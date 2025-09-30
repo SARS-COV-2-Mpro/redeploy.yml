@@ -1,22 +1,19 @@
-s
-name: Cloudflare Worker Auto-Redeploy
+name: Deploy to Cloudflare
 
 on:
-  schedule:
-    - cron: "*/30 * * * *"   # runs every 30 minutes
-  workflow_dispatch:          # allows manual trigger in Actions tab
+  push:
+    branches: [ main ]   # change if you want another branch
 
 jobs:
-  redeploy:
+  deploy:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v3
 
-      - name: Deploy Worker to Cloudflare
-        run: |
-          curl -sS -X PUT "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CF_ACCOUNT_ID }}/workers/scripts/${{ secrets.CF_WORKER_NAME }}" \
-            -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
-            -F 'metadata={"main_module":"index.js"};type=application/json' \
-            -F "index.js=@index.js;type=application/javascript+module"
+      - name: Publish to Cloudflare Workers
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CF_API_TOKEN }}
+          accountId: ${{ secrets.CF_ACCOUNT_ID }}
+          command: deploy
