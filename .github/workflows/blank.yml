@@ -1,8 +1,16 @@
 name: Deploy to Cloudflare
 
 on:
+  # Trigger on new commits pushed to main
   push:
-    branches: [ main ]   # deploy on push to main branch
+    branches: [ main ]
+
+  # Also run automatically every 30 minutes
+  schedule:
+    - cron: "*/30 * * * *"
+
+  # Allow manual trigger from Actions tab
+  workflow_dispatch:
 
 jobs:
   deploy:
