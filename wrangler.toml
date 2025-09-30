@@ -1,0 +1,3 @@
+name = "exchange-server"       # 👈 must match your Worker name
+main = "index.js"              # or "dist/index.js" if you bundle
+compatibility_date = "2023-09-30"
