@@ -1,3 +1,37 @@
-name = "exchange-server"       # 👈 must match your Worker name
-main = "index.js"              # or "dist/index.js" if you bundle
-compatibility_date = "2023-09-30"
+# ========================
+# Cloudflare Wrangler Config
+# ========================
+
+# 👇 Worker name — must match the service name in your dashboard (exchange-server)
+name = "exchange-server"
+
+# 👇 Entry point for your Worker
+main = "src/index.js"
+
+# 👇 Cloudflare compatibility date (linked to CF runtime features)
+compatibility_date = "2024-03-01"
+
+# 👇 Your Cloudflare account ID (safe to store here)
+account_id = "d6846addb712ea8c4283cab3eabf02dc"
+
+# ========================
+# D1 Database Binding
+# ========================
+[[d1_databases]]
+binding = "DB"                          # how you access it in code: env.DB
+database_name = "exchange_db"           # CF database name
+database_id = "c3779437-f414-45f9-9c67-a083880de786"
+preview_database_id = "c3779437-f414-45f9-9c67-a083880de786" # same DB in preview mode
+
+# ========================
+# Cron Triggers
+# ========================
+[triggers]
+crons = ["*/1 * * * *"]                 # run every 5 minutes
+
+# ========================
+# Service Bindings (calling another Worker)
+# ========================
+[[services]]
+binding = "outbound"                    # call it in code with env.outbound.fetch()
+service = "outbound-proxy"              # target Worker service name
