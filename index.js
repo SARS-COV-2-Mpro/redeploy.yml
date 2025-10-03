@@ -79,6 +79,17 @@ const sigmoid = (x) => 1 / (1 + Math.exp(-x));
 function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 const bpsToFrac = (bps) => Number(bps || 0) / 10000;
 
+/* UI helpers (match Worker 1 style) */
+function formatMoney(amount) { return `$${Number(amount || 0).toFixed(8)}`; }
+function formatPercent(decimal) { return `${(decimal * 100).toFixed(2)}%`; }
+function formatDurationShort(ms) {
+  if (!isFinite(ms) || ms <= 0) return "0m";
+  const totalMin = Math.round(ms / 60000);
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  return h > 0 ? `${h}h ${m}m` : `${m}m`;
+}
+
 /* ---------- LRU+TTL cache ---------- */
 class TTLLRU {
   constructor(capacity = 512, ttlMs = 60000) {
@@ -116,15 +127,23 @@ async function safeFetch(url, options = {}, timeoutMs = DEFAULT_FETCH_TIMEOUT_MS
   try { return await fetch(url, { ...options, signal: ctrl.signal }); }
   finally { clearTimeout(to); }
 }
+const DEFAULT_CPU_BUDGET_MS = 12000;
+function createCpuBudget(ms = DEFAULT_CPU_BUDGET_MS) {
+  const deadline = Date.now() + Math.max(250, ms);
+  return {
+    deadline,
+    isExpired() { return Date.now() > deadline; },
+    timeLeft() { return Math.max(0, deadline - Date.now()); },
+    ensure(label) { if (this.isExpired()) throw new Error(`CPU budget exceeded at ${label}`); }
+  };
+}
 
-/* ---------- Telegram helpers ---------- */
+/* ---------- Telegram helpers (Worker 1 style; no silent no-op) ---------- */
 async function answerCallbackQuery(env, id) {
-  if (!env.TELEGRAM_BOT_TOKEN) return;
   const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/answerCallbackQuery`;
   await safeFetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ callback_query_id: id }) }).catch(() => {});
 }
 async function sendMessage(chatId, text, buttons, env) {
-  if (!env.TELEGRAM_BOT_TOKEN) return;
   const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
   const body = { chat_id: chatId, text };
   if (buttons && buttons.length) body.reply_markup = { inline_keyboard: buttons };
@@ -132,7 +151,6 @@ async function sendMessage(chatId, text, buttons, env) {
   if (!r.ok) console.error("sendMessage error:", await r.text());
 }
 async function editMessage(chatId, messageId, newText, buttons, env) {
-  if (!env.TELEGRAM_BOT_TOKEN) return;
   const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/editMessageText`;
   const body = { chat_id: chatId, message_id: messageId, text: newText };
   if (buttons && buttons.length) body.reply_markup = { inline_keyboard: buttons };
@@ -681,6 +699,16 @@ function computeMFE_MAE(entryPrice, side, klines1m) {
   }
 }
 
+/* ---------- Exports for later sections ---------- */
+export {
+  PRICE_CACHE_TTL_MS, STOP_PCT_CACHE_TTL_MS, ORDERBOOK_CACHE_TTL_MS,
+  priceCache, stopPctCache, orderbookCache,
+  getCurrentPrice, calculateStopPercent,
+  getOrderBookSnapshot, computeSpreadDepth, computeBestBidAsk,
+  fetchKlines, fetchKlinesRange, seriesReturnsFromKlines, pearsonCorr,
+  getGistPending, getLatestIdeas, computeMFE_MAE
+};
+
 /* ======================================================================
    SECTION 3/7 — Wallet/Equity, Cooldowns, HSE/Kelly, Exposure,
                   Logging, TCR pacing (flat CPU via KV counters)
@@ -1040,6 +1068,19 @@ async function computeUserSqsGate(env, userId) {
   return computeDynamicSqsGate(baseGate, target, openedSoFar);
 }
 
+/* ---------- Exports ---------- */
+export {
+  getWalletBalance, getTotalCapital, getPeakEquity, getDrawdown,
+  getOpenPortfolioRisk, getOpenPositionsCount, getOpenNotional,
+  hasActiveExposure, getActiveExposureSymbols,
+  defaultCooldownMs, setSymbolCooldown, getSymbolCooldownRemainingMs, isSymbolOnCooldown,
+  pLCBFromSQS, ddScaler, maxCorrelationWithOpen, computeHSEAndCosts, kellyFraction, SQSfromScore,
+  logEvent,
+  // pacing
+  utcDayKey, ensureDayRoll, bumpTradeCounters, getPacingCounters, resyncPacingFromDB,
+  dayProgressUTC, computeDynamicSqsGate, computeUserSqsGate
+};
+
 /* ======================================================================
    SECTION 4/7 — Exchange verification, signing helpers, orders & routing
    (Threads clientOrderId to newClientOrderId; adds spot/futures list APIs;
@@ -1323,7 +1364,7 @@ async function verifyCoinEx(apiKey, apiSecret, ex) {
 async function verifyLBank(apiKey, apiSecret, ex) {
   const path = "/v2/user_info.do";
   const ts = Date.now().toString();
-  const params = { api_key: apiKey, symbol: "usdt_usdt", timestamp: ts }; // symbol ignored but some libs require it
+  const params = { api_key: apiKey, symbol: "usdt_usdt", timestamp: ts };
   const paramStr = Object.entries(params).sort(([a],[b])=>a.localeCompare(b)).map(([k, v]) => `${k}=${v}`).join("&");
   const signStr = paramStr + `&secret_key=${apiSecret}`;
   const sign = md5Hex(signStr).toUpperCase();
@@ -1908,7 +1949,6 @@ async function cancelSpotOrderByCID(ex, apiKey, apiSecret, base, clientOrderId) 
   const url = `${ex.baseUrl}${endpoint}?${qs}&signature=${sig}`;
   const r = await safeFetch(url, { method: "DELETE", headers: { [ex.apiKeyHeader]: apiKey } }, 8000);
   if (!r.ok) {
-    // swallow common not-found/filled errors
     try {
       const j = await r.json();
       const msg = (j?.msg || j?.message || "").toLowerCase();
@@ -1969,21 +2009,781 @@ async function placeSpotOCO(ex, apiKey, apiSecret, base, qty, tpPrice, slPrice, 
   if (!r.ok) throw new Error(j?.msg || j?.message || `HTTP ${r.status}`);
   return j;
 }
+
+/* ---------- Exports ---------- */
+export {
+  hmacHexStr, hmacB64Str, hmacB64Bytes, sha256Bytes, md5Hex,
+  parseUSDT_BinanceLike, parseUSDT_Gate, parseUSDT_Bybit, parseUSDT_Kraken, parseUSDT_CoinEx, parseUSDT_Huobi, parseUSDT_LBank,
+  verifyBinanceLike, verifyBinanceFutures, verifyBybit, verifyKraken, verifyGate, huobiSignedGet, verifyHuobi, verifyCoinEx, verifyLBank,
+  verifyApiKeys,
+  listAllOrdersBinanceLike, listMyTradesBinanceLike, listAllOrdersFutures, listMyTradesFutures,
+  placeBinanceLikeOrder, placeBinanceLikeLimitMaker,
+  placeLBankOrder, placeCoinExOrder,
+  placeBinanceFuturesOrder, placeBinanceFuturesLimitPostOnly,
+  placeDemoOrder,
+  placeMarketBuy, placeMarketSell,
+  getBinanceLikeOrderStatus, getBinanceFuturesOrderStatus,
+  placeSpotTPLimit, placeSpotSLStopLimit, placeSpotTTLMarket,
+  placeFutTPMarket, placeFutSLMarket, placeFutTTLMarket,
+  cancelSpotOrderByCID, cancelFuturesOrderByCID, placeSpotOCO, supportsSpotOCO
+};
+
+/* ======================================================================
+   SECTION 5/7 — Protocol Status, Create/Execute/Close Trades,
+                  Auto exits, Win stats (CID exits + TTL + MFE/MAE)
+   ====================================================================== */
+
+/* ---------- Time stop (env-driven; default 14 minutes; used as fallback) ---------- */
+function getMaxTradeAgeMs(env) {
+  const minsRaw = Number(env?.MAX_TRADE_AGE_MIN ?? 14);
+  const mins = isFinite(minsRaw) ? minsRaw : 14;
+  return Math.max(1, Math.floor(mins)) * 60 * 1000;
+}
+
+/* ---------- TTL helpers (per-idea, per-trade) ---------- */
+function ttlBounds(env) {
+  const lo = Math.max(1, Math.floor(Number(env?.TTL_MIN_SEC ?? 540)));
+  const hi = Math.max(lo, Math.floor(Number(env?.TTL_MAX_SEC ?? 1200)));
+  return { TTL_MIN_SEC: lo, TTL_MAX_SEC: hi };
+}
+function ttlDeadlineMsFromIdea(idea, nowMs, env) {
+  const { TTL_MIN_SEC, TTL_MAX_SEC } = ttlBounds(env);
+  const holdSecRaw = Number(idea?.hold_sec ?? idea?.ttl_sec ?? NaN);
+  const ttlTsRaw = Number(idea?.ttl_ts_ms ?? NaN);
+  if (isFinite(ttlTsRaw) && ttlTsRaw > 0) {
+    const minMs = nowMs + TTL_MIN_SEC * 1000;
+    const maxMs = nowMs + TTL_MAX_SEC * 1000;
+    return Math.min(Math.max(ttlTsRaw, minMs), maxMs);
+  }
+  if (isFinite(holdSecRaw) && holdSecRaw > 0) {
+    const clamped = Math.min(Math.max(holdSecRaw, TTL_MIN_SEC), TTL_MAX_SEC);
+    return nowMs + clamped * 1000;
+  }
+  return null;
+}
+function ensureTradeTtl(extra, openedAtMs, env) {
+  if (!extra) extra = {};
+  if (!extra.ttl) extra.ttl = {};
+  const { TTL_MIN_SEC, TTL_MAX_SEC } = ttlBounds(env);
+  if (!isFinite(Number(extra.ttl.ttl_ts_ms))) {
+    const holdSec = Math.max(TTL_MIN_SEC, Math.min(TTL_MAX_SEC, Number(extra.ttl.hold_sec ?? TTL_MIN_SEC)));
+    extra.ttl.ttl_ts_ms = openedAtMs + holdSec * 1000;
+  } else {
+    const minMs = openedAtMs + TTL_MIN_SEC * 1000;
+    const maxMs = openedAtMs + TTL_MAX_SEC * 1000;
+    extra.ttl.ttl_ts_ms = Math.min(Math.max(Number(extra.ttl.ttl_ts_ms), minMs), maxMs);
+  }
+  return extra;
+}
+
+/* ---------- Protocol status text ---------- */
+function protocolStatusTextB(protocol, liveBalance, openRisk, winStats, extras = {}) {
+  const D_risk = DAILY_OPEN_RISK_CAP_FRAC * liveBalance;
+  const D_risk_left = Math.max(0, D_risk - openRisk);
+
+  const perTradeNotionalCapFrac = Number(extras.perTradeNotionalCapFrac ?? 0.10);
+  const dailyNotionalCapFrac    = Number(extras.dailyNotionalCapFrac ?? 0.30);
+  const perTradeNotionalCap     = perTradeNotionalCapFrac * liveBalance;
+  const dailyNotionalCap        = dailyNotionalCapFrac * liveBalance;
+
+  const winLine = winStats
+    ? `Win rate: ${winStats.winRatePct.toFixed(1)}% (${winStats.wins}/${winStats.total})`
+    : `Win rate: n/a`;
+
+  const lines = [
+    "Protocol Status (ACP V20, Multi-Position):",
+    "",
+    `Live Balance (TC): ${formatMoney(liveBalance)}`,
+    `ACP (${(ACP_FRAC*100).toFixed(0)}% of TC): ${formatMoney(ACP_FRAC * liveBalance)}`,
+    `Per-trade risk cap (M): ${formatMoney(PER_TRADE_CAP_FRAC * liveBalance)}`,
+    `Daily open risk cap (D): ${formatMoney(D_risk)} | Used: ${formatMoney(openRisk)} | Left: ${formatMoney(D_risk_left)}`,
+    "",
+    `Bank Notional Caps:`,
+    `Per-trade notional cap: ${formatMoney(perTradeNotionalCap)} (${(perTradeNotionalCapFrac*100).toFixed(0)}% of TC)`,
+    `Daily notional cap: ${formatMoney(dailyNotionalCap)} (${(dailyNotionalCapFrac*100).toFixed(0)}% of TC)`,
+    "",
+    `Fee Rate (per side): ${formatPercent(protocol.fee_rate ?? 0.001)}`,
+    winLine
+  ];
+
+  const src = extras?.ideasSource || null;
+  const subreqUsed = extras?.subreqUsed;
+  const longShare = extras?.longShareTarget;
+  const sqsGate = extras?.sqsGate;
+  const todayOpened = extras?.todayOpened;
+  const targetDaily = extras?.targetDaily;
+
+  const info = [];
+  if (src || subreqUsed != null || longShare != null || sqsGate != null || todayOpened != null) {
+    info.push("", "Suggester/TCR:");
+    if (src) info.push(`Ideas source: ${src}`);
+    if (subreqUsed != null) info.push(`Subrequests last cycle: ${subreqUsed}`);
+    if (longShare != null) info.push(`Bias (long share target): ${(longShare * 100).toFixed(0)}%`);
+    if (sqsGate != null) info.push(`Dynamic SQS gate: ${sqsGate.toFixed(2)}`);
+    if (todayOpened != null && targetDaily != null) info.push(`Today trades: ${todayOpened}/${targetDaily} (pace control)`);
+  }
+
+  lines.push(...info, "", "This is live and updates as trades open/close. Exits: native CID TP/SL when supported, TTL fallback.");
+  return lines.join("\n");
+}
+
+async function renderProtocolStatus(env, userId, messageId = 0) {
+  const protocol = await getProtocolState(env, userId);
+  const tc = await getTotalCapital(env, userId);
+  const openRisk = await getOpenPortfolioRisk(env, userId);
+  const stats = await getWinStats(env, userId);
+
+  let ideasMeta = {};
+  try {
+    const row = await env.DB.prepare("SELECT ideas_json FROM ideas ORDER BY ts DESC LIMIT 1").first();
+    if (row?.ideas_json) {
+      const j = JSON.parse(row.ideas_json);
+      ideasMeta = {
+        ideasSource: j?.meta?.origin || j?.source || "external",
+        subreqUsed: j?.meta?.subrequestsUsed,
+        longShareTarget: j?.meta?.longShareTarget
+      };
+    }
+  } catch {}
+
+  let sqsGate = null, todayOpened = null, targetDaily = null;
+  try {
+    sqsGate = await computeUserSqsGate(env, userId);
+    const { todayCount } = await getPacingCounters(env, userId);
+    todayOpened = todayCount;
+    const explicitTarget = Number(env?.TCR_TARGET_TRADES || 0);
+    if (explicitTarget > 0) targetDaily = explicitTarget;
+    else {
+      const { last7Counts } = await getPacingCounters(env, userId);
+      targetDaily = Math.max(1, Math.round((todayOpened + last7Counts.reduce((a,b)=>a+b,0))/7));
+    }
+  } catch {}
+
+  const extras = {
+    ...ideasMeta,
+    sqsGate,
+    todayOpened,
+    targetDaily,
+    perTradeNotionalCapFrac: Number(env?.PER_TRADE_NOTIONAL_CAP_FRAC ?? 0.10),
+    dailyNotionalCapFrac: Number(env?.DAILY_OPEN_NOTIONAL_CAP_FRAC ?? 0.30)
+  };
+
+  const text = protocol
+    ? protocolStatusTextB(protocol, tc, openRisk, stats, extras)
+    : "No protocol initialized yet.";
+  const buttons = [[{ text: "Continue ▶️", callback_data: "continue_dashboard" }]];
+  if (messageId) await editMessage(userId, messageId, text, buttons, env);
+  else await sendMessage(userId, text, buttons, env);
+}
+
+/* ---------- Auto skip record (UI bookkeeping) ---------- */
+async function createAutoSkipRecord(env, userId, idea, protocol, reason, meta) {
+  try {
+    const session = await getSession(env, userId);
+    const symbol = String(idea?.symbol || "").toUpperCase();
+    const currentPrice = await getCurrentPrice(symbol, idea?.price);
+
+    let sL = Math.max(await calculateStopPercent(symbol), MIN_STOP_PCT);
+    const isShort = String(idea?.side || 'long').toLowerCase() === 'short';
+    const stopPrice = isFinite(currentPrice) && currentPrice > 0
+      ? (!isShort ? currentPrice * (1 - sL) : currentPrice * (1 + sL))
+      : 0;
+    const tpPrice   = isFinite(currentPrice) && currentPrice > 0
+      ? (!isShort ? currentPrice * (1 + sL * STRICT_RRR) : currentPrice * (1 - sL * STRICT_RRR))
+      : 0;
+
+    const extra_json = {
+      auto_skip: true,
+      skip_reason: reason,
+      skip_meta: meta || {},
+      idea_score: idea?.score,
+      direction: isShort ? 'short' : 'long',
+      r_target: STRICT_RRR,
+      exits_from_idea: false,
+      strict_rrr: true,
+      bracket_frozen: true
+    };
+
+    await env.DB.prepare(
+      `INSERT INTO trades (user_id, exchange_name, mode, symbol, side, qty, price, status,
+                           stop_pct, stop_price, tp_price, risk_usd, strict_rrr, bracket_frozen, extra_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      userId, session.exchange_name, session.bot_mode, symbol, isShort ? 'SELL' : 'BUY',
+      0, currentPrice || 0, 'rejected',
+      sL, stopPrice, tpPrice, 0, 'true', 'true', JSON.stringify(extra_json)
+    ).run();
+
+    await bumpTradeCounters(env, userId, 1);
+  } catch (e) {
+    console.error('createAutoSkipRecord error:', e);
+  }
+}
+
+/* ---------- Create pending trade (sizing + budgets) ---------- */
+async function createPendingTrade(env, userId, idea, protocol) {
+  const session = await getSession(env, userId);
+  const symbol = String(idea.symbol || '').toUpperCase();
+
+  // cooldown
+  const cdMs = await getSymbolCooldownRemainingMs(env, userId, symbol);
+  if (cdMs > 0) return { id: null, meta: { symbol, skipReason: "cooldown_active", remain_ms: cdMs } };
+
+  // price
+  let currentPrice = await getCurrentPrice(symbol, idea?.price ?? idea?.entry_mid ?? idea?.entry_limit);
+  if (!isFinite(currentPrice) || currentPrice <= 0) {
+    try {
+      const ob = await getOrderBookSnapshot(symbol);
+      const { mid } = computeSpreadDepth(ob);
+      if (isFinite(mid) && mid > 0) currentPrice = mid;
+    } catch {}
+  }
+  if (!isFinite(currentPrice) || currentPrice <= 0) {
+    const cached = priceCache.get((symbol || "").toUpperCase());
+    if (typeof cached !== "undefined" && isFinite(cached) && cached > 0) currentPrice = cached;
+  }
+  if (!isFinite(currentPrice) || currentPrice <= 0) return { id: null, meta: { symbol, skipReason: "market_data" } };
+
+  // Direction
+  const dir = String(idea.side || 'long').toLowerCase();
+  const isShort = (dir === 'short' || dir === 'sell');
+
+  // Capital
+  const TC = await getTotalCapital(env, userId);
+  const ACP = ACP_FRAC * TC;
+  if (ACP < 6) return { id: null, meta: { symbol, skipReason: "bank_closed", TC, ACP } };
+
+  // Notional caps
+  const perTradeNotionalCapFrac = Number(env?.PER_TRADE_NOTIONAL_CAP_FRAC ?? 0.10);
+  const dailyNotionalCapFrac    = Number(env?.DAILY_OPEN_NOTIONAL_CAP_FRAC ?? 0.30);
+  const perTradeNotionalCap     = perTradeNotionalCapFrac * TC;
+  const dailyNotionalCap        = dailyNotionalCapFrac * TC;
+  const openNotional            = await getOpenNotional(env, userId);
+  let dailyNotionalLeft         = Math.max(0, dailyNotionalCap - openNotional);
+  if (dailyNotionalLeft <= 0) return { id: null, meta: { symbol, skipReason: "daily_notional_exhausted", dailyNotionalLeft, dailyNotionalCap, openNotional, TC } };
+
+  // Risk budgets
+  const M = PER_TRADE_CAP_FRAC * TC;
+  const D = DAILY_OPEN_RISK_CAP_FRAC * TC;
+  const openRisk = await getOpenPortfolioRisk(env, userId);
+  let D_left = Math.max(0, D - openRisk);
+  const B = Math.min(M, D_left);
+  if (B <= 0) return { id: null, meta: { symbol, skipReason: "daily_risk_budget_exhausted", D_left, D, openRisk, TC } };
+
+  // Prob/SQS from idea.score when provided
+  const SQS = SQSfromScore(idea.score ?? 0);
+  const p = pLCBFromSQS(SQS);
+
+  // Stops
+  const sL = Math.max(await calculateStopPercent(symbol), MIN_STOP_PCT);
+
+  // Fees and HSE/EV
+  const feeRate = (protocol?.fee_rate ?? 0.001);
+  const hse = await computeHSEAndCosts(symbol, sL, feeRate);
+  const { pH, cost_R } = hse;
+
+  const RRR_used = STRICT_RRR;
+  const EV_R = p * RRR_used - (1 - p) - cost_R;
+  if (!(EV_R > 0)) return { id: null, meta: { symbol, skipReason: "ev_gate", EV_R, p, RRR: RRR_used, cost_R, pH, sL, currentPrice } };
+
+  // Dynamic SQS gate
+  const sqsMinDynamic = await computeUserSqsGate(env, userId);
+  if (SQS < sqsMinDynamic) return { id: null, meta: { symbol, skipReason: "low_sqs", SQS, sL, currentPrice, sqsMin: sqsMinDynamic } };
+
+  // Kelly sizing (blended)
+  const { f_k, Var_R } = kellyFraction(EV_R, p, RRR_used);
+  const w_sqs = SQS * SQS;
+  const f_raw = clamp(LAMBDA_BLEND * w_sqs + (1 - LAMBDA_BLEND) * f_k, 0, 1);
+
+  // State scalers
+  const dd = await getDrawdown(env, userId, TC);
+  const k_dd = ddScaler(dd);
+  const rho_max = await maxCorrelationWithOpen(env, userId, symbol);
+  const c_corr = clamp(1 - rho_max, 0, 1);
+
+  // HSE gate softening
+  let g;
+  if (pH < 0.60) g = 1.0;
+  else if (pH < 0.75) g = 0.7;
+  else if (pH < 0.85) g = 0.5;
+  else g = 0.2;
+
+  // Desired risk and notional mapping
+  const Desired_Risk_USD = B * k_dd * f_raw * c_corr * g;
+  let notionalDesired = Desired_Risk_USD / sL;
+
+  // Respect caps
+  let notionalFinal = Math.min(notionalDesired, perTradeNotionalCap, dailyNotionalLeft);
+  if (notionalFinal <= 0) return { id: null, meta: { symbol, skipReason: "bank_notional_zero", perTradeNotionalCap, dailyNotionalLeft, openNotional, sL, currentPrice } };
+
+  const Final_Risk_USD = notionalFinal * sL;
+
+  // Funds check — shrink to available
+  const requiredFunds = notionalFinal * (1 + 2 * feeRate);
+  if (requiredFunds > TC) {
+    const maxNotional = TC / (1 + 2 * feeRate);
+    notionalFinal = Math.max(0, Math.min(notionalFinal, maxNotional));
+    if (!(notionalFinal > 0)) return { id: null, meta: { symbol, skipReason: "insufficient_funds", available: TC, required: requiredFunds, sL, currentPrice, notionalFinal } };
+  }
+
+  // Bracket preview
+  const stopPrice = isShort ? currentPrice * (1 + sL) : currentPrice * (1 - sL);
+  const tpPrice   = isShort ? currentPrice * (1 - sL * RRR_used) : currentPrice * (1 + sL * RRR_used);
+
+  // Extra snapshot
+  const extra_json = {
+    idea_score: idea.score,
+    direction: isShort ? 'short' : 'long',
+    SQS, p, RRR: RRR_used, EV_R, Var_R, f_kelly: f_k, w_sqs, f_raw,
+    dd, k_dd, rho_max, c_corr, pH, g,
+    sL, stop_price: stopPrice, tp_price: tpPrice,
+    fee_rate: feeRate,
+    idea_fields: {
+      ttl_sec: idea.ttl_sec,
+      entry_limit: isFinite(idea.entry_limit) ? Number(idea.entry_limit) : undefined,
+      entry_policy: idea.entry_policy || undefined
+    },
+    budgets: { TC, ACP: ACP_FRAC*TC, M: PER_TRADE_CAP_FRAC*TC, D: DAILY_OPEN_RISK_CAP_FRAC*TC, openRisk, D_left, B, Desired_Risk_USD, Final_Risk_USD },
+    bank_notional: {
+      per_trade_cap_frac: perTradeNotionalCapFrac,
+      daily_cap_frac: dailyNotionalCapFrac,
+      per_trade_cap: perTradeNotionalCap,
+      daily_cap: dailyNotionalCap,
+      open_notional: openNotional,
+      daily_left: dailyNotionalLeft,
+      desired_notional: notionalDesired,
+      final_notional: notionalFinal
+    },
+    quote_size_raw: notionalDesired,
+    quote_size: notionalFinal,
+    required_funds: requiredFunds,
+    available_funds: TC,
+    funds_ok: true,
+    r_target: RRR_used,
+    strict_rrr: true,
+    bracket_frozen: true,
+    used_price: currentPrice
+  };
+
+  // Capture per-idea TTL now
+  const nowMs = Date.now();
+  const ttlTs = ttlDeadlineMsFromIdea(idea, nowMs, env);
+  if (ttlTs) {
+    extra_json.ttl = { ttl_ts_ms: ttlTs, hold_sec: Math.round((ttlTs - nowMs) / 1000), source: 'idea' };
+  }
+
+  const res = await env.DB.prepare(
+    `INSERT INTO trades (user_id, exchange_name, mode, symbol, side, qty, price, status, stop_pct, stop_price, tp_price, risk_usd, strict_rrr, bracket_frozen, extra_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     RETURNING id`
+  ).bind(
+    userId, session.exchange_name, session.bot_mode, symbol, isShort ? 'SELL' : 'BUY',
+    0, currentPrice, 'pending', sL, stopPrice, tpPrice, Final_Risk_USD, 'true', 'true', JSON.stringify(extra_json)
+  ).first();
+
+  const id = res?.id || null;
+  if (id) await bumpTradeCounters(env, userId, 1);
+  return { id, meta: { symbol, sL, currentPrice, notionalFinal, Final_Risk_USD } };
+}
+
+/* ---------- Execute trade (places native exits with CID when supported) ---------- */
+async function executeTrade(env, userId, tradeId) {
+  const trade = await env.DB.prepare("SELECT * FROM trades WHERE id = ? AND user_id = ?").bind(tradeId, userId).first();
+  if (!trade || trade.status !== 'pending') return false;
+
+  const extra = JSON.parse(trade.extra_json || '{}');
+  const protocol = await getProtocolState(env, userId);
+  const isShort = trade.side === 'SELL';
+
+  // Exchange / session
+  const session = await getSession(env, userId);
+  const ex = SUPPORTED_EXCHANGES[session.exchange_name];
+
+  try {
+    // Place market entry
+    let orderResult;
+    if (!isShort) {
+      orderResult = await placeMarketBuy(env, userId, trade.symbol, extra.quote_size, { reduceOnly: false, clientOrderId: `ent-${tradeId}-${Date.now()}` });
+    } else {
+      orderResult = await placeMarketSell(env, userId, trade.symbol, extra.quote_size, true, { reduceOnly: false, clientOrderId: `ent-${tradeId}-${Date.now()}` });
+    }
+
+    // Compute actual stops/targets from entry fill
+    const rUsed = Number(extra?.r_target || STRICT_RRR);
+    const entryPx = Number(orderResult.avgPrice || trade.price);
+    const qty = Number(orderResult.executedQty || 0);
+
+    const actualStopPrice = !isShort
+      ? entryPx * (1 - trade.stop_pct)
+      : entryPx * (1 + trade.stop_pct);
+    const actualTpPrice = !isShort
+      ? entryPx * (1 + trade.stop_pct * rUsed)
+      : entryPx * (1 - trade.stop_pct * rUsed);
+
+    // TTL finalize to open time
+    const openedAtMs = Date.now();
+    ensureTradeTtl(extra, openedAtMs, env);
+
+    // Prepare CIDs and place native exits when supported
+    const cidRoot = `t${tradeId}-${Date.now()}`;
+    const cidTp = `${cidRoot}:tp`;
+    const cidSl = `${cidRoot}:sl`;
+    const cidTtl = `${cidRoot}:ttl`;
+    const listCid = `${cidRoot}:oco`;
+
+    extra.exits = { cid_root: cidRoot, cid_tp: cidTp, cid_sl: cidSl, cid_ttl: cidTtl, list_cid: listCid, tp_px: actualTpPrice, sl_px: actualStopPrice };
+    extra.metrics = { ...(extra.metrics || {}), tc_at_entry: await getTotalCapital(env, userId), notional_at_entry: entryPx * qty };
+
+    // Place exits by exchange type
+    try {
+      if (ex.kind === 'binanceLike') {
+        // OCO on Binance; on others, place separate TP/SL
+        if (supportsSpotOCO(ex)) {
+          await (async () => {
+            const apiKey = await decrypt(session.api_key_encrypted, env);
+            const apiSecret = await decrypt(session.api_secret_encrypted, env);
+            await placeSpotOCO(ex, apiKey, apiSecret, trade.symbol.toUpperCase(), qty, actualTpPrice, actualStopPrice, cidTp, cidSl, listCid);
+          })();
+        } else {
+          const apiKey = await decrypt(session.api_key_encrypted, env);
+          const apiSecret = await decrypt(session.api_secret_encrypted, env);
+          await placeSpotTPLimit(ex, apiKey, apiSecret, trade.symbol.toUpperCase(), qty, actualTpPrice, cidTp);
+          await placeSpotSLStopLimit(ex, apiKey, apiSecret, trade.symbol.toUpperCase(), qty, actualStopPrice, cidSl);
+        }
+      } else if (ex.kind === 'binanceFuturesUSDT') {
+        const sideClose = isShort ? "BUY" : "SELL";
+        const apiKey = await decrypt(session.api_key_encrypted, env);
+        const apiSecret = await decrypt(session.api_secret_encrypted, env);
+        await placeFutTPMarket(ex, apiKey, apiSecret, trade.symbol.toUpperCase(), sideClose, actualTpPrice, cidTp);
+        await placeFutSLMarket(ex, apiKey, apiSecret, trade.symbol.toUpperCase(), sideClose, actualStopPrice, cidSl);
+      }
+    } catch (e) {
+      console.error("exit placement error:", e?.message || e);
+    }
+
+    // Open the trade locally
+    await env.DB.prepare(
+      `UPDATE trades SET status = 'open', qty = ?, entry_price = ?, stop_price = ?, tp_price = ?, extra_json = ?, updated_at = ? WHERE id = ?`
+    ).bind(qty, entryPx, actualStopPrice, actualTpPrice, JSON.stringify(extra), nowISO(), tradeId).run();
+
+    await logEvent(env, userId, 'trade_open', {
+      symbol: trade.symbol, side: trade.side, qty, entry: entryPx,
+      stop_pct: trade.stop_pct, stop_price: actualStopPrice, tp_price: actualTpPrice, r: rUsed,
+      phase: protocol?.phase, fee_rate: protocol?.fee_rate, strict_rrr: true, bracket_frozen: true,
+      ttl_ts_ms: extra?.ttl?.ttl_ts_ms
+    });
+
+    // Update Gist pending (execution truth)
+    try {
+      const { state, etag } = await loadGistState(env);
+      state.loop_heartbeat_ts = Date.now();
+      const baseFull = `${trade.symbol.toUpperCase()}USDT`;
+      const pendingRow = {
+        client_order_id: cidRoot,
+        symbolFull: baseFull,
+        side: isShort ? 'SHORT' : 'LONG',
+        entry_price: entryPx,
+        qty,
+        ts_open_ms: openedAtMs,
+        exits: { tp_px: actualTpPrice, sl_px: actualStopPrice, cid_tp: cidTp, cid_sl: cidSl, cid_ttl: cidTtl }
+      };
+      // merge/append
+      const merged = mergeGistState(state, { pending: [ pendingRow ], closed: [] });
+      await saveGistState(env, merged, etag);
+    } catch (e) {
+      console.error("gist pending update error:", e?.message || e);
+    }
+
+    return true;
+  } catch (e) {
+    console.error('executeTrade error:', e);
+    await logEvent(env, userId, 'error', { where: 'executeTrade', message: e.message });
+    return false;
+  }
+}
+
+/* ---------- Working orders resolver (post-only fills) ---------- */
+async function checkWorkingOrders(env, userId) {
+  // For this worker version, market entries are immediate; maker-post-only paths may be added similarly to Worker 1.
+  // No-op for now; reserved for LIMIT_MAKER tracking if enabled later.
+  return;
+}
+
+/* ---------- Efficient price getter for exits ---------- */
+async function robustPriceFor(symbol) {
+  let p = await getCurrentPrice(symbol);
+  if (!isFinite(p) || p <= 0) {
+    try {
+      const ob = await getOrderBookSnapshot(symbol);
+      const { mid } = computeSpreadDepth(ob);
+      if (isFinite(mid) && mid > 0) p = mid;
+    } catch {}
+  }
+  if (!isFinite(p) || p <= 0) {
+    const cached = priceCache.get((symbol || "").toUpperCase());
+    if (typeof cached !== "undefined" && isFinite(cached) && cached > 0) p = cached;
+  }
+  return isFinite(p) && p > 0 ? p : 0;
+}
+
+/* ---------- Manual close & automated exits (TTL + price fallback, MFE/MAE on close) ---------- */
+async function closeTradeNow(env, userId, tradeId) {
+  const trade = await env.DB.prepare("SELECT * FROM trades WHERE id = ? AND user_id = ?").bind(tradeId, userId).first();
+  if (!trade || trade.status !== "open") return { ok: false, msg: "Trade not open." };
+  const protocol = await getProtocolState(env, userId);
+  const isShort = trade.side === 'SELL';
+  try {
+    let exitPrice = await robustPriceFor(trade.symbol);
+
+    if (!isShort) {
+      const sellResult = await placeMarketSell(env, userId, trade.symbol, trade.qty, false, { reduceOnly: true, clientOrderId: `exit-${tradeId}-${Date.now()}` });
+      exitPrice = sellResult.avgPrice || exitPrice;
+    } else {
+      const session = await getSession(env, userId);
+      if (session.exchange_name === 'crypto_parrot') {
+        const buyResult = await placeDemoOrder(trade.symbol, "BUY", trade.qty, false);
+        exitPrice = buyResult.avgPrice || exitPrice;
+      } else {
+        const requiredQuote = trade.qty * (exitPrice || (await getCurrentPrice(trade.symbol)));
+        const buyResult = await placeMarketBuy(env, userId, trade.symbol, requiredQuote, { reduceOnly: true, clientOrderId: `exit-${tradeId}-${Date.now()}` });
+        exitPrice = buyResult.avgPrice || exitPrice;
+      }
+    }
+
+    const grossPnl = !isShort ? (exitPrice - trade.entry_price) * trade.qty
+                              : (trade.entry_price - exitPrice) * trade.qty;
+    const fees = (trade.entry_price * trade.qty + exitPrice * trade.qty) * (protocol?.fee_rate ?? 0.001);
+    const netPnl = grossPnl - fees;
+    const realizedR = trade.risk_usd > 0 ? netPnl / trade.risk_usd : 0;
+
+    // MFE/MAE computation
+    let mfe_bps = 0, mae_bps = 0;
+    try {
+      if (ENABLE_MFE_MAE(env)) {
+        const startTs = Date.parse(trade.updated_at || trade.created_at || "") - 5_000;
+        const endTs = Date.now() + 5_000;
+        const k1m = await fetchKlinesRange(trade.symbol, "1m", startTs, endTs);
+        const side = isShort ? "short" : "long";
+        ({ mfe_bps, mae_bps } = computeMFE_MAE(trade.entry_price, side, k1m));
+      }
+    } catch {}
+
+    await env.DB.prepare(
+      `UPDATE trades SET status='closed', price=?, realized_pnl=?, realized_r=?, fees=?, close_type='MANUAL', updated_at=? WHERE id=?`
+    ).bind(exitPrice, netPnl, realizedR, fees, nowISO(), tradeId).run();
+
+    await setSymbolCooldown(env, userId, trade.symbol);
+    await logEvent(env, userId, 'trade_close', { symbol: trade.symbol, entry: trade.entry_price, exit: exitPrice, realizedR, close_type: 'MANUAL', pnl: netPnl, fees, mfe_bps, mae_bps });
+
+    // Update Gist: move from pending to closed
+    try {
+      const { state, etag } = await loadGistState(env);
+      state.loop_heartbeat_ts = Date.now();
+      const baseFull = `${trade.symbol.toUpperCase()}USDT`;
+      const extra = JSON.parse(trade.extra_json || '{}');
+      const cidRoot = extra?.exits?.cid_root || null;
+
+      // remove pending by CID
+      if (cidRoot) removePendingByCID(state, cidRoot);
+
+      const pnl_bps = trade.entry_price > 0 ? Math.round(((exitPrice / trade.entry_price - 1) * (isShort ? -1 : 1)) * 10000) : 0;
+      const closedRow = {
+        symbolFull: baseFull,
+        side: isShort ? 'SHORT' : 'LONG',
+        ts_open_ms: Date.parse(trade.updated_at || trade.created_at || ""),
+        ts_exit_ms: Date.now(),
+        entry_px: trade.entry_price,
+        exit_px: exitPrice,
+        qty: trade.qty,
+        pnl_bps,
+        mfe_bps, mae_bps,
+        trade_details: { client_order_id: cidRoot }
+      };
+      appendClosed(state, closedRow);
+      state.lastReconcileTs = Date.now();
+      await saveGistState(env, state, etag);
+    } catch (e) { console.error("gist close update error:", e?.message || e); }
+
+    return { ok: true, msg: "Closed." };
+  } catch (e) {
+    await logEvent(env, userId, 'error', { where: 'closeTradeNow', message: e.message });
+    return { ok: false, msg: e.message || "Close failed." };
+  }
+}
+
+/* ---------- Robust auto-close with TTL + price fallbacks ---------- */
+async function checkAndExitTrades(env, userId) {
+  const openTrades = await env.DB.prepare(
+    "SELECT id, symbol, side, qty, entry_price, stop_price, tp_price, risk_usd, stop_pct, extra_json, created_at, updated_at FROM trades WHERE user_id = ? AND status = 'open'"
+  ).bind(userId).all();
+  if (!openTrades?.results?.length) return;
+
+  const protocol = await getProtocolState(env, userId);
+
+  const symbols = [...new Set(openTrades.results.map(t => t.symbol))];
+  const priceMap = new Map();
+  for (const s of symbols) {
+    priceMap.set(s, await robustPriceFor(s));
+  }
+
+  const AGE_MS_FALLBACK = getMaxTradeAgeMs(env);
+
+  for (const trade of (openTrades.results || [])) {
+    try {
+      let currentPrice = Number(priceMap.get(trade.symbol) || 0);
+      if (!isFinite(currentPrice) || currentPrice <= 0) {
+        await logEvent(env, userId, 'error', { where: 'checkAndExitTrades', message: `bad price for ${trade.symbol}` });
+        continue;
+      }
+
+      const isShort = (trade.side === 'SELL');
+      let shouldExit = false;
+      let exitReason = '';
+
+      // Per-trade TTL
+      let extra = {};
+      try { extra = JSON.parse(trade.extra_json || '{}'); } catch { extra = {}; }
+
+      // Priority: TP/SL (price check) > TTL > TIME fallback
+      if (!isShort) {
+        if (currentPrice <= trade.stop_price) { shouldExit = true; exitReason = 'SL'; }
+        else if (currentPrice >= trade.tp_price) { shouldExit = true; exitReason = 'TP'; }
+      } else {
+        if (currentPrice >= trade.stop_price) { shouldExit = true; exitReason = 'SL'; }
+        else if (currentPrice <= trade.tp_price) { shouldExit = true; exitReason = 'TP'; }
+      }
+
+      // TTL enforcement
+      if (!shouldExit && ENABLE_TTL(env)) {
+        const ttlTs = Number(extra?.ttl?.ttl_ts_ms || 0);
+        if (isFinite(ttlTs) && ttlTs > 0 && Date.now() >= ttlTs) {
+          shouldExit = true;
+          exitReason = 'TTL';
+        }
+      }
+
+      // TIME fallback if no per-trade TTL
+      if (!shouldExit) {
+        const ttlTs = Number(extra?.ttl?.ttl_ts_ms || 0);
+        if (!(isFinite(ttlTs) && ttlTs > 0)) {
+          const openedAtMs = Date.parse(trade.updated_at || trade.created_at || "");
+          if (isFinite(openedAtMs) && (Date.now() - openedAtMs >= AGE_MS_FALLBACK)) {
+            shouldExit = true;
+            exitReason = 'TIME';
+          }
+        }
+      }
+
+      if (!shouldExit) continue;
+
+      // try reduce-only market exit
+      let exitPrice = currentPrice;
+      if (!isShort) {
+        const sellResult = await placeMarketSell(env, userId, trade.symbol, trade.qty, false, { reduceOnly: true, clientOrderId: `ttl-${trade.id}-${Date.now()}` });
+        exitPrice = sellResult.avgPrice || currentPrice;
+      } else {
+        const session = await getSession(env, userId);
+        if (session.exchange_name === 'crypto_parrot') {
+          const buyResult = await placeDemoOrder(trade.symbol, "BUY", trade.qty, false);
+          exitPrice = buyResult.avgPrice || currentPrice;
+        } else {
+          const requiredQuote = trade.qty * currentPrice;
+          const buyResult = await placeMarketBuy(env, userId, trade.symbol, requiredQuote, { reduceOnly: true, clientOrderId: `ttl-${trade.id}-${Date.now()}` });
+          exitPrice = buyResult.avgPrice || currentPrice;
+        }
+      }
+
+      const grossPnl = !isShort ? (exitPrice - trade.entry_price) * trade.qty
+                                : (trade.entry_price - exitPrice) * trade.qty;
+      const fees = (trade.entry_price * trade.qty + exitPrice * trade.qty) * (protocol?.fee_rate ?? 0.001);
+      const netPnl = grossPnl - fees;
+      const realizedR = trade.risk_usd > 0 ? netPnl / trade.risk_usd : 0;
+
+      // MFE/MAE
+      let mfe_bps = 0, mae_bps = 0;
+      try {
+        if (ENABLE_MFE_MAE(env)) {
+          const startTs = Date.parse(trade.updated_at || trade.created_at || "") - 5_000;
+          const endTs = Date.now() + 5_000;
+          const k1m = await fetchKlinesRange(trade.symbol, "1m", startTs, endTs);
+          const side = isShort ? "short" : "long";
+          ({ mfe_bps, mae_bps } = computeMFE_MAE(trade.entry_price, side, k1m));
+        }
+      } catch {}
+
+      await env.DB.prepare(
+        `UPDATE trades SET status = 'closed', price = ?, realized_pnl = ?, realized_r = ?, fees = ?, close_type = ?, updated_at = ? WHERE id = ?`
+      ).bind(exitPrice, netPnl, realizedR, fees, exitReason, nowISO(), trade.id).run();
+
+      await setSymbolCooldown(env, userId, trade.symbol);
+
+      await logEvent(env, userId, 'trade_close', {
+        symbol: trade.symbol, entry: trade.entry_price, exit: exitPrice, realizedR,
+        hit: exitReason, exit_source: (exitReason === 'TTL' ? 'ttl_scan' : (exitReason === 'TIME' ? 'time_stop' : 'sl_tp_scan')),
+        pnl: netPnl, fees, strict_rrr: true, r_target: Number(JSON.parse(trade.extra_json||"{}")?.r_target ?? STRICT_RRR),
+        ttl_ts_ms: Number(JSON.parse(trade.extra_json||"{}")?.ttl?.ttl_ts_ms ?? 0),
+        mfe_bps, mae_bps
+      });
+
+      // Update Gist: move from pending to closed
+      try {
+        const { state, etag } = await loadGistState(env);
+        state.loop_heartbeat_ts = Date.now();
+        const baseFull = `${trade.symbol.toUpperCase()}USDT`;
+        const exj = JSON.parse(trade.extra_json || '{}');
+        const cidRoot = exj?.exits?.cid_root || null;
+
+        if (cidRoot) removePendingByCID(state, cidRoot);
+
+        const pnl_bps = trade.entry_price > 0 ? Math.round(((exitPrice / trade.entry_price - 1) * (isShort ? -1 : 1)) * 10000) : 0;
+        const closedRow = {
+          symbolFull: baseFull,
+          side: isShort ? 'SHORT' : 'LONG',
+          ts_open_ms: Date.parse(trade.updated_at || trade.created_at || ""),
+          ts_exit_ms: Date.now(),
+          entry_px: trade.entry_price,
+          exit_px: exitPrice,
+          qty: trade.qty,
+          pnl_bps,
+          mfe_bps, mae_bps,
+          trade_details: { client_order_id: cidRoot }
+        };
+        appendClosed(state, closedRow);
+        state.lastReconcileTs = Date.now();
+        await saveGistState(env, state, etag);
+      } catch (e) { console.error("gist close update error:", e?.message || e); }
+
+    } catch (e) {
+      console.error('checkAndExitTrades error:', e);
+      await logEvent(env, userId, 'error', { where: 'checkAndExitTrades', message: e.message });
+    }
+  }
+}
+
+/* ---------- Win-rate for Protocol Status ---------- */
+async function getWinStats(env, userId) {
+  const row = await env.DB.prepare(
+    "SELECT SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) AS wins, COUNT(*) AS total " +
+    "FROM trades WHERE user_id = ? AND status = 'closed'"
+  ).bind(userId).first();
+  const wins = Number(row?.wins || 0);
+  const total = Number(row?.total || 0);
+  const losses = Math.max(0, total - wins);
+  const winRatePct = total > 0 ? (wins / total) * 100 : 0;
+  return { winRatePct, wins, losses, total };
+}
+
+/* ---------- Exports ---------- */
+export {
+  protocolStatusTextB, renderProtocolStatus,
+  createAutoSkipRecord, createPendingTrade, executeTrade, closeTradeNow, checkWorkingOrders, checkAndExitTrades,
+  getWinStats, robustPriceFor
+};
+
 /* ======================================================================
    SECTION 6/7 — UI Texts, Cards, Keyboards, Dashboard, Lists,
                   Trade Details, Actions, Concurrency helpers
    ====================================================================== */
-
-/* ---------- Local UI helpers ---------- */
-function formatMoney(amount) { return `$${Number(amount || 0).toFixed(8)}`; }
-function formatPercent(decimal) { return `${(Number(decimal || 0) * 100).toFixed(2)}%`; }
-function formatDurationShort(ms) {
-  if (!isFinite(ms) || ms <= 0) return "0m";
-  const totalMin = Math.round(ms / 60000);
-  const h = Math.floor(totalMin / 60);
-  const m = totalMin % 60;
-  return h > 0 ? `${h}h ${m}m` : `${m}m`;
-}
 
 /* ---------- UI text blocks ---------- */
 function welcomeText() {
@@ -2032,11 +2832,11 @@ function confirmManualTextB(bal, feeRate) {
     "Setup complete (ACP V20 Brain, Manual Mode).",
     "",
     `Live Balance (TC): ${formatMoney(bal)}`,
-    `ACP (80% of TC): ${formatMoney(0.80 * bal)}`,
-    `Per-trade cap: ${formatPercent(0.10)} of TC`,
-    `Daily open risk cap: ${formatPercent(0.30)} of TC`,
+    `ACP (${(ACP_FRAC*100).toFixed(0)}% of TC): ${formatMoney(ACP_FRAC * bal)}`,
+    `Per-trade cap: ${formatPercent(PER_TRADE_CAP_FRAC)} of TC`,
+    `Daily open risk cap: ${formatPercent(DAILY_OPEN_RISK_CAP_FRAC)} of TC`,
     `Fee Rate (per side): ${formatPercent(feeRate)}`,
-    "Exits: dynamic RRR per idea when provided; fallback 2:1.",
+    "Exits: native exchange TP/SL (CID-threaded) when supported; TTL fallback; RRR 2:1 baseline.",
     "",
     "In Manual mode, the bot will suggest trades with full details (entry, stop, target). You decide to Approve or Reject."
   ].join("\n");
@@ -2046,11 +2846,11 @@ function confirmAutoTextB(bal, feeRate) {
     "Setup complete (ACP V20 Brain, Auto Mode).",
     "",
     `Live Balance (TC): ${formatMoney(bal)}`,
-    `ACP (80% of TC): ${formatMoney(0.80 * bal)}`,
-    `Per-trade cap: ${formatPercent(0.10)} of TC`,
-    `Daily open risk cap: ${formatPercent(0.30)} of TC`,
+    `ACP (${(ACP_FRAC*100).toFixed(0)}% of TC): ${formatMoney(ACP_FRAC * bal)}`,
+    `Per-trade cap: ${formatPercent(PER_TRADE_CAP_FRAC)} of TC`,
+    `Daily open risk cap: ${formatPercent(DAILY_OPEN_RISK_CAP_FRAC)} of TC`,
     `Fee Rate (per side): ${formatPercent(feeRate)}`,
-    "Exits: dynamic RRR per idea when provided; fallback 2:1.",
+    "Exits: native exchange TP/SL (CID-threaded) when supported; TTL fallback; RRR 2:1 baseline.",
     "",
     "In Auto mode, the bot opens/closes trades by itself, respecting budgets and EV gates. Review any time via Manage Trades."
   ].join("\n");
@@ -2058,24 +2858,16 @@ function confirmAutoTextB(bal, feeRate) {
 
 /* ---------- Cards ---------- */
 function fmtExecIntent(extra) {
-  const pol = String(extra?.entry?.policy || '').toLowerCase();
-  const ex = String(extra?.exec?.exec || '').toLowerCase();
-  const lim = extra?.entry?.limit;
+  const entry_policy = String(extra?.idea_fields?.entry_policy || '').toLowerCase();
+  const lim = extra?.idea_fields?.entry_limit;
   const parts = [];
-  if (pol) parts.push(`policy=${pol}`);
-  if (ex) parts.push(`exec=${ex}`);
+  if (entry_policy) parts.push(`policy=${entry_policy}`);
   if (isFinite(lim)) parts.push(`limit=${formatMoney(lim)}`);
   return parts.length ? parts.join(" | ") : "policy=market";
 }
 function fmtMgmtOverlay(extra) {
-  const m = extra?.mgmt || {};
-  const parts = [];
-  if (isFinite(m.be_at_r)) parts.push(`BE@${Number(m.be_at_r).toFixed(2)}R`);
-  if (isFinite(m.partial_take_at_r)) parts.push(`PT@${Number(m.partial_take_at_r).toFixed(2)}R x${Number(m.partial_take_pct ?? 0.5).toFixed(2)}`);
-  if (isFinite(m.trail_atr_mult) && m.trail_atr_mult > 0) parts.push(`Trail x${Number(m.trail_atr_mult).toFixed(2)}`);
-  if (m.extend_ttl_if_unrealized_bps_ge != null) parts.push(`TTL+ if >= ${String(m.extend_ttl_if_unrealized_bps_ge)}`);
-  if (m.early_cut_if_unrealized_bps_le != null) parts.push(`EarlyCut if <= ${String(m.early_cut_if_unrealized_bps_le)}`);
-  return parts.length ? parts.join(" | ") : "none";
+  // This worker does not apply dynamic mgmt overlay; display placeholder for parity.
+  return "none";
 }
 function pendingTradeCard(trade, extra) {
   const planned = Number(extra.quote_size || 0);
@@ -2123,6 +2915,12 @@ function openTradeDetails(trade, extra, currentPrice) {
   const entryIntent = fmtExecIntent(extra);
   const mgmtTxt = fmtMgmtOverlay(extra);
 
+  const exitCIDs = extra?.exits || {};
+  const cidLines = [];
+  if (exitCIDs?.cid_root) cidLines.push(`CID Root: ${exitCIDs.cid_root}`);
+  if (exitCIDs?.cid_tp) cidLines.push(`TP CID: ${exitCIDs.cid_tp}`);
+  if (exitCIDs?.cid_sl) cidLines.push(`SL CID: ${exitCIDs.cid_sl}`);
+
   return [
     `Trade #${trade.id}`,
     "",
@@ -2134,7 +2932,7 @@ function openTradeDetails(trade, extra, currentPrice) {
     `Stop: ${formatMoney(trade.stop_price)} (${formatPercent(trade.stop_pct)})`,
     `Target: ${formatMoney(trade.tp_price)} (RRR ${rTxt}:1)`,
     "",
-    `Quantity: ${Number(trade.qty || 0).toFixed(6)}`,
+    `Quantity: ${trade.qty.toFixed(6)}`,
     `Capital used at entry: ${formatMoney(notionalAtEntry)} (${formatPercent(pctEntry)} of TC at entry)`,
     `Risk (Final): ${formatMoney(trade.risk_usd)}`,
     "",
@@ -2142,9 +2940,10 @@ function openTradeDetails(trade, extra, currentPrice) {
     `USD: ${pnlUsd >= 0 ? "+" : ""}${formatMoney(pnlUsd)}`,
     `R: ${pnlR >= 0 ? "+" : ""}${pnlR.toFixed(2)}R`,
     "",
+    cidLines.join("\n"),
     `Mgmt overlay: ${mgmtTxt}`,
-    "SL/TP are enforced by the bot. You can Close Now anytime."
-  ].join("\n");
+    "SL/TP are enforced by the bot (native CID exits when supported). You can Close Now anytime."
+  ].filter(Boolean).join("\n");
 }
 function skippedTradeCard(trade, extra) {
   const lines = [
@@ -2164,7 +2963,6 @@ function skippedTradeCard(trade, extra) {
     if (typeof meta.required  !== 'undefined') lines.push(`Required:  ${formatMoney(meta.required)}`);
   }
   if (extra?.skip_reason === 'ev_gate' && typeof meta.EV_R !== 'undefined') lines.push(`EV_R: ${Number(meta.EV_R).toFixed(3)}`);
-  if (extra?.skip_reason === 'hse_gate' && typeof meta.pH  !== 'undefined') lines.push(`pH: ${Number(meta.pH).toFixed(2)}`);
   if (extra?.skip_reason === 'duplicate_symbol') {
     lines.push(`Duplicate exposure: already open or pending on ${trade.symbol}.`);
   }
@@ -2201,7 +2999,7 @@ function kbPendingTrade(tradeId, fundsOk) {
   if (fundsOk) rows.push([{ text: "Approve ✅", callback_data: `tr_appr:${tradeId}` }, { text: "Reject ❌", callback_data: `tr_rej:${tradeId}` }]);
   else rows.push([{ text: "Reject ❌", callback_data: `tr_rej:${tradeId}` }]);
   rows.push([{ text: "Continue ▶️", callback_data: "continue_dashboard" }]);
-  rows.push([{ text: "Back to list", callback_data: "manage_trades" }], [{ text: "Stop ⏸️", callback_data: "action_stop_confirm" }]);
+  rows.push([{ text: "Back to list", callback_data: "manage_trades" }], [{ text: "Stop ⛔", callback_data: "action_stop_confirm" }]);
   return rows;
 }
 function kbOpenTradeStrict(tradeId) {
@@ -2209,7 +3007,7 @@ function kbOpenTradeStrict(tradeId) {
     [{ text: "Close Now ⏹️", callback_data: `tr_close:${tradeId}` }, { text: "Refresh 🔄", callback_data: `tr_refresh:${tradeId}` }],
     [{ text: "Continue ▶️", callback_data: "continue_dashboard" }],
     [{ text: "Back to list", callback_data: "manage_trades" }],
-    [{ text: "Stop ⏸️", callback_data: "action_stop_confirm" }]
+    [{ text: "Stop ⛔", callback_data: "action_stop_confirm" }]
   ];
 }
 
@@ -2224,9 +3022,9 @@ async function sendDashboard(env, userId, messageId = 0) {
   const paused = (session.auto_paused || "false") === "true";
   let text;
   if (session.bot_mode === "manual") {
-    text = "Bot is active (Manual).\n\nExits: dynamic RRR per idea when provided; fallback 2:1.\nACP V20 sizing.\nUse Manage Trades to inspect suggestions and open/closed positions.";
+    text = "Bot is active (Manual).\n\nExits: native CID TP/SL when supported; TTL fallback.\nACP V20 sizing.\nUse Manage Trades to inspect suggestions and open/closed positions.";
   } else {
-    text = `Bot is active (Auto).\nStatus: ${paused ? "Paused" : "Running"}.\n\nExits: dynamic RRR per idea when provided; fallback 2:1.\nACP V20 sizing.\nUse Manage Trades to inspect positions.`;
+    text = `Bot is active (Auto).\nStatus: ${paused ? "Paused" : "Running"}.\n\nExits: native CID TP/SL when supported; TTL fallback.\nACP V20 sizing.\nUse Manage Trades to inspect positions.`;
   }
   const buttons = kbDashboard(session.bot_mode, paused, !!protocol, hasOpenPositions);
   if (messageId) await editMessage(userId, messageId, text, buttons, env);
@@ -2307,7 +3105,7 @@ async function sendTradeDetailsUI(env, userId, tradeId, messageId = 0) {
 
   if (trade.status === 'pending') {
     const text = pendingTradeCard(trade, extra);
-    const buttons = kbPendingTrade(tradeId, extra.funds_ok);
+    const buttons = kbPendingTrade(tradeId, extra.funds_ok !== false);
     if (messageId) await editMessage(userId, messageId, text, buttons, env);
     else await sendMessage(userId, text, buttons, env);
     return;
@@ -2337,6 +3135,7 @@ async function sendTradeDetailsUI(env, userId, tradeId, messageId = 0) {
     return;
   }
 
+  // Closed
   const tcAtEntry = Number(extra?.metrics?.tc_at_entry || 0);
   const notionalAtEntry = Number(extra?.metrics?.notional_at_entry || (trade.entry_price * trade.qty));
   const pctEntry = tcAtEntry > 0 ? notionalAtEntry / tcAtEntry : 0;
@@ -2378,25 +3177,20 @@ async function handleTradeAction(env, userId, action, messageId = 0) {
         break;
       }
       const extra = JSON.parse(row.extra_json || '{}');
-      if (extra.funds_ok !== true) {
-        await editMessage(userId, messageId, `Insufficient funds to approve trade #${tradeId}.`, [[{ text: "Continue ▶️", callback_data: "continue_dashboard" }]], env);
-        break;
-      }
-      // executeTrade is expected to exist in your app (manual mode flow)
+      // Execute regardless, sizing already validated
       const approved = await executeTrade(env, userId, tradeId);
       if (approved) await sendTradeDetailsUI(env, userId, tradeId, messageId);
       else await editMessage(userId, messageId, `Failed to execute trade #${tradeId}.`, [[{ text: "Continue ▶️", callback_data: "continue_dashboard" }]], env);
       break;
     }
     case 'tr_rej':
-      await env.DB.prepare("UPDATE trades SET status = 'rejected', updated_at = ? WHERE id = ? AND user_id = ?").bind(new Date().toISOString(), tradeId, userId).run();
+      await env.DB.prepare("UPDATE trades SET status = 'rejected', updated_at = ? WHERE id = ? AND user_id = ?").bind(nowISO(), tradeId, userId).run();
       await sendTradesListUI(env, userId, 1, messageId);
       break;
     case 'tr_refresh':
       await sendTradeDetailsUI(env, userId, tradeId, messageId);
       break;
     case 'tr_close': {
-      // closeTradeNow is expected to exist in your app (manual mode flow)
       const res = await closeTradeNow(env, userId, tradeId);
       if (res.ok) await sendTradeDetailsUI(env, userId, tradeId, messageId);
       else await editMessage(userId, messageId, `Close failed: ${res.msg}`, [[{ text: "Continue ▶️", callback_data: "continue_dashboard" }]], env);
@@ -2439,210 +3233,661 @@ async function showWelcomeStep(env, userId, messageId = 0) {
 
 /* ---------- Concurrency helpers ---------- */
 function getMaxConcurrent(env) {
-  const v = Number(env.MAX_CONCURRENT_POSITIONS || 3);
-  return Math.max(1, Math.floor(isFinite(v) ? v : 3));
+  const v = Number(env.MAX_CONCURRENT_POSITIONS || DEFAULT_MAX_CONCURRENT_POS);
+  return Math.max(1, Math.floor(isFinite(v) ? v : DEFAULT_MAX_CONCURRENT_POS));
 }
 function getMaxNewPerCycle(env) {
-  const v = Number(env.MAX_NEW_POSITIONS_PER_CYCLE || 3);
-  return Math.max(1, Math.floor(isFinite(v) ? v : 3));
+  const v = Number(env.MAX_NEW_POSITIONS_PER_CYCLE || DEFAULT_MAX_NEW_POSITIONS_PER_CYCLE);
+  return Math.max(1, Math.floor(isFinite(v) ? v : DEFAULT_MAX_NEW_POSITIONS_PER_CYCLE));
 }
+
+/* Exports */
+export {
+  welcomeText, modeText, exchangeText, askApiKeyText, askApiSecretText, confirmManualTextB, confirmAutoTextB,
+  pendingTradeCard, openTradeDetails, skippedTradeCard,
+  exchangeButtons, kbDashboard, kbPendingTrade, kbOpenTradeStrict,
+  sendDashboard, getTradeCounts, sendTradesListUI, sendTradeDetailsUI, handleTradeAction,
+  handleStopRequest, restartWizardAtExchange, showWelcomeStep,
+  getMaxConcurrent, getMaxNewPerCycle
+};
 
 /* ======================================================================
-   SECTION 7/7 — processUser (no-op for Gist), HTTP endpoints,
-                  Cron with Gist reconciliation, Worker export
+   SECTION 7/7 — processUser, Telegram handler, HTTP endpoints,
+                  Cron with fan-out fallback, Worker export
    ====================================================================== */
 
-/* ---------- Global execution credentials (Gist flow) ---------- */
-function getGlobalExecAccount(env) {
-  const exName = String(env.GLOBAL_EXCHANGE || env.EXCHANGE || "mexc").toLowerCase().trim();
-  const ex = SUPPORTED_EXCHANGES[exName];
-  if (!ex || !ex.hasOrders) return null;
-
-  let apiKey = "";
-  let apiSecret = "";
-
-  if (ex.kind === "binanceLike") {
-    apiKey    = String(env.MEXC_API_KEY || env.BINANCE_API_KEY || "").trim();
-    apiSecret = String(env.MEXC_SECRET_KEY || env.BINANCE_SECRET_KEY || "").trim();
-  } else if (ex.kind === "binanceFuturesUSDT") {
-    apiKey    = String(env.BINANCE_FUTURES_API_KEY || env.BINANCE_API_KEY || "").trim();
-    apiSecret = String(env.BINANCE_FUTURES_SECRET_KEY || env.BINANCE_SECRET_KEY || "").trim();
-  }
-
-  if (!apiKey || !apiSecret) return null;
-  return { exName, ex, apiKey, apiSecret };
-}
-
-/* ---------- Fee rate detection (cache in state.fees) ---------- */
-async function detectFeeRates(exec, state) {
+/* ---------- Per-user processing (flat-CPU: early exits, time guards) ---------- */
+async function processUser(env, userId, budget = null) {
   try {
-    if (state.fees && (state.fees.maker != null || state.fees.taker != null)) return;
-    if (exec.ex.kind === "binanceLike") {
-      const v = await verifyBinanceLike(exec.apiKey, exec.apiSecret, exec.ex);
-      if (v?.success && v.data?.fees) state.fees = { maker: v.data.fees.maker, taker: v.data.fees.taker };
-    } else if (exec.ex.kind === "binanceFuturesUSDT") {
-      const v = await verifyBinanceFutures(exec.apiKey, exec.apiSecret, exec.ex);
-      if (v?.success && v.data?.feeRate != null) state.fees = { maker: v.data.feeRate, taker: v.data.feeRate };
-    }
-  } catch {}
-}
+    if (budget?.isExpired()) return;
+    const session = await getSession(env, userId);
+    if (!session) return;
 
-/* ---------- Gist reconciliation loop (persist heartbeat every run) ---------- */
-async function runGistReconciliation(env) {
-  if (!gistEnabled(env)) return { ok: true, changed: false, reason: "gist_disabled" };
+    // Resolve exits first
+    await checkWorkingOrders(env, userId);
+    if (budget?.isExpired()) return;
 
-  const exec = getGlobalExecAccount(env);
-  if (!exec) {
-    console.warn("[gist] Missing GLOBAL_EXCHANGE or API keys; set GLOBAL_EXCHANGE and API key/secret envs.");
-    return { ok: false, changed: false, reason: "no_exec_creds" };
-  }
+    await checkAndExitTrades(env, userId);
+    if (budget?.isExpired()) return;
 
-  const { state, etag } = await loadGistState(env);
-  await detectFeeRates(exec, state);
+    const openPauseTh = Number(env.OPEN_PAUSE_THRESHOLD || 2);
+    const openCountNow = await getOpenPositionsCount(env, userId);
+    const overConcurrency = openCountNow >= openPauseTh;
 
-  const pending = Array.isArray(state.pending) ? [...state.pending] : [];
+    const protocol = await getProtocolState(env, userId);
+    if (session.status !== 'active' || !protocol || protocol.phase === 'terminated') return;
 
-  let changed = false;
-  for (const idea of pending) {
+    const maxPos = getMaxConcurrent(env);
+    const maxNew = getMaxNewPerCycle(env);
+
+    const TC = await getTotalCapital(env, userId);
+
+    // Notional budgets
+    const perTradeNotionalCapFrac = Number(env?.PER_TRADE_NOTIONAL_CAP_FRAC ?? 0.10);
+    const dailyNotionalCapFrac    = Number(env?.DAILY_OPEN_NOTIONAL_CAP_FRAC ?? 0.30);
+    const dailyNotionalCap        = dailyNotionalCapFrac * TC;
+    const openNotional            = await getOpenNotional(env, userId);
+    let dailyNotionalLeft         = Math.max(0, dailyNotionalCap - openNotional);
+
+    // Risk budgets
+    const D = DAILY_OPEN_RISK_CAP_FRAC * TC;
+    const openRisk = await getOpenPortfolioRisk(env, userId);
+    let D_left = Math.max(0, D - openRisk);
+
+    // Ideas (external push)
+    const ideas = await getLatestIdeas(env);
+    if (!ideas || !ideas.ideas || !ideas.ideas.length) return;
+
+    // Freshness guard
     try {
-      const res = await reconcilePendingIdea(env, state, idea, exec);
-      if (["closed","open","removed","skipped"].includes(res?.status)) changed = true;
-    } catch (e) {
-      console.error("[gist] reconcile error:", e?.message || e);
+      const ts = new Date(ideas.ts || 0).getTime();
+      const maxAgeMs = Number(env.IDEAS_MAX_AGE_MS || 20 * 60 * 1000);
+      if (!ts || (Date.now() - ts) > maxAgeMs) return;
+    } catch (_) {}
+
+    // Snapshot dedupe — process each ideas.ts only once per user
+    const ideasTs = String(ideas.ts || "");
+    const lastKey = `last_ideas_ts_user_${userId}`;
+    const lastSeenTs = await kvGet(env, lastKey);
+
+    // Early skip when nothing to do: no open positions and snapshot already processed
+    if (openCountNow === 0 && lastSeenTs && lastSeenTs === ideasTs) return;
+
+    // Duplicate symbols control map (per-cycle) — cross-cycle: no dups open/pending
+    const counts = new Map();
+    try {
+      const rowsCnt = await env.DB.prepare(
+        "SELECT symbol, COUNT(*) AS c FROM trades WHERE user_id = ? AND status IN ('open','pending') GROUP BY symbol"
+      ).bind(userId).all();
+      for (const r of (rowsCnt.results || [])) {
+        const s = String(r.symbol || '').toUpperCase();
+        const c = Number(r.c || 0);
+        if (s) counts.set(s, c);
+      }
+    } catch (_) {}
+
+    const activeSyms = await getActiveExposureSymbols(env, userId);
+    let placed = 0; // opened/pending count this cycle
+    const stopReason = (!D_left ? 'daily_risk_budget_exhausted' : (!dailyNotionalLeft ? 'daily_notional_exhausted' : null));
+
+    const ideasTsMs = new Date(ideas.ts || 0).getTime();
+
+    for (let idx = 0; idx < ideas.ideas.length; idx++) {
+      if (budget?.isExpired()) break;
+      budget?.ensure("ideas_loop");
+
+      const idea = ideas.ideas[idx];
+      const symU = String(idea.symbol || '').toUpperCase();
+      if (!symU) continue;
+
+      // TTL gating for stale idea
+      try {
+        const ttlMs = Number(idea.ttl_sec || 0) * 1000;
+        if (ttlMs > 0 && ideasTsMs > 0 && Date.now() - ideasTsMs > ttlMs) {
+          await createAutoSkipRecord(env, userId, idea, protocol, 'stale_idea_ttl', { ttl_sec: idea.ttl_sec });
+          continue;
+        }
+      } catch {}
+
+      // Duplicate symbol enforcement (cross-cycle: no duplicates)
+      const curCount = counts.get(symU) || 0;
+      if (curCount > 0) {
+        await createAutoSkipRecord(env, userId, idea, protocol, 'duplicate_symbol', { curCount, capPerSym: 1 });
+        continue;
+      }
+
+      // Concurrency limit (UNCONDITIONAL)
+      if (overConcurrency || (openCountNow + placed) >= maxPos) {
+        await createAutoSkipRecord(env, userId, idea, protocol, 'concurrency_limit', { openCountNow, placed, maxPos, th: openPauseTh });
+        continue;
+      }
+
+      // Budget stop reason
+      if (stopReason) {
+        await createAutoSkipRecord(env, userId, idea, protocol, stopReason, { D_left, dailyNotionalLeft });
+        continue;
+      }
+
+      // Try to create a pending trade
+      const beforeOpenRisk = await getOpenPortfolioRisk(env, userId);
+      const { id, meta } = await createPendingTrade(env, userId, idea, protocol);
+      if (!id) {
+        await createAutoSkipRecord(env, userId, idea, protocol, meta?.skipReason || 'unknown', meta);
+        continue;
+      }
+
+      // Execute (Auto) or show card (Manual)
+      if (session.bot_mode === 'auto' && session.auto_paused !== 'true') {
+        const executed = await executeTrade(env, userId, id);
+        if (!executed) {
+          await env.DB.prepare("UPDATE trades SET status = 'failed', updated_at = ? WHERE id = ?").bind(nowISO(), id).run();
+          continue;
+        }
+
+        // Update per-cycle duplicate count
+        counts.set(symU, (counts.get(symU) || 0) + 1);
+
+        activeSyms.add(symU);
+        placed++;
+
+        // Cycle cap enforcement (UNCONDITIONAL)
+        if (placed >= maxNew) {
+          for (const rest of ideas.ideas.slice(idx + 1)) {
+            await createAutoSkipRecord(env, userId, rest, protocol, 'cycle_cap_reached', { placed, maxNew });
+          }
+          break;
+        }
+
+        // Update budgets after open
+        const afterOpenRisk = await getOpenPortfolioRisk(env, userId);
+        D_left -= Math.max(0, afterOpenRisk - beforeOpenRisk);
+        const afterOpenNotional = await getOpenNotional(env, userId);
+        dailyNotionalLeft = Math.max(0, dailyNotionalCap - afterOpenNotional);
+      } else if (session.bot_mode === 'manual') {
+        // Fetch and show the pending card
+        const trow = await env.DB.prepare("SELECT * FROM trades WHERE id = ? AND user_id = ?").bind(id, userId).first();
+        const extra = JSON.parse(trow.extra_json || '{}');
+        await sendMessage(userId, pendingTradeCard(trow, extra), kbPendingTrade(id, extra.funds_ok !== false), env);
+
+        // Update per-cycle duplicate count
+        counts.set(symU, (counts.get(symU) || 0) + 1);
+
+        activeSyms.add(symU);
+        placed++;
+
+        if (placed >= maxNew) {
+          for (const rest of ideas.ideas.slice(idx + 1)) {
+            await createAutoSkipRecord(env, userId, rest, protocol, 'cycle_cap_reached', { placed, maxNew });
+          }
+          break;
+        }
+        dailyNotionalLeft -= Number(extra.quote_size || 0);
+      }
+
+      // If budgets became exhausted mid-loop, log the rest as exhausted
+      if ((D_left <= 0 || dailyNotionalLeft <= 0)) {
+        const reason = D_left <= 0 ? 'daily_risk_budget_exhausted' : 'daily_notional_exhausted';
+        for (const rest of ideas.ideas.slice(idx + 1)) {
+          await createAutoSkipRecord(env, userId, rest, protocol, reason, { D_left, dailyNotionalLeft });
+        }
+        break;
+      }
     }
-  }
 
-  // Heartbeat always; lastReconcileTs only on data changes
-  state.loop_heartbeat_ts = Date.now();
-  if (changed) state.lastReconcileTs = Date.now();
-
-  const saveHeartbeatAlways = envFlag(env, "HEARTBEAT_ALWAYS_SAVE", "1"); // default ON
-  if (changed || saveHeartbeatAlways) {
-    await saveGistState(env, state, etag);
-  }
-
-  return { ok: true, changed, reason: changed ? "updated" : "no_change" };
-}
-
-/* ---------- processUser (no-op for Gist-aligned worker) ---------- */
-async function processUser(_env, _userId, _budget = null) {
-  return;
-}
-
-/* ---------- HTTP endpoints ---------- */
-async function handleHealth() {
-  return new Response(JSON.stringify({ ok: true, time: nowISO() }), {
-    headers: { "Content-Type": "application/json" }
-  });
-}
-async function handleGistState(env, request) {
-  const token = String(env.TASK_TOKEN || "").trim();
-  const auth = request.headers.get("Authorization") || "";
-  if (token && (!auth.startsWith("Bearer ") || auth.split(" ")[1] !== token)) {
-    return new Response("Unauthorized", { status: 401 });
-  }
-  const { state } = await loadGistState(env);
-  return new Response(JSON.stringify(state), { headers: { "Content-Type": "application/json" } });
-}
-async function handleStateMirror(env, request) {
-  const token = String(env.TASK_TOKEN || "").trim();
-  const auth = request.headers.get("Authorization") || "";
-  if (token && (!auth.startsWith("Bearer ") || auth.split(" ")[1] !== token)) {
-    return new Response("Unauthorized", { status: 401 });
-  }
-  let db = {};
-  try {
-    const total   = (await env.DB.prepare("SELECT COUNT(*) AS c FROM trades").first())?.c || 0;
-    const open    = (await env.DB.prepare("SELECT COUNT(*) AS c FROM trades WHERE status='open'").first())?.c || 0;
-    const pending = (await env.DB.prepare("SELECT COUNT(*) AS c FROM trades WHERE status='pending'").first())?.c || 0;
-    const closed  = (await env.DB.prepare("SELECT COUNT(*) AS c FROM trades WHERE status='closed'").first())?.c || 0;
-    const rejected= (await env.DB.prepare("SELECT COUNT(*) AS c FROM trades WHERE status='rejected'").first())?.c || 0;
-    const users   = (await env.DB.prepare("SELECT COUNT(*) AS u FROM user_sessions WHERE status IN ('active','halted')").first())?.u || 0;
-    db = { counts: { total, open, pending, closed, rejected }, users };
+    // Mark this snapshot as processed for this user (prevents reprocessing every minute)
+    if (ideasTs) await kvSet(env, lastKey, ideasTs);
   } catch (e) {
-    db = { error: e?.message || "db_error" };
+    console.error(`processUser error for ${userId}:`, e);
+    await logEvent(env, userId, 'error', { where: 'processUser', message: e.message });
   }
-  const { state } = await loadGistState(env);
-  return new Response(JSON.stringify({ gist: state, db, ts: nowISO() }), { headers: { "Content-Type": "application/json" } });
-}
-async function handleGistReconcile(env, request) {
-  const token = String(env.TASK_TOKEN || "").trim();
-  const auth = request.headers.get("Authorization") || "";
-  if (token && (!auth.startsWith("Bearer ") || auth.split(" ")[1] !== token)) {
-    return new Response("Unauthorized", { status: 401 });
-  }
-  const res = await runGistReconciliation(env);
-  return new Response(JSON.stringify({ ok: res.ok, changed: res.changed, ts: nowISO(), reason: res.reason || "ok" }), {
-    headers: { "Content-Type": "application/json" }
-  });
 }
 
-/* ---------- Cron with lock: Gist reconciliation every run ---------- */
-async function runCron(env) {
-  const now = Date.now();
-  const existing = await env.DB.prepare(
-    "SELECT value FROM kv_state WHERE key = ? AND CAST(value AS INTEGER) > ?"
-  ).bind(CRON_LOCK_KEY, now - CRON_LOCK_TTL * 1000).first();
+/* ---------- Telegram update handler (debounced exits) ---------- */
+async function handleTelegramUpdate(update, env, ctx) {
+  const isCb = !!update.callback_query;
+  const msg = isCb ? update.callback_query.message : update.message;
+  if (!msg) return;
 
-  if (existing) {
-    console.log("Cron already running; skipping.");
+  const userId = msg.chat.id;
+  const text = isCb ? update.callback_query.data : (update.message.text || "");
+  const messageId = isCb ? update.callback_query.message.message_id : (update.message?.message_id || 0);
+  if (isCb) ctx.waitUntil(answerCallbackQuery(env, update.callback_query.id));
+
+  // Debounced checks: working orders + exits
+  try {
+    const openCount = await getOpenPositionsCount(env, userId);
+    if (openCount > 0) {
+      const k = `exit_check_ts_${userId}`;
+      const last = Number(await kvGet(env, k) || 0);
+      const now = Date.now();
+      if (now - last > 3000) {
+        await kvSet(env, k, now);
+        ctx.waitUntil(checkWorkingOrders(env, userId));
+        ctx.waitUntil(checkAndExitTrades(env, userId));
+      }
+    }
+  } catch (_) {}
+
+  let session = await getSession(env, userId);
+  if (!session) {
+    if (text !== "/start") { await sendMessage(userId, "Session expired. Send /start to begin.", null, env); return; }
+    session = await createSession(env, userId);
+  }
+
+  // Navigation quick handlers
+  if (text === "continue_dashboard" || text === "back_dashboard") { await sendDashboard(env, userId, isCb ? messageId : 0); return; }
+  if (text === "action_refresh_wizard") { await restartWizardAtExchange(env, userId, isCb ? messageId : 0); return; }
+
+  // Stop actions
+  if (text === "action_direct_stop") { await handleDirectStop(env, userId); return; }
+  if (text === "action_stop_confirm") {
+    if (["start","awaiting_accept","awaiting_mode","awaiting_exchange","awaiting_api_key","awaiting_api_secret"].includes(session.current_step)) {
+      await handleDirectStop(env, userId);
+    } else {
+      await handleStopRequest(env, userId, isCb ? messageId : 0);
+    }
+    return;
+  }
+  if (text === "action_stop_keep") {
+    await saveSession(env, userId, { status: 'halted' });
+    const t = "Session is alive. Send /continue to go to the Dashboard.";
+    if (isCb && messageId) await editMessage(userId, messageId, t, null, env); else await sendMessage(userId, t, null, env);
+    return;
+  }
+  if (text === "action_stop_closeall") {
+    const openTrades = await env.DB.prepare("SELECT id FROM trades WHERE user_id = ? AND status = 'open'").bind(userId).all();
+    let closed = 0;
+    for (const t of (openTrades.results || [])) { try { const res = await closeTradeNow(env, userId, t.id); if (res.ok) closed++; } catch(_){} }
+    const t = `All positions closed (${closed}).`; if (isCb && messageId) await editMessage(userId, messageId, t, null, env); else await sendMessage(userId, t, null, env);
+    await handleDirectStop(env, userId); return;
+  }
+  if (text === "action_wipe_keys") {
+    const openCount = await getOpenPositionsCount(env, userId);
+    if (openCount > 0) {
+      const t = "Cannot wipe keys while positions are open. Close them first.";
+      const b = [[{ text: "Continue ▶️", callback_data: "continue_dashboard" }]];
+      if (isCb && messageId) await editMessage(userId, messageId, t, b, env); else await sendMessage(userId, t, b, env);
+      return;
+    }
+    await saveSession(env, userId, { current_step: 'awaiting_exchange', api_key_encrypted: null, api_secret_encrypted: null });
+    await restartWizardAtExchange(env, userId, isCb ? messageId : 0);
+    return;
+  }
+  if (text === "action_retry_apikey") {
+    await saveSession(env, userId, { current_step: 'awaiting_api_key', temp_api_key: null });
+    if (isCb && messageId) await editMessage(userId, messageId, askApiKeyText(session.exchange_name), null, env);
+    else await sendMessage(userId, askApiKeyText(session.exchange_name), null, env);
+    return;
+  }
+  if (text === "clean_pending") {
+    await env.DB.prepare("DELETE FROM trades WHERE user_id = ? AND status IN ('pending','rejected')").bind(userId).run();
+    await resyncPacingFromDB(env, userId);
+    await sendTradesListUI(env, userId, 1, isCb ? messageId : 0);
+    return;
+  }
+  if (text === "action_delete_history") {
+    const openCount = await getOpenPositionsCount(env, userId);
+    if (openCount > 0) {
+      const t = "You have open positions. Close all current trades to delete history.";
+      const b = [[{ text: "Continue ▶️", callback_data: "continue_dashboard" }]];
+      if (isCb && messageId) await editMessage(userId, messageId, t, b, env); else await sendMessage(userId, t, b, env);
+      return;
+    }
+    try {
+      await env.DB.prepare("DELETE FROM events_log WHERE user_id = ?").bind(userId).run();
+      await env.DB.prepare("DELETE FROM trades WHERE user_id = ?").bind(userId).run();
+      await env.DB.prepare("DELETE FROM protocol_state WHERE user_id = ?").bind(userId).run();
+
+      // Reset KV (peak equity + pacing counters)
+      await kvSet(env, `peak_equity_user_${userId}`, 0);
+      const today = utcDayKey();
+      await kvSet(env, `tcr_today_date_${userId}`, today);
+      await kvSet(env, `tcr_today_count_${userId}`, 0);
+      await kvSet(env, `tcr_7d_roll_${userId}`, JSON.stringify({ last7: [] }));
+
+      await deleteSession(env, userId);
+      await createSession(env, userId);
+      await showWelcomeStep(env, userId, isCb ? messageId : 0);
+    } catch (e) {
+      console.error("action_delete_history error:", e);
+      const t = "Failed to delete history (internal error)."; const b = [[{ text: "Continue ▶️", callback_data: "continue_dashboard" }]];
+      if (isCb && messageId) await editMessage(userId, messageId, t, b, env); else await sendMessage(userId, t, b, env);
+    }
+    return;
+  }
+  if (text === "/continue") {
+    if (session.status === 'halted') { await saveSession(env, userId, { status: 'active' }); await sendDashboard(env, userId, isCb ? messageId : 0); }
+    else { const t = "Bot is already active."; if (isCb && messageId) await editMessage(userId, messageId, t, null, env); else await sendMessage(userId, t, null, env); }
     return;
   }
 
-  await env.DB.prepare("INSERT OR REPLACE INTO kv_state (key, value) VALUES (?, ?)").bind(CRON_LOCK_KEY, String(now)).run();
+  // Mode switches require no open positions
+  if (text === '/manual' || text === '/auto') {
+    const openCount = await getOpenPositionsCount(env, userId);
+    if (openCount > 0) {
+      const t = "Cannot change mode while positions are open. Close positions first.";
+      const b = [[{ text: "Continue ▶️", callback_data: "continue_dashboard" }]];
+      if (isCb && messageId) await editMessage(userId, messageId, t, b, env); else await sendMessage(userId, t, b, env);
+      return;
+    }
+  }
 
-  try {
-    await runGistReconciliation(env);
-  } catch (e) {
-    console.error("runCron error:", e);
-  } finally {
-    await env.DB.prepare("DELETE FROM kv_state WHERE key = ?").bind(CRON_LOCK_KEY).run();
+  // Slash commands
+  if (/^\/price\s+/i.test(text)) {
+    const parts = text.trim().split(/\s+/); const sym = (parts[1] || "").toUpperCase();
+    if (!sym) { await sendMessage(userId, "Usage: /price BTC", null, env); return; }
+    const p = await getCurrentPrice(sym); await sendMessage(userId, `${sym}USDT price: ${formatMoney(p)}`, null, env); return;
+  }
+  if (text.startsWith('/approve')) {
+    const id = parseInt((text.split(/\s+/)[1] || ''), 10);
+    const row = await env.DB.prepare("SELECT id, extra_json, status FROM trades WHERE user_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1").bind(userId).first();
+    const tradeId = id || row?.id;
+    if (!tradeId) { await sendMessage(userId, "No pending trade to approve.", null, env); return; }
+    const row2 = row || await env.DB.prepare("SELECT extra_json, status FROM trades WHERE id = ? AND user_id = ?").bind(tradeId, userId).first();
+    if (!row2 || row2.status !== 'pending') { await sendMessage(userId, `Trade #${tradeId} not pending.`, null, env); return; }
+    const ok = await executeTrade(env, userId, tradeId);
+    await sendMessage(userId, ok ? `Trade #${tradeId} approved and executed.` : `Failed to execute trade #${tradeId}.`, null, env);
+    return;
+  }
+  if (text.startsWith('/reject')) {
+    const id = parseInt((text.split(/\s+/)[1] || ''), 10);
+    const row = await env.DB.prepare("SELECT id FROM trades WHERE user_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1").bind(userId).first();
+    const tradeId = id || row?.id;
+    if (!tradeId) { await sendMessage(userId, "No pending trade to reject.", null, env); return; }
+    await env.DB.prepare("UPDATE trades SET status = 'rejected', updated_at = ? WHERE id = ? AND user_id = ?").bind(nowISO(), tradeId, userId).run();
+    await sendMessage(userId, `Trade #${tradeId} rejected.`, null, env);
+    return;
+  }
+  if (text.startsWith('/refresh')) {
+    const id = parseInt((text.split(/\s+/)[1] || ''), 10);
+    if (!id) { await sendMessage(userId, "Usage: /refresh <tradeId>", null, env); return; }
+    await sendTradeDetailsUI(env, userId, id);
+    return;
+  }
+  if (text.startsWith('/close')) {
+    const id = parseInt((text.split(/\s+/)[1] || ''), 10);
+    if (!id) { await sendMessage(userId, "Usage: /close <tradeId>", null, env); return; }
+    const res = await closeTradeNow(env, userId, id);
+    await sendMessage(userId, res.ok ? `Closed trade #${id}.` : `Close failed: ${res.msg}`, null, env);
+    return;
+  }
+  if (text === '/trades') { await sendTradesListUI(env, userId, 1); return; }
+  if (text === '/funds')  { const bal = await getWalletBalance(env, userId); await sendMessage(userId, `Wallet Available (USDT): ${formatMoney(bal)}`, null, env); return; }
+  if (text === '/detect') {
+    const s2 = await getSession(env, userId);
+    if (!s2?.api_key_encrypted) { await sendMessage(userId, "No API keys saved yet.", null, env); return; }
+    const apiKey = await decrypt(s2.api_key_encrypted, env);
+    const apiSecret = await decrypt(s2.api_secret_encrypted, env);
+    const res = await verifyApiKeys(apiKey, apiSecret, s2.exchange_name);
+    if (!res.success) { await sendMessage(userId, `Detect failed: ${res.reason}`, null, env); return; }
+    const detectedBal = parseFloat(String(res.data.balance || "0").replace(" USDT",""));
+    const feeRate = res.data.feeRate ?? 0.001;
+    const protocol = await getProtocolState(env, userId);
+    if (!protocol) {
+      await initProtocolDynamic(env, userId, feeRate, 0.01);
+      await sendMessage(userId, `Protocol initialized.\nBalance: ${formatMoney(detectedBal)}\nFee: ${formatPercent(feeRate)}`, null, env);
+    } else {
+      await updateProtocolState(env, userId, { fee_rate: feeRate });
+      await sendMessage(userId, `Detected.\nBalance: ${formatMoney(detectedBal)}\nFee updated: ${formatPercent(feeRate)}`, null, env);
+    }
+    return;
+  }
+  if (text.startsWith('/risk')) { await sendMessage(userId, "ACP V20 uses EV-based sizing with strict budgets; /risk is informational only.", null, env); return; }
+  if (text === '/manual') { await saveSession(env, userId, { bot_mode: 'manual', status: 'active' }); await sendDashboard(env, userId, isCb ? messageId : 0); return; }
+  if (text === '/auto')   { await saveSession(env, userId, { bot_mode: 'auto', status: 'active', auto_paused: 'false' }); await sendDashboard(env, userId, isCb ? messageId : 0); return; }
+  if (text === '/pause')  { await saveSession(env, userId, { auto_paused: 'true' }); await sendDashboard(env, userId, isCb ? messageId : 0); return; }
+  if (text === '/resume') { await saveSession(env, userId, { auto_paused: 'false' }); await sendDashboard(env, userId, isCb ? messageId : 0); return; }
+
+  // Navigation
+  if (text === "manage_trades") { await sendTradesListUI(env, userId, 1, isCb ? messageId : 0); return; }
+  if (text === "action_back_to_exchange") { await saveSession(env, userId, { current_step: 'awaiting_exchange' }); await restartWizardAtExchange(env, userId, isCb ? messageId : 0); return; }
+  if (text === "auto_toggle") {
+    const row = await env.DB.prepare("SELECT auto_paused FROM user_sessions WHERE user_id = ?").bind(userId).first();
+    const paused = (row?.auto_paused || "false") === "true";
+    await saveSession(env, userId, { auto_paused: paused ? "false" : "true" });
+    await sendDashboard(env, userId, isCb ? messageId : 0);
+    return;
+  }
+  if (text === "/report" || text === "protocol_status") { await renderProtocolStatus(env, userId, isCb ? messageId : 0); return; }
+
+  // Wizard state machine (condensed)
+  let nextStep = session.current_step, updates = {};
+  switch (session.current_step) {
+    case "start": if (text === "/start") nextStep = "awaiting_accept"; break;
+    case "awaiting_accept": if (text === "action_accept_terms") nextStep = "awaiting_mode"; break;
+    case "awaiting_mode":
+      if (text === "mode_manual" || text === "mode_auto") { updates.bot_mode = text === "mode_manual" ? "manual" : "auto"; nextStep = "awaiting_exchange"; }
+      else if (text === "action_back_to_start") nextStep = "awaiting_accept"; break;
+    case "awaiting_exchange":
+      if (text.startsWith("exchange_")) {
+        const exKey = text.slice("exchange_".length);
+        if (SUPPORTED_EXCHANGES[exKey]) { updates.exchange_name = exKey; nextStep = "awaiting_api_key"; }
+      } else if (text === "action_back_to_mode") nextStep = "awaiting_mode";
+      break;
+    case "awaiting_api_key":
+      if (!isCb) { updates.temp_api_key = text; nextStep = "awaiting_api_secret"; }
+      else if (text === "action_back_to_exchange") nextStep = "awaiting_exchange";
+      break;
+    case "awaiting_api_secret":
+      if (!isCb) {
+        const tempKey = session.temp_api_key; const exName = session.exchange_name;
+        if (tempKey && exName) {
+          try {
+            const result = await verifyApiKeys(tempKey, text, exName);
+            if (result.success) {
+              updates.api_key_encrypted = await encrypt(tempKey, env);
+              updates.api_secret_encrypted = await encrypt(text, env);
+              updates.temp_api_key = null;
+              const detectedBal = parseFloat(String(result.data.balance || "0").replace(" USDT",""));
+              const feeRate = result.data.feeRate ?? 0.001;
+              await initProtocolDynamic(env, userId, feeRate, 0.01);
+              updates.pending_action_data = JSON.stringify({ bal: detectedBal, feeRate });
+              nextStep = session.bot_mode === 'manual' ? "confirm_manual" : "confirm_auto_funds";
+            } else {
+              const t = `Key check failed.\nReason: ${result.reason || "Unknown error"}`;
+              if (isCb && messageId) await editMessage(userId, messageId, t, [[{ text: "Try again", callback_data: "action_retry_apikey" }], [{ text: "Stop", callback_data: "action_direct_stop" }]], env);
+              else await sendMessage(userId, t, [[{ text: "Try again", callback_data: "action_retry_apikey" }], [{ text: "Stop", callback_data: "action_direct_stop" }]], env);
+              return;
+            }
+          } catch (e) {
+            const t = "Key check failed.\nReason: internal error";
+            if (isCb && messageId) await editMessage(userId, messageId, t, [[{ text: "Try again", callback_data: "action_retry_apikey" }], [{ text: "Stop", callback_data: "action_direct_stop" }]], env);
+            else await sendMessage(userId, t, [[{ text: "Try again", callback_data: "action_retry_apikey" }], [{ text: "Stop", callback_data: "action_direct_stop" }]], env);
+            return;
+          }
+        }
+      }
+      break;
+    case "confirm_manual":
+      if (text === "action_start_manual") {
+        updates.status = 'active';
+        updates.needs_protocol_onboarding = 'true';
+        nextStep = "active_manual_running";
+        await renderProtocolStatus(env, userId, isCb ? messageId : 0);
+      } break;
+    case "confirm_auto_funds":
+      if (text === "action_start_auto") {
+        const bal = await getWalletBalance(env, userId);
+        if (bal < 16) {
+          const t = `Wallet available: ${formatMoney(bal)}. Please deposit to enable auto trades.`;
+          if (isCb && messageId) await editMessage(userId, messageId, t, [[{ text: "Wipe API Key & Go Back", callback_data: "action_wipe_keys" }]], env);
+          else await sendMessage(userId, t, [[{ text: "Wipe API Key & Go Back", callback_data: "action_wipe_keys" }]], env);
+          return;
+        }
+        updates.status = 'active';
+        updates.auto_paused = 'false';
+        updates.needs_protocol_onboarding = 'true';
+        nextStep = "active_auto_running";
+        await renderProtocolStatus(env, userId, isCb ? messageId : 0);
+      } break;
+    case "active_manual_running":
+    case "active_auto_running":
+      break;
+  }
+
+  let outText = "", buttons = null;
+  switch (nextStep) {
+    case "awaiting_accept":
+      outText = welcomeText();
+      buttons = [[{ text: "Accept ✅", callback_data: "action_accept_terms" }],[{ text: "Stop ⛔", callback_data: "action_stop_confirm" }]];
+      break;
+    case "awaiting_mode":
+      outText = modeText();
+      buttons = [[{ text: "Manual (approve each trade)", callback_data: "mode_manual" }],[{ text: "Fully Automatic", callback_data: "mode_auto" }],[{ text: "Back ◀️", callback_data: "action_back_to_start" },{ text: "Stop ⛔", callback_data: "action_stop_confirm" }]];
+      break;
+    case "awaiting_exchange":
+      outText = exchangeText(); buttons = exchangeButtons(); break;
+    case "awaiting_api_key":
+      outText = askApiKeyText(session.exchange_name);
+      buttons = [[{ text: "Back ◀️", callback_data: "action_back_to_exchange" }],[{ text: "Stop ⛔", callback_data: "action_stop_confirm" }]];
+      break;
+    case "awaiting_api_secret":
+      outText = askApiSecretText();
+      buttons = [[{ text: "Back ◀️", callback_data: "action_back_to_exchange" }],[{ text: "Stop ⛔", callback_data: "action_stop_confirm" }]];
+      break;
+    case "confirm_manual": {
+      const { bal, feeRate } = JSON.parse(updates.pending_action_data || session.pending_action_data || '{}');
+      outText = confirmManualTextB(bal ?? 0, feeRate ?? 0.001);
+      buttons = [[{ text: "Start Manual ▶️", callback_data: "action_start_manual" }],[{ text: "Wipe API Key & Go Back", callback_data: "action_wipe_keys" }]];
+      break;
+    }
+    case "confirm_auto_funds": {
+      const { bal, feeRate } = JSON.parse(updates.pending_action_data || session.pending_action_data || '{}');
+      outText = confirmAutoTextB(bal ?? 0, feeRate ?? 0.001);
+      buttons = [[{ text: "Yes, Start Auto 🚀", callback_data: "action_start_auto" }],[{ text: "Wipe API Key & Go Back", callback_data: "action_wipe_keys" }]];
+      break;
+    }
+    default: /* no text */ ;
+  }
+
+  updates.current_step = nextStep;
+  await saveSession(env, userId, updates);
+  if (outText) {
+    if (isCb && messageId) await editMessage(userId, messageId, outText, buttons, env);
+    else await sendMessage(userId, outText, buttons, env);
   }
 }
 
-/* ---------- Worker export ---------- */
+/* ---------- Cron with fan out fallback ---------- */
+async function runCron(env) {
+  const lockValue = Date.now().toString();
+  const existing = await env.DB.prepare(
+    "SELECT value FROM kv_state WHERE key = ? AND CAST(value AS INTEGER) > ?"
+  ).bind(CRON_LOCK_KEY, Date.now() - CRON_LOCK_TTL * 1000).first();
+  if (existing) { console.log('Cron already running, skipping'); return; }
+
+  await env.DB.prepare("INSERT OR REPLACE INTO kv_state (key, value) VALUES (?, ?)").bind(CRON_LOCK_KEY, lockValue).run();
+
+  try {
+    // Active users
+    const activeUsers = await env.DB
+      .prepare("SELECT user_id FROM user_sessions WHERE status IN ('active','halted') AND bot_mode IN ('manual','auto')")
+      .all();
+
+    // Config
+    const base = String(env.SELF_BASE_URL || "").trim().replace(/\/+$/, "");
+    const token = String(env.TASK_TOKEN || "").trim();
+    const haveTaskEndpoint = !!base && !!token;
+    const forceInline = String(env.DEBUG_FORCE_INLINE || "0") === "1";
+
+    for (const u of (activeUsers.results || [])) {
+      const uid = u.user_id;
+      const budgetMs = Number(env.USER_CPU_BUDGET_MS || 20000);
+
+      if (haveTaskEndpoint && !forceInline) {
+        try {
+          const url = `${base}/task/process-user?uid=${encodeURIComponent(uid)}`;
+          const r = await safeFetch(url, {
+            method: "POST",
+            headers: { "Authorization": `Bearer ${token}` }
+          }, 6000);
+
+          if (!r || !r.ok) {
+            console.warn("[cron] fanout non-OK; fallback inline", { uid, status: r?.status });
+            await processUser(env, uid, createCpuBudget(budgetMs));
+          }
+        } catch (e) {
+          console.error("[cron] fanout error; fallback inline", { uid, err: e?.message || e });
+          await processUser(env, uid, createCpuBudget(budgetMs));
+        }
+      } else {
+        // Inline mode
+        await processUser(env, uid, createCpuBudget(budgetMs));
+      }
+    }
+  } catch (e) {
+    console.error("runCron error:", e);
+  } finally {
+    await env.DB.prepare("DELETE FROM kv_state WHERE key = ? AND value = ?").bind(CRON_LOCK_KEY, lockValue).run();
+  }
+}
+
+/* ---------- Worker Export ---------- */
 export default {
   async fetch(request, env, ctx) {
     try {
       const url = new URL(request.url);
 
-      if (url.pathname === "/health" && request.method === "GET") {
-        return await handleHealth();
-      }
-      if (url.pathname === "/gist/state" && request.method === "GET") {
-        return await handleGistState(env, request);
-      }
-      if (url.pathname === "/state" && request.method === "GET") {
-        return await handleStateMirror(env, request);
-      }
-      if (url.pathname === "/gist/reconcile" && request.method === "POST") {
-        return await handleGistReconcile(env, request);
-      }
-
-      // Legacy compatibility endpoints (optional)
+      // Per-user task endpoint (self-fan-out), token-protected
       if (url.pathname === "/task/process-user" && request.method === "POST") {
-        const token = String(env.TASK_TOKEN || "").trim();
         const auth = request.headers.get("Authorization") || "";
-        const good = token ? (auth.startsWith("Bearer ") && auth.split(" ")[1] === token) : true;
+        const token = String(env.TASK_TOKEN || "").trim();
+        const good = auth.startsWith("Bearer ") && auth.split(" ")[1] === token;
         if (!good) return new Response("Unauthorized", { status: 401 });
+
         const uid = url.searchParams.get("uid");
         if (!uid) return new Response("Missing uid", { status: 400 });
-        ctx.waitUntil(processUser(env, uid, null));
-        return new Response(JSON.stringify({ ok: true, uid }), { headers: { "Content-Type": "application/json" } });
+
+        try {
+          const ms = Number(env.TASK_WALL_BUDGET_MS || 12000);
+          await processUser(env, uid, createCpuBudget(ms));
+          return new Response(JSON.stringify({ ok: true, uid }), { headers: { "Content-Type": "application/json" } });
+        } catch (e) {
+          console.error("task/process-user error:", e);
+          return new Response(JSON.stringify({ ok: false, error: e.message || "fail" }), {
+            status: 500, headers: { "Content-Type": "application/json" }
+          });
+        }
+      }
+
+      if (url.pathname === "/health") {
+        return new Response(JSON.stringify({ ok: true, time: nowISO() }), { headers: { "Content-Type": "application/json" } });
+      }
+
+      if (url.pathname === "/telegram" && request.method === "POST") {
+        const update = await request.json();
+        await handleTelegramUpdate(update, env, ctx);
+        return new Response("OK");
       }
 
       if (url.pathname === "/signals/push" && request.method === "POST") {
-        const expected = String(env.PUSH_TOKEN || "").trim();
+        // Optional bearer protection (set PUSH_TOKEN to enforce)
         const auth = request.headers.get("Authorization") || "";
-        if (expected && auth !== `Bearer ${expected}`) return new Response("Unauthorized", { status: 401 });
+        const expected = String(env.PUSH_TOKEN || "").trim();
+        if (expected && auth !== `Bearer ${expected}`) {
+          console.warn("[push] 401 unauthorized");
+          return new Response("Unauthorized", { status: 401 });
+        }
 
         let ideas;
-        try { ideas = await request.json(); } catch { return new Response("Bad JSON", { status: 400 }); }
+        try {
+          ideas = await request.json();
+        } catch (e) {
+          console.error("[push] bad json", e);
+          return new Response("Bad JSON", { status: 400 });
+        }
+
+        // Visibility in logs
+        const len = Array.isArray(ideas?.ideas) ? ideas.ideas.length : 0;
+        console.log(`[push] received ${len} ideas, origin=${ideas?.meta?.origin}, ts=${ideas?.ts || nowISO()}`);
+
         try {
           await env.DB.prepare("INSERT INTO ideas (ts, mode, ideas_json) VALUES (?, ?, ?)")
             .bind(ideas.ts || nowISO(), ideas.mode || 'normal', JSON.stringify(ideas)).run();
+          console.log("[push] stored ideas snapshot in D1");
           return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
         } catch (e) {
+          console.error("[push] D1 insert error:", e);
           return new Response("DB error", { status: 500 });
         }
       }
@@ -2658,3 +3903,5 @@ export default {
     await runCron(env);
   },
 };
+
+
