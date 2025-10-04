@@ -1191,8 +1191,8 @@ async function verifyLBank(apiKey, apiSecret, ex) {
   const url = `${ex.baseUrl}${path}`;
   const res = await safeFetch(url, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body }, 6000);
   const data = await res.json().catch(()=>({}));
-  if (!res.ok || data?.result === false) return { success: false, reason: data?.error_code || data?.msg || `HTTP ${res.status}` };
-  return { success: true, data: { balance: parseUSDT_LBank(data) + " USDT" } };
+  if (!res.ok || data?.result === false) throw new Error(data?.error_code || data?.msg || `HTTP ${res.status}`);
+  return { orderId: data.order_id, executedQty: 0, avgPrice: 0, status: "NEW" };
 }
 
 /* ---------- Verify API keys (dispatcher) ---------- */
@@ -1860,7 +1860,7 @@ function makerTakerSummary(trades) {
 }
 function avgPxQtyFromTrades(trades) {
   let q=0, v=0;
-  for (const tr of trades||[]) {
+  for (const tr of (trades||[])) {
     const qty = parseFloat(tr.qty || tr.executedQty || tr.qty_filled || tr.baseQty || 0);
     const px  = parseFloat(tr.price || tr.p || tr.avgPrice || 0);
     if (isFinite(qty) && isFinite(px) && qty>0 && px>0) { q += qty; v += qty*px; }
@@ -1897,6 +1897,63 @@ async function commissionFromTradesUSDT(trades, base) {
   return total;
 }
 
+// Approx fee fallback (used by demo or when no precise fills are present)
+function approxCommissionFromNotional(entryNotional, exitNotional, feeRatePerSide) {
+  const f = Number(feeRatePerSide || 0);
+  const eN = Math.max(0, Number(entryNotional || 0));
+  const xN = Math.max(0, Number(exitNotional || 0));
+  const commission_quote_usdt = (eN + xN) * f;
+  const commission_bps = eN > 0 ? Math.round((commission_quote_usdt / eN) * 10000) : 0;
+  return { commission_quote_usdt, commission_bps };
+}
+
+/* Demo TP/SL evaluation from 1m klines — earliest hit since entry */
+async function evaluateDemoExit(idea, base, entryPrice, entryTsMs) {
+  try {
+    const short = isShortSide(idea);
+    const tpBps = Number(idea.tp_bps || 0);
+    const slBps = Number(idea.sl_bps || 0);
+
+    let tpAbs = Number(idea.tp_abs || NaN);
+    let slAbs = Number(idea.sl_abs || NaN);
+    if (!(tpAbs>0) || !(slAbs>0)) {
+      if (short) {
+        if (!(tpAbs>0)) tpAbs = entryPrice * (1 - tpBps/10000);
+        if (!(slAbs>0)) slAbs = entryPrice * (1 + slBps/10000);
+      } else {
+        if (!(tpAbs>0)) tpAbs = entryPrice * (1 + tpBps/10000);
+        if (!(slAbs>0)) slAbs = entryPrice * (1 - slBps/10000);
+      }
+    }
+
+    const since = Math.max(0, Number(entryTsMs || 0) - 60_000);
+    const kl1m = await fetchKlinesRange(base, "1m", since, Date.now() + 60_000);
+    if (!Array.isArray(kl1m) || kl1m.length === 0) return null;
+
+    let best = null; // {reason, exitPrice, exitTsMs}
+    for (const k of kl1m) {
+      const hi = Number(k[2] || 0);
+      const lo = Number(k[3] || 0);
+      const ts = Number(k[6] || k[0] || 0);
+
+      if (!short) {
+        const tpHit = isFinite(hi) && hi >= tpAbs;
+        const slHit = isFinite(lo) && lo <= slAbs;
+        if (tpHit) { best = { reason: "tp", exitPrice: tpAbs, exitTsMs: ts }; break; }
+        if (slHit) { best = { reason: "sl", exitPrice: slAbs, exitTsMs: ts }; break; }
+      } else {
+        const tpHit = isFinite(lo) && lo <= tpAbs;  // favorable for short
+        const slHit = isFinite(hi) && hi >= slAbs;  // adverse for short
+        if (tpHit) { best = { reason: "tp", exitPrice: tpAbs, exitTsMs: ts }; break; }
+        if (slHit) { best = { reason: "sl", exitPrice: slAbs, exitTsMs: ts }; break; }
+      }
+    }
+    return best;
+  } catch {
+    return null;
+  }
+}
+
 /* ---------- Entry placement (if not present) ---------- */
 async function ensureEntryOrderExists(idea, exAccount) {
   const { ex, apiKey, apiSecret } = exAccount || {};
@@ -1907,6 +1964,14 @@ async function ensureEntryOrderExists(idea, exAccount) {
   const side = entrySideToOrderSide(idea);
   const notional = Number(idea.notional_usd || idea.notional_usdt || 0);
   if (!cid || !(notional > 0) || !base) return null;
+
+  if (ex.kind === 'demoParrot') {
+    try {
+      // Simulate immediate fill at live price
+      const o = await placeDemoOrder(base, side, notional, true, cid);
+      return { orderId: o.orderId, executedQty: o.executedQty, avgPrice: o.avgPrice, status: o.status || "FILLED" };
+    } catch { return null; }
+  }
 
   if (ex.kind === 'binanceLike') {
     // Spot: only long entries supported
@@ -1975,6 +2040,14 @@ async function ensureOrResizeBracketExits(state, idea, exAccount, entryPrice, fi
   const slOrder = (orders||[]).find(o => String(o.clientOrderId||"") === slCID && ["NEW","PARTIALLY_FILLED"].includes(String(o.status||"").toUpperCase()));
   const haveBoth = !!tpOrder && !!slOrder;
 
+  if (ex.kind === 'demoParrot') {
+    // No exchange orders; just record exits metadata
+    if (!meta.placed || needResize) {
+      updatePendingOpenByCID(state, cid, { exits: { placed: true, via: "demo", placed_qty: filledQty, tp_abs: tpAbs, sl_abs: slAbs } });
+    }
+    return;
+  }
+
   if (ex.kind === 'binanceLike') {
     // Spot long-only exits; use OCO when supported
     if (isShort) return; // safety
@@ -2029,16 +2102,154 @@ async function reconcilePendingIdea(env, state, idea, exAccount) {
     const base = ideaBaseFromSymbolFull(idea);
     const { ex, apiKey, apiSecret } = exAccount || {};
     const since = Math.max(0, Number(idea.ts_ms || 0) - 60_000);
+    const isDemo = ex?.kind === 'demoParrot';
 
     if (!ex || !apiKey || !apiSecret) return { status: 'error', reason: 'no_exec_creds' };
 
-    // Remove unsupported spot shorts immediately (so they don't linger)
+    // Remove unsupported spot shorts immediately (only for binanceLike)
     if (ex.kind === 'binanceLike' && isShortSide(idea)) {
       console.warn(`[gist] Removing unsupported spot short ${base} (CID ${cid})`);
       removePendingByCID(state, cid);
       return { status: 'removed', cid, reason: 'spot_short_unsupported' };
     }
 
+    // Helper to compute fee side
+    const resolvedFeeSide = Number((state?.fees && (state.fees.taker ?? state.fees.maker)) ?? env?.FEE_RATE_PER_SIDE ?? 0.001);
+
+    if (isDemo) {
+      // DEMO FLOW — no exchange queries; simulate fills and exits using prices/klines
+      const st = String(idea.status || "planned").toLowerCase();
+
+      // If planned, "enter" now if not already open
+      if (st === "planned") {
+        const side = entrySideToOrderSide(idea);
+        const notional = Number(idea.notional_usd || idea.notional_usdt || 0);
+        if (notional > 0) {
+          // Simulate market entry
+          const o = await placeDemoOrder(base, side, notional, true, cid);
+          const entryPrice = Number(o.avgPrice || 0);
+          const qty = Number(o.executedQty || 0);
+          const entryTsMs = Date.now();
+
+          updatePendingOpenByCID(state, cid, {
+            status: "open",
+            entry_ts_ms: entryTsMs,
+            entry_price: entryPrice,
+            qty
+          });
+
+          // Record exits metadata (demo)
+          await ensureOrResizeBracketExits(state, { ...idea, entry_price: entryPrice }, exAccount, entryPrice, qty, null);
+        } else {
+          return { status: 'pending', cid };
+        }
+      }
+
+      // From here treat it as open
+      const openIdea = (state.pending||[]).find(x => String(x.client_order_id||"") === cid);
+      const entryPrice = Number(openIdea?.entry_price || idea.entry_price || 0);
+      const entryQty   = Number(openIdea?.qty || idea.qty || 0);
+      const entryTsMs  = Number(openIdea?.entry_ts_ms || idea.entry_ts_ms || Date.now());
+      if (!(entryPrice > 0 && entryQty > 0)) return { status: 'pending', cid };
+
+      // Resolve absolute exits from (possibly) updated metadata
+      const meta = openIdea?.exits || idea.exits || {};
+      const short = isShortSide(idea);
+      let tpAbs = Number(meta.tp_abs || idea.tp_abs || NaN);
+      let slAbs = Number(meta.sl_abs || idea.sl_abs || NaN);
+      if (!(tpAbs>0) || !(slAbs>0)) {
+        const tpBps = Number(idea.tp_bps || 0), slBps = Number(idea.sl_bps || 0);
+        if (short) {
+          if (!(tpAbs>0)) tpAbs = entryPrice * (1 - tpBps/10000);
+          if (!(slAbs>0)) slAbs = entryPrice * (1 + slBps/10000);
+        } else {
+          if (!(tpAbs>0)) tpAbs = entryPrice * (1 + tpBps/10000);
+          if (!(slAbs>0)) slAbs = entryPrice * (1 - slBps/10000);
+        }
+      }
+
+      // First: TP/SL detection from klines since entry
+      let exit = await evaluateDemoExit(idea, base, entryPrice, entryTsMs);
+
+      // Second: TTL market close if past TTL and still no exit
+      const ttlTs = Number(
+        idea.ttl_ts_ms ||
+        ((entryTsMs && Number(idea.hold_sec)) ? (entryTsMs + 1000 * Number(idea.hold_sec)) : 0)
+      );
+      if (!exit && envFlag(env, "ENABLE_TTL_MARKET_CLOSE", "1") && isFinite(ttlTs) && ttlTs > 0 && Date.now() >= ttlTs) {
+        const px = await getCurrentPrice(base, entryPrice);
+        exit = { reason: "ttl", exitPrice: Number(px || entryPrice), exitTsMs: Date.now() };
+      }
+
+      if (!exit) return { status: 'open', cid };
+
+      // Compute net pnl and close
+      const entryNotional = entryPrice * entryQty;
+      const exitNotional  = exit.exitPrice * entryQty;
+      const up = !short;
+      const ret = up ? (exit.exitPrice/entryPrice - 1) : (entryPrice/exit.exitPrice - 1);
+
+      // Commission (approx for demo)
+      const approx = approxCommissionFromNotional(entryNotional, exitNotional, resolvedFeeSide);
+      const commission_quote_usdt = approx.commission_quote_usdt;
+      const commission_bps = approx.commission_bps;
+
+      // PnL (net of commissions)
+      const pnl_bps = Math.round(ret*10000) - commission_bps;
+      const exit_outcome = (pnl_bps > 0) ? "win" : "loss";
+
+      // MFE/MAE (optional)
+      let mfe_bps = 0, mae_bps = 0;
+      if (envFlag(env, "MFE_MAE_ENABLE", "1")) {
+        try {
+          const kl1m = await fetchKlinesRange(base, "1m", Number(entryTsMs)-60_000, Number(exit.exitTsMs)+60_000);
+          const r = computeMFE_MAE(entryPrice, idea.side, kl1m);
+          mfe_bps = r.mfe_bps || 0;
+          mae_bps = r.mae_bps || 0;
+        } catch (e) {
+          console.warn("[gist] MFE/MAE compute warn (demo):", e?.message || e);
+        }
+      }
+
+      appendClosed(state, {
+        symbolFull: idea.symbolFull || `${base}USDT`,
+        side: idea.side,
+        pnl_bps,
+        ts_entry_ms: Number(entryTsMs),
+        ts_exit_ms: Number(exit.exitTsMs),
+        price_entry: entryPrice,
+        price_exit: exit.exitPrice,
+        qty: entryQty,
+        reconciliation: "demo_sim",
+        exit_reason: exit.reason,
+        exit_outcome,
+        p_pred: idea.p_lcb,
+        p_raw: idea.p_raw,
+        calib_key: idea.calib_key,
+        regime: idea.regime,
+        predicted_snapshot: idea.predicted,
+        trade_details: {
+          client_order_id: cid,
+          maker_taker_entry: { maker: 0, taker: 0 },
+          maker_taker_exit:  { maker: 0, taker: 0 },
+          commission_bps,
+          commission_quote_usdt,
+          fingerprint_entry: null,
+          fingerprint_exit:  null
+        },
+        realized: { tp_hit: exit.reason==="tp", sl_hit: exit.reason==="sl", ttl_exit: exit.reason==="ttl", mfe_bps, mae_bps },
+        learned: false,
+        learned_at_ts: null
+      });
+
+      bumpSymStatsReal(state, base, pnl_bps);
+      (state.equity ||= []).push({ ts_ms: Number(exit.exitTsMs), pnl_bps, recon: "demo" });
+
+      removePendingByCID(state, cid);
+      return { status: 'closed', cid, pnl_bps, reason: exit.reason };
+    }
+
+    // Live exchange paths (binanceLike / binanceFutures)
     const listOrders = async () => {
       if (ex.kind === 'binanceFuturesUSDT') return await listAllOrdersFutures(ex, apiKey, apiSecret, base, since, 1000);
       return await listAllOrdersBinanceLike(ex, apiKey, apiSecret, base, since, 1000);
@@ -2177,7 +2388,7 @@ async function reconcilePendingIdea(env, state, idea, exAccount) {
     // Write closed[] if exited
     if (exitReason && exitPrice > 0 && entryPrice > 0 && entryQty > 0) {
       // Commission (prefer precise from fills; keep approx fallback)
-      const feeSide = Number((state?.fees && (state.fees.taker ?? state.fees.maker)) ?? env?.FEE_RATE_PER_SIDE ?? 0.001);
+      const feeSide = resolvedFeeSide;
       const c1 = await commissionFromTradesUSDT(entryTrades, base);
       const c2 = await commissionFromTradesUSDT(exitTrades, base);
       let commission_quote_usdt = (c1 || 0) + (c2 || 0);
@@ -2258,7 +2469,6 @@ async function reconcilePendingIdea(env, state, idea, exAccount) {
     return { status: 'error', error: e?.message || String(e) };
   }
 }
-
 /* ======================================================================
    SECTION 6/7 — UI Texts, Cards, Keyboards, Dashboard, Lists
    (Worker-1 UX: Manage Trades submenu + W1-style cards + Protocol Status)
@@ -2335,6 +2545,22 @@ function confirmAutoTextB(bal, feeRate) {
   ].join("\n");
 }
 
+/* ---------- Performance stats from closed[] ---------- */
+function computeClosedStatsFromState(state) {
+  const closed = Array.isArray(state?.closed) ? state.closed : [];
+  let wins = 0, losses = 0, netBps = 0, netUsdt = 0;
+  for (const t of closed) {
+    const bps = Number(t?.pnl_bps || 0);
+    netBps += bps;
+    if (bps > 0) wins++; else losses++;
+    const entryNotional = Number(t?.price_entry || 0) * Number(t?.qty || 0);
+    if (entryNotional > 0) netUsdt += (bps / 10000) * entryNotional;
+  }
+  const total = closed.length;
+  const winRate = total > 0 ? wins / total : 0;
+  return { wins, losses, total, winRate, netBps, netPct: netBps / 100, netUsdt };
+}
+
 /* ---------- Protocol Status (Worker-1 style presentation) ---------- */
 function protocolStatusTextW1(protocol, tc, counts, extras = {}) {
   const perTradeNotionalCapFrac = Number(extras.perTradeNotionalCapFrac ?? 0.10);
@@ -2356,6 +2582,17 @@ function protocolStatusTextW1(protocol, tc, counts, extras = {}) {
     "",
     `Fee Rate (per side): ${formatPercent(protocol?.fee_rate ?? 0.001)}`
   ];
+
+  // Optional perf/stat block
+  if (extras.stats) {
+    const s = extras.stats;
+    lines.push(
+      "",
+      "Performance:",
+      `Closed: ${s.total} | Wins: ${s.wins} | Win rate: ${(s.winRate*100).toFixed(1)}%`,
+      `Net PnL: ${s.netBps >= 0 ? "+" : ""}${s.netBps} bps (${s.netPct >= 0 ? "+" : ""}${s.netPct.toFixed(2)}%)` + (isFinite(s.netUsdt) ? ` | ~ ${s.netUsdt >= 0 ? "+" : ""}${formatMoney(s.netUsdt)}` : "")
+    );
+  }
 
   const info = [];
   if (extras.ideasSource || extras.subreqUsed != null || extras.longShare != null || extras.sqsGate != null || extras.todayOpened != null) {
@@ -2398,13 +2635,18 @@ async function renderProtocolStatus(env, userId, messageId = 0) {
     targetDaily = Math.max(1, Math.round((todayOpened + last7Counts.reduce((a,b)=>a+b,0))/7));
   } catch {}
 
+  // Compute performance stats from closed[]
+  let stats = null;
+  try { stats = computeClosedStatsFromState(state); } catch {}
+
   const extras = {
     ...ideasMeta,
     sqsGate,
     todayOpened,
     targetDaily,
     perTradeNotionalCapFrac: Number(env?.PER_TRADE_NOTIONAL_CAP_FRAC ?? 0.10),
-    dailyNotionalCapFrac: Number(env?.DAILY_OPEN_NOTIONAL_CAP_FRAC ?? 0.30)
+    dailyNotionalCapFrac: Number(env?.DAILY_OPEN_NOTIONAL_CAP_FRAC ?? 0.30),
+    stats
   };
 
   const text = protocol
@@ -2565,6 +2807,7 @@ function kbDashboard(mode, paused, hasProtocol, counts) {
   rows.push([{ text: "Manage Trades 📋", callback_data: "manage_trades" }]);
   rows.push([{ text: "Protocol Status 🛡️", callback_data: "protocol_status" }]);
   if (mode === 'auto') rows.push([{ text: paused ? "Resume Auto ▶️" : "Pause Auto ⏸️", callback_data: "auto_toggle" }]);
+  rows.push([{ text: "Reset History 🧹", callback_data: "reset_history_confirm" }]);
   rows.push([{ text: "Stop Bot ⛔", callback_data: "action_stop_confirm" }]);
   return rows;
 }
@@ -2588,7 +2831,7 @@ function kbOpenTradeStrictW1(cid) {
     [{ text: "Close Now ⏹️", callback_data: `tr_close:${cid}` }, { text: "Refresh 🔄", callback_data: `tr_refresh:${cid}` }],
     [{ text: "Continue ▶️", callback_data: "continue_dashboard" }],
     [{ text: "Back to list", callback_data: "mt_open" }],
-    [{ text: "Stop ⛔", callback_data: "action_stop_confirm" }]
+    [{ text: "Stop ⏹️", callback_data: "action_stop_confirm" }]
   ];
 }
 
@@ -2734,6 +2977,7 @@ async function sendPendingIdeaUI(env, userId, cid, messageId = 0) {
   if (messageId) await editMessage(userId, messageId, card, kb, env);
   else await sendMessage(userId, card, kb, env);
 }
+
 /* ======================================================================
    SECTION 7/7 — processUser, Telegram handler, HTTP endpoints,
                   Cron with Gist reconciliation, Worker export
@@ -2828,6 +3072,9 @@ async function sendProtocolStatus(env, userId, messageId = 0) {
       closed: (state.closed || []).length
     };
 
+    // Performance summary
+    const stats = computeClosedStatsFromState(state);
+
     const lines = [
       "Protocol Status (ACP V20, Multi-Position):",
       "",
@@ -2843,7 +3090,11 @@ async function sendProtocolStatus(env, userId, messageId = 0) {
       "",
       `Fee Rate (per side): ${formatPercent(feeRate)}`,
       "",
-      `Ideas (planned): ${counts.planned} | Open positions: ${counts.open} | Closed trades: ${counts.closed}`
+      `Ideas (planned): ${counts.planned} | Open positions: ${counts.open} | Closed trades: ${counts.closed}`,
+      "",
+      "Performance:",
+      `Closed: ${stats.total} | Wins: ${stats.wins} | Win rate: ${(stats.winRate*100).toFixed(1)}%`,
+      `Net PnL: ${stats.netBps >= 0 ? "+" : ""}${stats.netBps} bps (${stats.netPct >= 0 ? "+" : ""}${stats.netPct.toFixed(2)}%)` + (isFinite(stats.netUsdt) ? ` | ~ ${stats.netUsdt >= 0 ? "+" : ""}${formatMoney(stats.netUsdt)}` : "")
     ];
 
     if (sqsGate != null || todayOpened != null || targetDaily != null) {
@@ -2945,6 +3196,11 @@ function getGlobalExecAccount(env) {
   const ex = SUPPORTED_EXCHANGES[exName];
   if (!ex || !ex.hasOrders) return null;
 
+  // Demo support: no real keys required
+  if (ex.kind === "demoParrot") {
+    return { exName, ex, apiKey: "demo", apiSecret: "demo" };
+  }
+
   let apiKey = "";
   let apiSecret = "";
 
@@ -2970,6 +3226,9 @@ async function detectFeeRates(exec, state) {
     } else if (exec.ex.kind === "binanceFuturesUSDT") {
       const v = await verifyBinanceFutures(exec.apiKey, exec.apiSecret, exec.ex);
       if (v?.success && v.data?.feeRate != null) state.fees = { maker: v.data.feeRate, taker: v.data.feeRate };
+    } else if (exec.ex.kind === "demoParrot") {
+      // Default demo fees
+      state.fees = { maker: 0.001, taker: 0.001 };
     }
   } catch {}
 }
@@ -3041,6 +3300,73 @@ async function closeGistCIDNow(env, cid) {
   const qty = Number(idea.qty || 0);
   if (!(qty > 0)) throw new Error("qty_zero");
 
+  // Demo: close immediately at current price and write closed[]
+  if (exec.ex.kind === 'demoParrot') {
+    const entryPrice = Number(idea.entry_price || 0);
+    const entryTsMs = Number(idea.entry_ts_ms || Date.now());
+    const currentPrice = await getCurrentPrice(base, entryPrice);
+    const exitPrice = Number(currentPrice || entryPrice || 1);
+    const exitTsMs = Date.now();
+    const short = ideaIsShort(idea);
+    const ret = short ? (entryPrice/exitPrice - 1) : (exitPrice/entryPrice - 1);
+
+    const entryNotional = entryPrice * qty;
+    const exitNotional  = exitPrice * qty;
+    const feeSide = Number((state?.fees && (state.fees.taker ?? state.fees.maker)) ?? env?.FEE_RATE_PER_SIDE ?? 0.001);
+    const approx = approxCommissionFromNotional(entryNotional, exitNotional, feeSide);
+    const pnl_bps = Math.round(ret * 10000) - approx.commission_bps;
+
+    // Optional MFE/MAE
+    let mfe_bps = 0, mae_bps = 0;
+    if (envFlag(env, "MFE_MAE_ENABLE", "1") && entryPrice > 0) {
+      try {
+        const kl1m = await fetchKlinesRange(base, "1m", Number(entryTsMs)-60_000, Number(exitTsMs)+60_000);
+        const r = computeMFE_MAE(entryPrice, idea.side, kl1m);
+        mfe_bps = r.mfe_bps || 0;
+        mae_bps = r.mae_bps || 0;
+      } catch {}
+    }
+
+    appendClosed(state, {
+      symbolFull: idea.symbolFull || `${base}USDT`,
+      side: idea.side,
+      pnl_bps,
+      ts_entry_ms: Number(entryTsMs),
+      ts_exit_ms: Number(exitTsMs),
+      price_entry: entryPrice,
+      price_exit: exitPrice,
+      qty,
+      reconciliation: "demo_manual_close",
+      exit_reason: "manual",
+      exit_outcome: (pnl_bps > 0) ? "win" : "loss",
+      p_pred: idea.p_lcb,
+      p_raw: idea.p_raw,
+      calib_key: idea.calib_key,
+      regime: idea.regime,
+      predicted_snapshot: idea.predicted,
+      trade_details: {
+        client_order_id: cid,
+        maker_taker_entry: { maker: 0, taker: 0 },
+        maker_taker_exit:  { maker: 0, taker: 0 },
+        commission_bps: approx.commission_bps,
+        commission_quote_usdt: approx.commission_quote_usdt,
+        fingerprint_entry: null,
+        fingerprint_exit:  null
+      },
+      realized: { tp_hit: false, sl_hit: false, ttl_exit: false, mfe_bps, mae_bps },
+      learned: false,
+      learned_at_ts: null
+    });
+
+    bumpSymStatsReal(state, base, pnl_bps);
+    (state.equity ||= []).push({ ts_ms: Number(exitTsMs), pnl_bps, recon: "demo_close" });
+
+    removePendingByCID(state, cid);
+    await saveGistState(env, state, null);
+    return true;
+  }
+
+  // Live exchanges: submit reduce-only market close (TTL style)
   try {
     if (exec.ex.kind === 'binanceLike') {
       await placeSpotTTLMarket(exec.ex, exec.apiKey, exec.apiSecret, base, qty, `${cid}:ttl`);
@@ -3057,6 +3383,41 @@ async function closeGistCIDNow(env, cid) {
     const { state: s2 } = await loadGistState(env);
     await reconcilePendingIdea(env, s2, idea, exec);
     await saveGistState(env, s2, null);
+  } catch {}
+
+  return true;
+}
+
+/* ---------- Reset history helper ---------- */
+async function resetHistory(env, userId) {
+  const { state, etag } = await loadGistState(env);
+  const openExists = (state.pending || []).some(p => String(p.status || "") === "open");
+  if (openExists) throw new Error("open_positions_exist");
+
+  state.pending = [];
+  state.closed = [];
+  state.equity = [];
+  state.sym_stats_real = {};
+  // optional: keep state.fees as-is; or reset if you want
+  state.lastReconcileTs = Date.now();
+  await saveGistState(env, state, etag);
+
+  // Clear pacing and peak equity KV for this user
+  try {
+    await kvSet(env, `tcr_today_date_${userId}`, "");
+    await kvSet(env, `tcr_today_count_${userId}`, 0);
+    await kvSet(env, `tcr_7d_roll_${userId}`, JSON.stringify({ last7: [] }));
+  } catch {}
+  try {
+    await kvSet(env, `peak_equity_user_${userId}`, 0);
+  } catch {}
+
+  // Optional: wipe user-scoped DB rows for trades/events
+  try {
+    await env.DB.prepare("DELETE FROM trades WHERE user_id = ?").bind(userId).run();
+  } catch {}
+  try {
+    await env.DB.prepare("DELETE FROM events_log WHERE user_id = ?").bind(userId).run();
   } catch {}
 
   return true;
@@ -3178,6 +3539,49 @@ async function handleTelegramUpdate(update, env, ctx) {
   if (text === "/manual") { await setGlobalMode(env, "manual"); await sendMessage(userId, "Global mode set to MANUAL.", null, env); return; }
   if (text === "/auto")   { await setGlobalMode(env, "auto");   await sendMessage(userId, "Global mode set to AUTO.", null, env);   return; }
 
+  // Reset History flow
+  if (text === "reset_history_confirm") {
+    const { state } = await loadGistState(env);
+    const openExists = (state.pending || []).some(p => String(p.status || "") === "open");
+    if (openExists) {
+      const t = "You have open positions. Please close them before resetting history.\nYou can close all now, or cancel.";
+      const b = [
+        [{ text: "Close all now ⏹️", callback_data: "action_stop_closeall" }],
+        [{ text: "Cancel", callback_data: "reset_history_cancel" }],
+        [{ text: "Continue ▶️", callback_data: "continue_dashboard" }]
+      ];
+      if (isCb && messageId) await editMessage(userId, messageId, t, b, env);
+      else await sendMessage(userId, t, b, env);
+    } else {
+      const t = "Reset History will clear all pending ideas, closed trades, equity timeline, symbol stats, pacing counters, and local DB logs for your user.\nAre you sure?";
+      const b = [
+        [{ text: "Yes, reset now 🧹", callback_data: "reset_history_do" }, { text: "Cancel", callback_data: "reset_history_cancel" }],
+        [{ text: "Continue ▶️", callback_data: "continue_dashboard" }]
+      ];
+      if (isCb && messageId) await editMessage(userId, messageId, t, b, env);
+      else await sendMessage(userId, t, b, env);
+    }
+    return;
+  }
+  if (text === "reset_history_do") {
+    try {
+      await resetHistory(env, userId);
+      await sendMessage(userId, "History reset completed.", null, env);
+      await sendDashboard(env, userId, isCb ? messageId : 0);
+    } catch (e) {
+      if (String(e?.message || "").includes("open_positions_exist")) {
+        await sendMessage(userId, "Cannot reset: open positions exist. Close them first.", null, env);
+      } else {
+        await sendMessage(userId, `Reset failed: ${e?.message || "error"}`, null, env);
+      }
+    }
+    return;
+  }
+  if (text === "reset_history_cancel") {
+    await sendDashboard(env, userId, isCb ? messageId : 0);
+    return;
+  }
+
   // Stop actions
   if (text === "action_stop_confirm") {
     const { state } = await loadGistState(env);
@@ -3263,6 +3667,13 @@ async function handleTelegramUpdate(update, env, ctx) {
     await saveSession(env, userId, { current_step: 'awaiting_mode' });
     const buttons = [[{ text: "Manual (approve each idea)", callback_data: "mode_manual" }],[{ text: "Fully Automatic", callback_data: "mode_auto" }]];
     await (isCb ? editMessage(userId, messageId, modeText(), buttons, env) : sendMessage(userId, modeText(), buttons, env));
+    return;
+  }
+
+  // Handle "Refresh" in exchange step to restart that section cleanly
+  if (text === "action_refresh_wizard") {
+    await saveSession(env, userId, { current_step: 'awaiting_exchange' });
+    await (isCb ? editMessage(userId, messageId, exchangeText(), exchangeButtons(), env) : sendMessage(userId, exchangeText(), exchangeButtons(), env));
     return;
   }
 
@@ -3420,8 +3831,7 @@ export default {
         let ideas;
         try { ideas = await request.json(); } catch { return new Response("Bad JSON", { status: 400 }); }
         try {
-          await env.DB.prepare("INSERT INTO ideas (ts, mode, ideas_json) VALUES (?, ?, ?)")
-            .bind(ideas.ts || nowISO(), ideas.mode || 'normal', JSON.stringify(ideas)).run();
+          await env.DB.prepare("INSERT INTO ideas (ts, mode, ideas_json) VALUES (?, ?, ?)").bind(ideas.ts || nowISO(), ideas.mode || 'normal', JSON.stringify(ideas)).run();
           return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
         } catch (e) {
           return new Response("DB error", { status: 500 });
@@ -3450,3 +3860,4 @@ export default {
     await runCron(env);
   },
 };
+
