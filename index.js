@@ -257,76 +257,114 @@ async function reconcileProtocol(env, userId, isWin, riskAmount, rrr, fees) {
 
 /* ---------- Gist adapter (state.json) ---------- */
 const GIST_FILE = "state.json";
+
+/* Robust gistOn: trims and normalizes env vars (handles "1", "true", "yes", extra whitespace) */
 function gistOn(env) {
-  return String(env?.GIST_ENABLED || "0") === "1" && !!env.GIST_ID && !!env.GIST_TOKEN;
+  const v = String(env?.GIST_ENABLED ?? "").trim().toLowerCase();
+  const enabled = v === "1" || v === "true" || v === "yes";
+  const id = String(env?.GIST_ID ?? "").trim();
+  const tok = String(env?.GIST_TOKEN ?? "").trim();
+  return enabled && !!id && !!tok;
 }
-function gistHdr(env) {
-  return {
-    "Authorization": `Bearer ${env.GIST_TOKEN}`,
+
+/* Conditional Content-Type (omit for GET), curl-like UA */
+function gistHdr(env, method = 'GET') {
+  const base = {
+    "Authorization": `Bearer ${String(env.GIST_TOKEN || "").trim()}`,
     "Accept": "application/vnd.github+json",
-    "Content-Type": "application/json"
+    "User-Agent": "curl/7.88.1"
   };
+  if (method !== 'GET') {
+    base["Content-Type"] = "application/json";
+  }
+  return base;
 }
+
 const deepClone = (o) => JSON.parse(JSON.stringify(o || {}));
 
-/* Strict ETag-aware get: returns { state, etag } */
+/* Gist GET with 10s timeout, trimmed ID, and temporary debug logging (remove after verifying success) */
 async function gistGetState(env) {
   if (!gistOn(env)) return null;
+
+  const GID = String(env.GIST_ID || "").trim();
   const headers = {
-    ...gistHdr(env),
-    "User-Agent": "CloudflareWorker/1.0",
+    ...gistHdr(env, 'GET'),
     "X-GitHub-Api-Version": "2022-11-28",
   };
-  const r = await safeFetch(`https://api.github.com/gists/${env.GIST_ID}`, { headers }, 8000).catch(()=>null);
-  if (!r || !r.ok) {
-    if (r) await r.text().catch(() => {}); // drain body on failure
-    return null; // unreachable → Section 7 will DB fallback (correct)
+  const url = `https://api.github.com/gists/${GID}`;
+
+  // TEMP DEBUG: remove after confirming 200 status in tails
+  console.log(`[Gist Debug] Fetching ${url} with headers:`, Object.keys(headers));
+
+  const r = await safeFetch(url, { headers }, 10000).catch((e) => {
+    console.error("[Gist Debug] safeFetch exception:", e?.message || e, "url:", url);
+    return null;
+  });
+
+  if (!r) {
+    console.error("[Gist Debug] No response (null r)");
+    return null;
   }
+
+  // TEMP DEBUG: remove after confirming
+  console.log(`[Gist Debug] Status: ${r.status} ${r.statusText}, Headers:`, {
+    "content-type": r.headers.get("content-type"),
+    "x-ratelimit-remaining": r.headers.get("x-ratelimit-remaining"),
+    "x-ratelimit-reset": r.headers.get("x-ratelimit-reset")
+  });
+
+  if (!r.ok) {
+    let errBody = "";
+    try { errBody = await r.text(); } catch {}
+    console.error(`[Gist Debug] !ok: ${r.status} ${r.statusText}, Body:`, errBody.slice(0, 500));
+    return null;
+  }
+
   const etag = r.headers.get("etag") || "";
   let j;
+  let bodyText = "";
   try {
-    j = await r.json();
+    bodyText = await r.text();
+    // TEMP DEBUG: remove after confirming
+    console.log("[Gist Debug] Body preview:", bodyText.slice(0, 200));
+    j = JSON.parse(bodyText);
   } catch (e) {
-    console.error("gistGetState JSON parse error:", e);
-    // Reachable but bad JSON → treat as empty (authoritative “do nothing”)
+    console.error("[Gist Debug] JSON parse error:", e?.message || e, "Body length:", bodyText?.length || 0);
     return { state: { pending: [], closed: [], sym_stats_real: {}, equity: [], lastReconcileTs: 0 }, etag };
   }
+
   const content = j?.files?.[GIST_FILE]?.content;
   if (!content) {
-    // File missing → treat as empty (authoritative “do nothing”)
     return { state: { pending: [], closed: [], sym_stats_real: {}, equity: [], lastReconcileTs: 0 }, etag };
   }
   try {
     return { state: JSON.parse(content), etag };
   } catch (e) {
     console.error("gistGetState content parse error:", e);
-    // Bad file JSON → treat as empty (authoritative “do nothing”)
     return { state: { pending: [], closed: [], sym_stats_real: {}, equity: [], lastReconcileTs: 0 }, etag };
   }
 }
 
-/* ETag-aware PATCH with merge-on-412 by rebasing mutator on fresh remote.
-   - If GIST_STRICT_PATCH != '1', falls back to simple PATCH w/o If-Match (legacy behavior, UX unchanged).
-   - Mutator receives a deep clone of the current remote state and should mutate only Worker domains. */
+/* Gist PATCH with trimmed ID and conditional headers */
 async function gistPatchState(env, mutator) {
   if (!gistOn(env)) return false;
 
   const strict = String(env?.GIST_STRICT_PATCH || "0") === "1";
 
   const doPatch = async (next, etag) => {
+    const GID = String(env.GIST_ID || "").trim();
+    const url = `https://api.github.com/gists/${GID}`;
     const body = JSON.stringify({ files: { [GIST_FILE]: { content: JSON.stringify(next, null, 2) } } });
     const headers = {
-      ...gistHdr(env),
-      "User-Agent": "CloudflareWorker/1.0",
+      ...gistHdr(env, 'PATCH'),
       "X-GitHub-Api-Version": "2022-11-28",
     };
     if (etag) headers["If-Match"] = etag;
-    const r = await safeFetch(`https://api.github.com/gists/${env.GIST_ID}`, { method: "PATCH", headers, body }, 8000).catch(()=>null);
+    const r = await safeFetch(url, { method: "PATCH", headers, body }, 8000).catch(()=>null);
     if (r) await r.text().catch(() => {});
     return r;
   };
 
-  // Legacy non-strict path (unchanged behavior)
   if (!strict) {
     const cur = await gistGetState(env);
     const base = deepClone(cur?.state || { pending: [], closed: [], sym_stats_real: {}, equity: [], lastReconcileTs: 0 });
@@ -336,9 +374,7 @@ async function gistPatchState(env, mutator) {
     return !!(r && r.ok);
   }
 
-  // Strict path with 412 handling (rebase mutator on fresh remote)
   try {
-    // 1) First attempt with current ETag
     const cur = await gistGetState(env);
     if (!cur) return false;
     const base1 = deepClone(cur.state || {});
@@ -347,7 +383,6 @@ async function gistPatchState(env, mutator) {
     let r = await doPatch(next1, cur.etag || "");
     if (r && r.ok) return true;
 
-    // 2) If conflict, re-fetch and rebase the mutator onto the fresh remote
     if (r && r.status === 412) {
       const cur2 = await gistGetState(env);
       if (!cur2) return false;
@@ -357,8 +392,6 @@ async function gistPatchState(env, mutator) {
       const r2 = await doPatch(next2, cur2.etag || "");
       return !!(r2 && r2.ok);
     }
-
-    // Non-OK (not a 412)
     return false;
   } catch (e) {
     console.error("gistPatchState strict error:", e);
@@ -3817,769 +3850,790 @@ export {
   getMaxConcurrent, getMaxNewPerCycle
 };
 /* ======================================================================
-SECTION 7/7 — processUser, Telegram handler, HTTP endpoints,
-Cron with fan-out fallback, Worker export
-====================================================================== */
+   SECTION 7/7 — processUser, Telegram handler, HTTP endpoints,
+                  Cron with fan-out fallback, Worker export
+   ====================================================================== */
 
 /* ---------- Gist → ideas builder (planned → ideas array) ---------- */
 async function buildIdeasFromGistPending(env) {
-const g = await gistGetState(env);
-// If Gist is disabled or unreachable, trigger fallback
-if (!g) return null;
+  // Retry logic for robust fetch (3 attempts on 401/403/412)
+  let g = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    g = await gistGetState(env);
+    if (g && g.state) break;  // Success
+    console.log(`[Gist Retry ${attempt}/3] Failed, waiting 2s...`);
+    await sleep(2000);  // Backoff
+  }
+  if (!g || !g.state) {
+    console.warn(`[Gist Final Fail] All retries failed; using fallback.`);
+    return null;
+  }
 
-const pendAll = g.state?.pending;
-if (!Array.isArray(pendAll) || pendAll.length === 0) {
-return { ts: nowISO(), ideas: [], meta: { origin: "gist-empty" } };
-}
+  // UPDATED: Optional success log (for verification post-fix; remove after confirming no fallbacks).
+  console.log("[Gist Success] Loaded pending:", g.state.pending?.length || 0);
 
-const planned = pendAll.filter(p => (p?.status || "planned") === "planned");
-if (!planned.length) {
-return { ts: nowISO(), ideas: [], meta: { origin: "gist-no-planned" } };
-}
+  const pendAll = g.state?.pending;
+  if (!Array.isArray(pendAll) || pendAll.length === 0) {
+    return { ts: nowISO(), ideas: [], meta: { origin: "gist-empty" } };
+  }
 
-// Best timestamp from plans (fallback now)
-const maxTs = planned.reduce((m, p) => Math.max(m, Number(p.ts_ms || 0)), 0);
-const ts = maxTs > 0 ? new Date(maxTs).toISOString() : nowISO();
+  const planned = pendAll.filter(p => (p?.status || "planned") === "planned");
+  if (!planned.length) {
+    return { ts: nowISO(), ideas: [], meta: { origin: "gist-no-planned" } };
+  }
 
-const ideas = planned.map(p => {
-const base = String(p.base || "").toUpperCase()
-|| String((p.symbolFull || "").replace(/USDT$/i, "")).toUpperCase();
-// Normalize side to long/short
-let side = String(p.side || 'long').toLowerCase();
-if (side === 'buy') side = 'long';
-if (side === 'sell') side = 'short';
+  // UPDATED: Optional log for planned count (remove after testing).
+  console.log("[Gist Success] Loaded", planned.length, "planned ideas");
 
-return {
-  // core
-  symbol: base,
-  side,
-  ttl_sec: isFinite(Number(p.hold_sec)) ? Number(p.hold_sec) : undefined,
+  // Best timestamp from plans (fallback now)
+  const maxTs = planned.reduce((m, p) => Math.max(m, Number(p.ts_ms || 0)), 0);
+  const ts = maxTs > 0 ? new Date(maxTs).toISOString() : nowISO();
 
-  // exits/sizing from plan
-  entry_limit: isFinite(Number(p.entry_limit)) ? Number(p.entry_limit) : undefined,
-  tp_bps: isFinite(Number(p.tp_bps)) ? Number(p.tp_bps) : undefined,
-  sl_bps: isFinite(Number(p.sl_bps)) ? Number(p.sl_bps) : undefined,
-  cost_bps: isFinite(Number(p.cost_bps)) ? Number(p.cost_bps) : undefined,
-  notional_usd: isFinite(Number(p.notional_usd)) ? Number(p.notional_usd) : undefined,
+  const ideas = planned.map(p => {
+    const base = String(p.base || "").toUpperCase()
+      || String((p.symbolFull || "").replace(/USDT$/i, "")).toUpperCase();
+    // Normalize side to long/short
+    let side = String(p.side || 'long').toLowerCase();
+    if (side === 'buy') side = 'long';
+    if (side === 'sell') side = 'short';
 
-  // probabilities and metadata linkages
-  p_lcb: isFinite(Number(p.p_lcb)) ? Number(p.p_lcb) : undefined,
-  p_win: isFinite(Number(p.p_lcb)) ? Number(p.p_lcb) : undefined,
-  p_raw: isFinite(Number(p.p_raw)) ? Number(p.p_raw) : undefined,
-  calib_key: p.calib_key,
-  regime: p.regime,
-  predicted: p.predicted,
+    return {
+      // core
+      symbol: base,
+      side,
+      ttl_sec: isFinite(Number(p.hold_sec)) ? Number(p.hold_sec) : undefined,
 
-  // stable IDs
-  client_order_id: p.client_order_id,
-  idea_id: p.idea_id
-};
-});
+      // exits/sizing from plan
+      entry_limit: isFinite(Number(p.entry_limit)) ? Number(p.entry_limit) : undefined,
+      tp_bps: isFinite(Number(p.tp_bps)) ? Number(p.tp_bps) : undefined,
+      sl_bps: isFinite(Number(p.sl_bps)) ? Number(p.sl_bps) : undefined,
+      cost_bps: isFinite(Number(p.cost_bps)) ? Number(p.cost_bps) : undefined,
+      notional_usd: isFinite(Number(p.notional_usd)) ? Number(p.notional_usd) : undefined,
 
-return { ts, ideas, meta: { origin: "gist" } };
+      // probabilities and metadata linkages
+      p_lcb: isFinite(Number(p.p_lcb)) ? Number(p.p_lcb) : undefined,
+      p_win: isFinite(Number(p.p_lcb)) ? Number(p.p_lcb) : undefined,
+      p_raw: isFinite(Number(p.p_raw)) ? Number(p.p_raw) : undefined,
+      calib_key: p.calib_key,
+      regime: p.regime,
+      predicted: p.predicted,
+
+      // stable IDs
+      client_order_id: p.client_order_id,
+      idea_id: p.idea_id
+    };
+  });
+
+  return { ts, ideas, meta: { origin: "gist" } };
 }
 
 /* ---------- Per-user processing (flat-CPU: early exits, time guards) ---------- */
 async function processUser(env, userId, budget = null) {
-try {
-if (budget?.isExpired()) return;
-const session = await getSession(env, userId);
-if (!session) return;
-
-// Helper: force all ideas through (env.NO_REJECTS = '1')
-const forceAll = () => String(env?.NO_REJECTS || '0') === '1';
-// Cycle-only duplicate guard flag
-const cycleOnly = String(env?.CYCLE_ONLY_DUP_GUARD || '0') === '1';
-
-// Reconcile exchange fills first (optional; internally no-ops if disabled)
-await reconcileExchangeFills(env, userId);
-if (budget?.isExpired()) return;
-
-// Resolve posted-maker orders, then enforce SL/TP
-await checkWorkingOrders(env, userId);
-if (budget?.isExpired()) return;
-
-await checkAndExitTrades(env, userId);
-if (budget?.isExpired()) return;
-
-const openPauseTh = Number(env.OPEN_PAUSE_THRESHOLD || 2);
-const openCountNow = await getOpenPositionsCount(env, userId);
-const overConcurrency = openCountNow >= openPauseTh;
-
-const protocol = await getProtocolState(env, userId);
-if (session.status !== 'active' || !protocol || protocol.phase === 'terminated') return;
-
-const maxPos = getMaxConcurrent(env);
-const maxNew = getMaxNewPerCycle(env);
-
-const TC = await getTotalCapital(env, userId);
-
-// Notional budgets (env-driven caps; behavior matches original logic)
-const perTradeNotionalCapFrac = Number(env?.PER_TRADE_NOTIONAL_CAP_FRAC ?? 0.10);
-const dailyNotionalCapFrac    = Number(env?.DAILY_OPEN_NOTIONAL_CAP_FRAC ?? 0.30);
-const dailyNotionalCap        = dailyNotionalCapFrac * TC;
-const openNotional            = await getOpenNotional(env, userId);
-let dailyNotionalLeft         = Math.max(0, dailyNotionalCap - openNotional);
-
-// Risk budgets (original constants)
-const D = DAILY_OPEN_RISK_CAP_FRAC * TC;
-const openRisk = await getOpenPortfolioRisk(env, userId);
-let D_left = Math.max(0, D - openRisk);
-
-let ideas = await buildIdeasFromGistPending(env);
-
-// Strict Gist: Exit if failed or empty (no DB fallback).
-if (!ideas || !ideas.ideas || !ideas.ideas.length) return;
-
-// Freshness guard
-try {
-  const ts = new Date(ideas.ts || 0).getTime();
-  const maxAgeMs = Number(env.IDEAS_MAX_AGE_MS || 20 * 60 * 1000);
-  if (!ts || (Date.now() - ts) > maxAgeMs) return;
-} catch (_) {}
-
-// Snapshot dedupe — process each ideas.ts only once per user
-const ideasTs = String(ideas.ts || "");
-const lastKey = `last_ideas_ts_user_${userId}`;
-const lastSeenTs = await kvGet(env, lastKey);
-
-// Early skip when nothing to do: no open positions and snapshot already processed
-if (openCountNow === 0 && lastSeenTs && lastSeenTs === ideasTs) return;
-
-// Duplicate symbols control map (per-cycle)
-const counts = new Map();
-
-// If NOT cycle-only, pre-populate with existing open/pending exposures (cross-cycle enforcement)
-let allowDup = false, capPerSym = 1;
-if (!cycleOnly) {
   try {
-    const rowsCnt = await env.DB.prepare(
-      "SELECT symbol, COUNT(*) AS c FROM trades WHERE user_id = ? AND status IN ('open','pending') GROUP BY symbol"
-    ).bind(userId).all();
-    for (const r of (rowsCnt.results || [])) {
-      const s = String(r.symbol || '').toUpperCase();
-      const c = Number(r.c || 0);
-      if (s) counts.set(s, c);
-    }
-  } catch (_) {}
-  allowDup = String(env?.ALLOW_DUPLICATE_SYMBOLS || '0') === '1';
-  capPerSym = Math.max(1, Math.floor(Number(env?.MAX_POS_PER_SYMBOL || 1)));
-}
+    if (budget?.isExpired()) return;
+    const session = await getSession(env, userId);
+    if (!session) return;
 
-const activeSyms = await getActiveExposureSymbols(env, userId);
-let placed = 0; // opened/pending count this cycle
-const stopReason = (!D_left ? 'daily_risk_budget_exhausted' : (!dailyNotionalLeft ? 'daily_notional_exhausted' : null));
+    // Helper: force all ideas through (env.NO_REJECTS = '1')
+    const forceAll = () => String(env?.NO_REJECTS || '0') === '1';
+    // Cycle-only duplicate guard flag
+    const cycleOnly = String(env?.CYCLE_ONLY_DUP_GUARD || '0') === '1';
 
-const ideasTsMs = new Date(ideas.ts || 0).getTime();
+    // Reconcile exchange fills first (optional; internally no-ops if disabled)
+    await reconcileExchangeFills(env, userId);
+    if (budget?.isExpired()) return;
 
-for (let idx = 0; idx < ideas.ideas.length; idx++) {
-  if (budget?.isExpired()) break;
-  budget?.ensure("ideas_loop");
+    // Resolve posted-maker orders, then enforce SL/TP
+    await checkWorkingOrders(env, userId);
+    if (budget?.isExpired()) return;
 
-  const idea = ideas.ideas[idx];
+    await checkAndExitTrades(env, userId);
+    if (budget?.isExpired()) return;
 
-  // TTL gating (skip only if NO_REJECTS is off)
-  try {
-    const ttlMs = Number(idea.ttl_sec || 0) * 1000;
-    if (ttlMs > 0 && ideasTsMs > 0 && Date.now() - ideasTsMs > ttlMs) {
-      if (!forceAll()) {
-        await createAutoSkipRecord(env, userId, idea, protocol, 'stale_idea_ttl', { ttl_sec: idea.ttl_sec });
-      }
-      continue;
-    }
-  } catch {}
+    const openPauseTh = Number(env.OPEN_PAUSE_THRESHOLD || 2);
+    const openCountNow = await getOpenPositionsCount(env, userId);
+    const overConcurrency = openCountNow >= openPauseTh;
 
-  const symU = String(idea.symbol || '').toUpperCase();
+    const protocol = await getProtocolState(env, userId);
+    if (session.status !== 'active' || !protocol || protocol.phase === 'terminated') return;
 
-  // Duplicate symbol enforcement
-  const curCount = counts.get(symU) || 0;
-  if (cycleOnly) {
-    // Block only within this cycle
-    if (curCount > 0) {
-      await createAutoSkipRecord(env, userId, idea, protocol, 'duplicate_symbol_cycle', { curCount });
-      continue;
-    }
-  } else {
-    // Env-driven cross-cycle policy
-    if ((!allowDup && curCount > 0) || (allowDup && curCount >= capPerSym)) {
-      await createAutoSkipRecord(env, userId, idea, protocol, 'duplicate_symbol', { curCount, capPerSym });
-      continue;
-    }
-  }
+    const maxPos = getMaxConcurrent(env);
+    const maxNew = getMaxNewPerCycle(env);
 
-  // Concurrency limit (UNCONDITIONAL)
-  if (overConcurrency || (openCountNow + placed) >= maxPos) {
-    if (!forceAll()) {
-      await createAutoSkipRecord(env, userId, idea, protocol, 'concurrency_limit', { openCountNow, placed, maxPos, th: openPauseTh });
-    }
-    continue;
-  }
+    const TC = await getTotalCapital(env, userId);
 
-  // Budget stop reason (skip only if NO_REJECTS is off)
-  if (stopReason && !forceAll()) {
-    await createAutoSkipRecord(env, userId, idea, protocol, stopReason, { D_left, dailyNotionalLeft });
-    continue;
-  }
+    // Notional budgets (env-driven caps; behavior matches original logic)
+    const perTradeNotionalCapFrac = Number(env?.PER_TRADE_NOTIONAL_CAP_FRAC ?? 0.10);
+    const dailyNotionalCapFrac    = Number(env?.DAILY_OPEN_NOTIONAL_CAP_FRAC ?? 0.30);
+    const dailyNotionalCap        = dailyNotionalCapFrac * TC;
+    const openNotional            = await getOpenNotional(env, userId);
+    let dailyNotionalLeft         = Math.max(0, dailyNotionalCap - openNotional);
 
-  // Try to create a pending trade
-  const beforeOpenRisk = await getOpenPortfolioRisk(env, userId);
-  const { id, meta } = await createPendingTrade(env, userId, idea, protocol);
-  if (!id) {
-    // If createPendingTrade still rejects (e.g., hard market_data), log as before
-    await createAutoSkipRecord(env, userId, idea, protocol, meta?.skipReason || 'unknown', meta);
-    continue;
-  }
+    // Risk budgets (original constants)
+    const D = DAILY_OPEN_RISK_CAP_FRAC * TC;
+    const openRisk = await getOpenPortfolioRisk(env, userId);
+    let D_left = Math.max(0, D - openRisk);
 
-  // Execute (Auto) or show card (Manual)
-  if (session.bot_mode === 'auto' && session.auto_paused !== 'true') {
-    const executed = await executeTrade(env, userId, id);
-    if (!executed) {
-      await env.DB.prepare("UPDATE trades SET status = 'failed', updated_at = ? WHERE id = ?").bind(nowISO(), id).run();
-      continue;
+    let ideas = await buildIdeasFromGistPending(env);
+
+    // Perfect: Strict Gist first; fallback only if all retries fail (rare).
+    if (ideas === null) {
+      console.warn(`[${userId}] Gist fetch failed after retries; falling back to DB ideas snapshot.`);
+      ideas = await getLatestIdeas(env);
     }
 
-    // Update per-cycle duplicate count
-    counts.set(symU, (counts.get(symU) || 0) + 1);
+    // Exit if no ideas from either source.
+    if (!ideas || !ideas.ideas || !ideas.ideas.length) return;
 
-    activeSyms.add(symU);
-    placed++;
+    // Freshness guard
+    try {
+      const ts = new Date(ideas.ts || 0).getTime();
+      const maxAgeMs = Number(env.IDEAS_MAX_AGE_MS || 20 * 60 * 1000);
+      if (!ts || (Date.now() - ts) > maxAgeMs) return;
+    } catch (_) {}
 
-    // Cycle cap enforcement (UNCONDITIONAL)
-    if (placed >= maxNew) {
-      if (!forceAll()) {
-        for (const rest of ideas.ideas.slice(idx + 1)) {
-          await createAutoSkipRecord(env, userId, rest, protocol, 'cycle_cap_reached', { placed, maxNew });
+    // Snapshot dedupe — process each ideas.ts only once per user
+    const ideasTs = String(ideas.ts || "");
+    const lastKey = `last_ideas_ts_user_${userId}`;
+    const lastSeenTs = await kvGet(env, lastKey);
+
+    // Early skip when nothing to do: no open positions and snapshot already processed
+    if (openCountNow === 0 && lastSeenTs && lastSeenTs === ideasTs) return;
+
+    // Duplicate symbols control map (per-cycle)
+    const counts = new Map();
+
+    // If NOT cycle-only, pre-populate with existing open/pending exposures (cross-cycle enforcement)
+    let allowDup = false, capPerSym = 1;
+    if (!cycleOnly) {
+      try {
+        const rowsCnt = await env.DB.prepare(
+          "SELECT symbol, COUNT(*) AS c FROM trades WHERE user_id = ? AND status IN ('open','pending') GROUP BY symbol"
+        ).bind(userId).all();
+        for (const r of (rowsCnt.results || [])) {
+          const s = String(r.symbol || '').toUpperCase();
+          const c = Number(r.c || 0);
+          if (s) counts.set(s, c);
+        }
+      } catch (_) {}
+      allowDup = String(env?.ALLOW_DUPLICATE_SYMBOLS || '0') === '1';
+      capPerSym = Math.max(1, Math.floor(Number(env?.MAX_POS_PER_SYMBOL || 1)));
+    }
+
+    const activeSyms = await getActiveExposureSymbols(env, userId);
+    let placed = 0; // opened/pending count this cycle
+    const stopReason = (!D_left ? 'daily_risk_budget_exhausted' : (!dailyNotionalLeft ? 'daily_notional_exhausted' : null));
+
+    const ideasTsMs = new Date(ideas.ts || 0).getTime();
+
+    for (let idx = 0; idx < ideas.ideas.length; idx++) {
+      if (budget?.isExpired()) break;
+      budget?.ensure("ideas_loop");
+
+      const idea = ideas.ideas[idx];
+
+      // TTL gating (skip only if NO_REJECTS is off)
+      try {
+        const ttlMs = Number(idea.ttl_sec || 0) * 1000;
+        if (ttlMs > 0 && ideasTsMs > 0 && Date.now() - ideasTsMs > ttlMs) {
+          if (!forceAll()) {
+            await createAutoSkipRecord(env, userId, idea, protocol, 'stale_idea_ttl', { ttl_sec: idea.ttl_sec });
+          }
+          continue;
+        }
+      } catch {}
+
+      const symU = String(idea.symbol || '').toUpperCase();
+
+      // Duplicate symbol enforcement
+      const curCount = counts.get(symU) || 0;
+      if (cycleOnly) {
+        // Block only within this cycle
+        if (curCount > 0) {
+          await createAutoSkipRecord(env, userId, idea, protocol, 'duplicate_symbol_cycle', { curCount });
+          continue;
+        }
+      } else {
+        // Env-driven cross-cycle policy
+        if ((!allowDup && curCount > 0) || (allowDup && curCount >= capPerSym)) {
+          await createAutoSkipRecord(env, userId, idea, protocol, 'duplicate_symbol', { curCount, capPerSym });
+          continue;
         }
       }
-      break;
-    }
 
-    // Update budgets after open
-    const afterOpenRisk = await getOpenPortfolioRisk(env, userId);
-    D_left -= Math.max(0, afterOpenRisk - beforeOpenRisk);
-    const afterOpenNotional = await getOpenNotional(env, userId);
-    dailyNotionalLeft = Math.max(0, dailyNotionalCap - afterOpenNotional);
-  } else if (session.bot_mode === 'manual') {
-    // Fetch and show the pending card
-    const trow = await env.DB.prepare("SELECT * FROM trades WHERE id = ? AND user_id = ?").bind(id, userId).first();
-    const extra = JSON.parse(trow.extra_json || '{}');
-    await sendMessage(userId, pendingTradeCard(trow, extra), kbPendingTrade(id, extra.funds_ok), env);
-
-    // Update per-cycle duplicate count
-    counts.set(symU, (counts.get(symU) || 0) + 1);
-
-    activeSyms.add(symU);
-    placed++;
-
-    // Cycle cap enforcement (UNCONDITIONAL)
-    if (placed >= maxNew) {
-      if (!forceAll()) {
-        for (const rest of ideas.ideas.slice(idx + 1)) {
-          await createAutoSkipRecord(env, userId, rest, protocol, 'cycle_cap_reached', { placed, maxNew });
+      // Concurrency limit (UNCONDITIONAL)
+      if (overConcurrency || (openCountNow + placed) >= maxPos) {
+        if (!forceAll()) {
+          await createAutoSkipRecord(env, userId, idea, protocol, 'concurrency_limit', { openCountNow, placed, maxPos, th: openPauseTh });
         }
+        continue;
       }
-      break;
-    }
-    dailyNotionalLeft -= Number(extra.quote_size || 0);
-  }
 
-  // If budgets became exhausted mid-loop, log the rest as exhausted (only if NO_REJECTS is off)
-  if ((D_left <= 0 || dailyNotionalLeft <= 0) && !forceAll()) {
-    const reason = D_left <= 0 ? 'daily_risk_budget_exhausted' : 'daily_notional_exhausted';
-    for (const rest of ideas.ideas.slice(idx + 1)) {
-      await createAutoSkipRecord(env, userId, rest, protocol, reason, { D_left, dailyNotionalLeft });
-    }
-    break;
-  }
-}
+      // Budget stop reason (skip only if NO_REJECTS is off)
+      if (stopReason && !forceAll()) {
+        await createAutoSkipRecord(env, userId, idea, protocol, stopReason, { D_left, dailyNotionalLeft });
+        continue;
+      }
 
-// Mark this snapshot as processed for this user (prevents reprocessing every minute)
-if (ideasTs) await kvSet(env, lastKey, ideasTs);
-} catch (e) {
-console.error(`processUser error for ${userId}:`, e);
-await logEvent(env, userId, 'error', { where: 'processUser', message: e.message });
-}
+      // Try to create a pending trade
+      const beforeOpenRisk = await getOpenPortfolioRisk(env, userId);
+      const { id, meta } = await createPendingTrade(env, userId, idea, protocol);
+      if (!id) {
+        // If createPendingTrade still rejects (e.g., hard market_data), log as before
+        await createAutoSkipRecord(env, userId, idea, protocol, meta?.skipReason || 'unknown', meta);
+        continue;
+      }
+
+      // Execute (Auto) or show card (Manual)
+      if (session.bot_mode === 'auto' && session.auto_paused !== 'true') {
+        const executed = await executeTrade(env, userId, id);
+        if (!executed) {
+          await env.DB.prepare("UPDATE trades SET status = 'failed', updated_at = ? WHERE id = ?").bind(nowISO(), id).run();
+          continue;
+        }
+
+        // Update per-cycle duplicate count
+        counts.set(symU, (counts.get(symU) || 0) + 1);
+
+        activeSyms.add(symU);
+        placed++;
+
+        // Cycle cap enforcement (UNCONDITIONAL)
+        if (placed >= maxNew) {
+          if (!forceAll()) {
+            for (const rest of ideas.ideas.slice(idx + 1)) {
+              await createAutoSkipRecord(env, userId, rest, protocol, 'cycle_cap_reached', { placed, maxNew });
+            }
+          }
+          break;
+        }
+
+        // Update budgets after open
+        const afterOpenRisk = await getOpenPortfolioRisk(env, userId);
+        D_left -= Math.max(0, afterOpenRisk - beforeOpenRisk);
+        const afterOpenNotional = await getOpenNotional(env, userId);
+        dailyNotionalLeft = Math.max(0, dailyNotionalCap - afterOpenNotional);
+      } else if (session.bot_mode === 'manual') {
+        // Fetch and show the pending card
+        const trow = await env.DB.prepare("SELECT * FROM trades WHERE id = ? AND user_id = ?").bind(id, userId).first();
+        const extra = JSON.parse(trow.extra_json || '{}');
+        await sendMessage(userId, pendingTradeCard(trow, extra), kbPendingTrade(id, extra.funds_ok), env);
+
+        // Update per-cycle duplicate count
+        counts.set(symU, (counts.get(symU) || 0) + 1);
+
+        activeSyms.add(symU);
+        placed++;
+
+        // Cycle cap enforcement (UNCONDITIONAL)
+        if (placed >= maxNew) {
+          if (!forceAll()) {
+            for (const rest of ideas.ideas.slice(idx + 1)) {
+              await createAutoSkipRecord(env, userId, rest, protocol, 'cycle_cap_reached', { placed, maxNew });
+            }
+          }
+          break;
+        }
+        dailyNotionalLeft -= Number(extra.quote_size || 0);
+      }
+
+      // If budgets became exhausted mid-loop, log the rest as exhausted (only if NO_REJECTS is off)
+      if ((D_left <= 0 || dailyNotionalLeft <= 0) && !forceAll()) {
+        const reason = D_left <= 0 ? 'daily_risk_budget_exhausted' : 'daily_notional_exhausted';
+        for (const rest of ideas.ideas.slice(idx + 1)) {
+          await createAutoSkipRecord(env, userId, rest, protocol, reason, { D_left, dailyNotionalLeft });
+        }
+        break;
+      }
+    }
+
+    // Mark this snapshot as processed for this user (prevents reprocessing every minute)
+    if (ideasTs) await kvSet(env, lastKey, ideasTs);
+  } catch (e) {
+    console.error(`processUser error for ${userId}:`, e);
+    await logEvent(env, userId, 'error', { where: 'processUser', message: e.message });
+  }
 }
 
 /* ---------- Telegram update handler (debounced exits + working orders + reconciliation) ---------- */
 async function handleTelegramUpdate(update, env, ctx) {
-const isCb = !!update.callback_query;
-const msg = isCb ? update.callback_query.message : update.message;
-if (!msg) return;
+  const isCb = !!update.callback_query;
+  const msg = isCb ? update.callback_query.message : update.message;
+  if (!msg) return;
 
-const userId = msg.chat.id;
-const text = isCb ? update.callback_query.data : (update.message.text || "");
-const messageId = isCb ? update.callback_query.message.message_id : (update.message?.message_id || 0);
-if (isCb) ctx.waitUntil(answerCallbackQuery(env, update.callback_query.id));
+  const userId = msg.chat.id;
+  const text = isCb ? update.callback_query.data : (update.message.text || "");
+  const messageId = isCb ? update.callback_query.message.message_id : (update.message?.message_id || 0);
+  if (isCb) ctx.waitUntil(answerCallbackQuery(env, update.callback_query.id));
 
-// Debounced checks: reconciliation + working orders + exits
-try {
-const openCount = await getOpenPositionsCount(env, userId);
-// Count pending with open_order
-const rowPend = await env.DB
-.prepare("SELECT COUNT(*) as c FROM trades WHERE user_id = ? AND status = 'pending' AND json_extract(extra_json,'$.open_order.id') IS NOT NULL")
-.bind(userId).first();
-const postedCount = Number(rowPend?.c || 0);
+  // Debounced checks: reconciliation + working orders + exits
+  try {
+    const openCount = await getOpenPositionsCount(env, userId);
+    // Count pending with open_order
+    const rowPend = await env.DB
+      .prepare("SELECT COUNT(*) as c FROM trades WHERE user_id = ? AND status = 'pending' AND json_extract(extra_json,'$.open_order.id') IS NOT NULL")
+      .bind(userId).first();
+    const postedCount = Number(rowPend?.c || 0);
 
-if (openCount > 0 || postedCount > 0) {
-  const k = `exit_check_ts_${userId}`;
-  const last = Number(await kvGet(env, k) || 0);
-  const now = Date.now();
-  if (now - last > 3000) {
-    await kvSet(env, k, now);
-    ctx.waitUntil(reconcileExchangeFills(env, userId)); // optional (no-op if disabled)
-    ctx.waitUntil(checkWorkingOrders(env, userId));
-    ctx.waitUntil(checkAndExitTrades(env, userId));
+    if (openCount > 0 || postedCount > 0) {
+      const k = `exit_check_ts_${userId}`;
+      const last = Number(await kvGet(env, k) || 0);
+      const now = Date.now();
+      if (now - last > 3000) {
+        await kvSet(env, k, now);
+        ctx.waitUntil(reconcileExchangeFills(env, userId)); // optional (no-op if disabled)
+        ctx.waitUntil(checkWorkingOrders(env, userId));
+        ctx.waitUntil(checkAndExitTrades(env, userId));
+      }
+    }
+  } catch (_) {}
+
+  let session = await getSession(env, userId);
+  if (!session) {
+    if (text !== "/start") { await sendMessage(userId, "Session expired. Send /start to begin.", null, env); return; }
+    session = await createSession(env, userId);
   }
-}
-} catch (_) {}
 
-let session = await getSession(env, userId);
-if (!session) {
-if (text !== "/start") { await sendMessage(userId, "Session expired. Send /start to begin.", null, env); return; }
-session = await createSession(env, userId);
-}
+  // Quick navigation
+  if (text === "continue_dashboard" || text === "back_dashboard") { await sendDashboard(env, userId, isCb ? messageId : 0); return; }
+  if (text === "action_refresh_wizard") { await restartWizardAtExchange(env, userId, isCb ? messageId : 0); return; }
 
-// Quick navigation
-if (text === "continue_dashboard" || text === "back_dashboard") { await sendDashboard(env, userId, isCb ? messageId : 0); return; }
-if (text === "action_refresh_wizard") { await restartWizardAtExchange(env, userId, isCb ? messageId : 0); return; }
+  // Stop actions
+  if (text === "action_direct_stop") { await handleDirectStop(env, userId); return; }
+  if (text === "action_stop_confirm") {
+    if (["start","awaiting_accept","awaiting_mode","awaiting_exchange","awaiting_api_key","awaiting_api_secret"].includes(session.current_step)) {
+      await handleDirectStop(env, userId);
+    } else {
+      await handleStopRequest(env, userId, isCb ? messageId : 0);
+    }
+    return;
+  }
+  if (text === "action_stop_keep") {
+    await saveSession(env, userId, { status: 'halted' });
+    const t = "Session is alive. Send /continue to go to the Dashboard.";
+    if (isCb && messageId) await editMessage(userId, messageId, t, null, env); else await sendMessage(userId, t, null, env);
+    return;
+  }
+  if (text === "action_stop_closeall") {
+    const openTrades = await env.DB.prepare("SELECT id FROM trades WHERE user_id = ? AND status = 'open'").bind(userId).all();
+    let closed = 0;
+    for (const t of (openTrades.results || [])) { try { const res = await closeTradeNow(env, userId, t.id); if (res.ok) closed++; } catch(_){} }
+    const t = `All positions closed (${closed}).`; if (isCb && messageId) await editMessage(userId, messageId, t, null, env); else await sendMessage(userId, t, null, env);
+    await handleDirectStop(env, userId); return;
+  }
+  if (text === "action_wipe_keys") {
+    const openCount = await getOpenPositionsCount(env, userId);
+    if (openCount > 0) {
+      const t = "Cannot wipe keys while positions are open. Close them first.";
+      const b = [[{ text: "Continue ▶️", callback_data: "continue_dashboard" }]];
+      if (isCb && messageId) await editMessage(userId, messageId, t, b, env); else await sendMessage(userId, t, b, env);
+      return;
+    }
+    await saveSession(env, userId, { current_step: 'awaiting_exchange', api_key_encrypted: null, api_secret_encrypted: null });
+    await restartWizardAtExchange(env, userId, isCb ? messageId : 0);
+    return;
+  }
+  if (text === "action_retry_apikey") {
+    await saveSession(env, userId, { current_step: 'awaiting_api_key', temp_api_key: null });
+    if (isCb && messageId) await editMessage(userId, messageId, askApiKeyText(session.exchange_name), null, env);
+    else await sendMessage(userId, askApiKeyText(session.exchange_name), null, env);
+    return;
+  }
+  if (text === "clean_pending") {
+    // Remove pending/rejected and resync flat-CPU pacing counters
+    await env.DB.prepare("DELETE FROM trades WHERE user_id = ? AND status IN ('pending','rejected')").bind(userId).run();
+    await resyncPacingFromDB(env, userId);
+    await sendTradesListUI(env, userId, 1, isCb ? messageId : 0);
+    return;
+  }
+  if (text === "action_delete_history") {
+    const openCount = await getOpenPositionsCount(env, userId);
+    if (openCount > 0) {
+      const t = "You have open positions. Close all current trades to delete history.";
+      const b = [[{ text: "Continue ▶️", callback_data: "continue_dashboard" }]];
+      if (isCb && messageId) await editMessage(userId, messageId, t, b, env); else await sendMessage(userId, t, b, env);
+      return;
+    }
+    try {
+      await env.DB.prepare("DELETE FROM events_log WHERE user_id = ?").bind(userId).run();
+      await env.DB.prepare("DELETE FROM trades WHERE user_id = ?").bind(userId).run();
+      await env.DB.prepare("DELETE FROM protocol_state WHERE user_id = ?").bind(userId).run();
 
-// Stop actions
-if (text === "action_direct_stop") { await handleDirectStop(env, userId); return; }
-if (text === "action_stop_confirm") {
-if (["start","awaiting_accept","awaiting_mode","awaiting_exchange","awaiting_api_key","awaiting_api_secret"].includes(session.current_step)) {
-await handleDirectStop(env, userId);
-} else {
-await handleStopRequest(env, userId, isCb ? messageId : 0);
-}
-return;
-}
-if (text === "action_stop_keep") {
-await saveSession(env, userId, { status: 'halted' });
-const t = "Session is alive. Send /continue to go to the Dashboard.";
-if (isCb && messageId) await editMessage(userId, messageId, t, null, env); else await sendMessage(userId, t, null, env);
-return;
-}
-if (text === "action_stop_closeall") {
-const openTrades = await env.DB.prepare("SELECT id FROM trades WHERE user_id = ? AND status = 'open'").bind(userId).all();
-let closed = 0;
-for (const t of (openTrades.results || [])) { try { const res = await closeTradeNow(env, userId, t.id); if (res.ok) closed++; } catch(_){} }
-const t = `All positions closed (${closed}).`; if (isCb && messageId) await editMessage(userId, messageId, t, null, env); else await sendMessage(userId, t, null, env);
-await handleDirectStop(env, userId); return;
-}
-if (text === "action_wipe_keys") {
-const openCount = await getOpenPositionsCount(env, userId);
-if (openCount > 0) {
-const t = "Cannot wipe keys while positions are open. Close them first.";
-const b = [[{ text: "Continue ▶️", callback_data: "continue_dashboard" }]];
-if (isCb && messageId) await editMessage(userId, messageId, t, b, env); else await sendMessage(userId, t, b, env);
-return;
-}
-await saveSession(env, userId, { current_step: 'awaiting_exchange', api_key_encrypted: null, api_secret_encrypted: null });
-await restartWizardAtExchange(env, userId, isCb ? messageId : 0);
-return;
-}
-if (text === "action_retry_apikey") {
-await saveSession(env, userId, { current_step: 'awaiting_api_key', temp_api_key: null });
-if (isCb && messageId) await editMessage(userId, messageId, askApiKeyText(session.exchange_name), null, env);
-else await sendMessage(userId, askApiKeyText(session.exchange_name), null, env);
-return;
-}
-if (text === "clean_pending") {
-// Remove pending/rejected and resync flat-CPU pacing counters
-await env.DB.prepare("DELETE FROM trades WHERE user_id = ? AND status IN ('pending','rejected')").bind(userId).run();
-await resyncPacingFromDB(env, userId);
-await sendTradesListUI(env, userId, 1, isCb ? messageId : 0);
-return;
-}
-if (text === "action_delete_history") {
-const openCount = await getOpenPositionsCount(env, userId);
-if (openCount > 0) {
-const t = "You have open positions. Close all current trades to delete history.";
-const b = [[{ text: "Continue ▶️", callback_data: "continue_dashboard" }]];
-if (isCb && messageId) await editMessage(userId, messageId, t, b, env); else await sendMessage(userId, t, b, env);
-return;
-}
-try {
-await env.DB.prepare("DELETE FROM events_log WHERE user_id = ?").bind(userId).run();
-await env.DB.prepare("DELETE FROM trades WHERE user_id = ?").bind(userId).run();
-await env.DB.prepare("DELETE FROM protocol_state WHERE user_id = ?").bind(userId).run();
-  // Reset KV (peak equity + pacing counters)
-  await kvSet(env, `peak_equity_user_${userId}`, 0);
-  const today = utcDayKey();
-  await kvSet(env, `tcr_today_date_${userId}`, today);
-  await kvSet(env, `tcr_today_count_${userId}`, 0);
-  await kvSet(env, `tcr_7d_roll_${userId}`, JSON.stringify({ last7: [] }));
+      // Reset KV (peak equity + pacing counters)
+      await kvSet(env, `peak_equity_user_${userId}`, 0);
+      const today = utcDayKey();
+      await kvSet(env, `tcr_today_date_${userId}`, today);
+      await kvSet(env, `tcr_today_count_${userId}`, 0);
+      await kvSet(env, `tcr_7d_roll_${userId}`, JSON.stringify({ last7: [] }));
 
-  await deleteSession(env, userId);
-  await createSession(env, userId);
-  await showWelcomeStep(env, userId, isCb ? messageId : 0);
-} catch (e) {
-  console.error("action_delete_history error:", e);
-  const t = "Failed to delete history (internal error)."; const b = [[{ text: "Continue ▶️", callback_data: "continue_dashboard" }]];
-  if (isCb && messageId) await editMessage(userId, messageId, t, b, env); else await sendMessage(userId, t, b, env);
-}
-return;
-}
-if (text === "/continue") {
-if (session.status === 'halted') { await saveSession(env, userId, { status: 'active' }); await sendDashboard(env, userId, isCb ? messageId : 0); }
-else { const t = "Bot is already active."; if (isCb && messageId) await editMessage(userId, messageId, t, null, env); else await sendMessage(userId, t, null, env); }
-return;
-}
+      await deleteSession(env, userId);
+      await createSession(env, userId);
+      await showWelcomeStep(env, userId, isCb ? messageId : 0);
+    } catch (e) {
+      console.error("action_delete_history error:", e);
+      const t = "Failed to delete history (internal error)."; const b = [[{ text: "Continue ▶️", callback_data: "continue_dashboard" }]];
+      if (isCb && messageId) await editMessage(userId, messageId, t, b, env); else await sendMessage(userId, t, b, env);
+    }
+    return;
+  }
+  if (text === "/continue") {
+    if (session.status === 'halted') { await saveSession(env, userId, { status: 'active' }); await sendDashboard(env, userId, isCb ? messageId : 0); }
+    else { const t = "Bot is already active."; if (isCb && messageId) await editMessage(userId, messageId, t, null, env); else await sendMessage(userId, t, null, env); }
+    return;
+  }
 
-// Mode switches require no open positions
-if (text === '/manual' || text === '/auto') {
-const openCount = await getOpenPositionsCount(env, userId);
-if (openCount > 0) {
-const t = "Cannot change mode while positions are open. Close positions first.";
-const b = [[{ text: "Continue ▶️", callback_data: "continue_dashboard" }]];
-if (isCb && messageId) await editMessage(userId, messageId, t, b, env); else await sendMessage(userId, t, b, env);
-return;
-}
-}
+  // Mode switches require no open positions
+  if (text === '/manual' || text === '/auto') {
+    const openCount = await getOpenPositionsCount(env, userId);
+    if (openCount > 0) {
+      const t = "Cannot change mode while positions are open. Close positions first.";
+      const b = [[{ text: "Continue ▶️", callback_data: "continue_dashboard" }]];
+      if (isCb && messageId) await editMessage(userId, messageId, t, b, env); else await sendMessage(userId, t, b, env);
+      return;
+    }
+  }
 
-// Slash commands
-if (/^\/price\s+/i.test(text)) {
-const parts = text.trim().split(/\s+/); const sym = (parts[1] || "").toUpperCase();
-if (!sym) { await sendMessage(userId, "Usage: /price BTC", null, env); return; }
-const p = await getCurrentPrice(sym); await sendMessage(userId, `${sym}USDT price: ${formatMoney(p)}`, null, env); return;
-}
-if (text.startsWith('/approve')) {
-const id = parseInt((text.split(/\s+/)[1] || ''), 10);
-const row = await env.DB.prepare("SELECT id, extra_json, status FROM trades WHERE user_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1").bind(userId).first();
-const tradeId = id || row?.id;
-if (!tradeId) { await sendMessage(userId, "No pending trade to approve.", null, env); return; }
-const row2 = row || await env.DB.prepare("SELECT extra_json, status FROM trades WHERE id = ? AND user_id = ?").bind(tradeId, userId).first();
-if (!row2 || row2.status !== 'pending') { await sendMessage(userId, `Trade #${tradeId} not pending.`, null, env); return; }
-const extra = JSON.parse(row2.extra_json || '{}');
-if (extra.funds_ok !== true) { await sendMessage(userId, `Insufficient funds to approve trade #${tradeId}.`, null, env); return; }
-const ok = await executeTrade(env, userId, tradeId);
-await sendMessage(userId, ok ? `Trade #${tradeId} approved and executed.` : `Failed to execute trade #${tradeId}.`, null, env);
-return;
-}
-if (text.startsWith('/reject')) {
-const id = parseInt((text.split(/\s+/)[1] || ''), 10);
-const row = await env.DB.prepare("SELECT id FROM trades WHERE user_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1").bind(userId).first();
-const tradeId = id || row?.id;
-if (!tradeId) { await sendMessage(userId, "No pending trade to reject.", null, env); return; }
-await env.DB.prepare("UPDATE trades SET status = 'rejected', updated_at = ? WHERE id = ? AND user_id = ?").bind(nowISO(), tradeId, userId).run();
-await sendMessage(userId, `Trade #${tradeId} rejected.`, null, env);
-return;
-}
-if (text.startsWith('/refresh')) {
-const id = parseInt((text.split(/\s+/)[1] || ''), 10);
-if (!id) { await sendMessage(userId, "Usage: /refresh <tradeId>", null, env); return; }
-await sendTradeDetailsUI(env, userId, id);
-return;
-}
-if (text.startsWith('/close')) {
-const id = parseInt((text.split(/\s+/)[1] || ''), 10);
-if (!id) { await sendMessage(userId, "Usage: /close <tradeId>", null, env); return; }
-const res = await closeTradeNow(env, userId, id);
-await sendMessage(userId, res.ok ? `Closed trade #${id}.` : `Close failed: ${res.msg}`, null, env);
-return;
-}
-if (text === '/trades') { await sendTradesListUI(env, userId, 1); return; }
-if (text === '/funds') { const bal = await getWalletBalance(env, userId); await sendMessage(userId, `Wallet Available (USDT): ${formatMoney(bal)}`, null, env); return; }
-if (text === '/detect') {
-const s2 = await getSession(env, userId);
-if (!s2?.api_key_encrypted) { await sendMessage(userId, "No API keys saved yet.", null, env); return; }
-const apiKey = await decrypt(s2.api_key_encrypted, env);
-const apiSecret = await decrypt(s2.api_secret_encrypted, env);
-const res = await verifyApiKeys(apiKey, apiSecret, s2.exchange_name);
-if (!res.success) { await sendMessage(userId, `Detect failed: ${res.reason}`, null, env); return; }
-const detectedBal = parseFloat(String(res.data.balance || "0").replace(" USDT",""));
-const feeRate = res.data.feeRate ?? 0.001;
-const protocol = await getProtocolState(env, userId);
-if (!protocol) {
-await initProtocolDynamic(env, userId, feeRate, 0.01);
-await sendMessage(userId, `Protocol initialized.\nBalance: ${formatMoney(detectedBal)}\nFee: ${formatPercent(feeRate)}`, null, env);
-} else {
-await updateProtocolState(env, userId, { fee_rate: feeRate });
-await sendMessage(userId, `Detected.\nBalance: ${formatMoney(detectedBal)}\nFee updated: ${formatPercent(feeRate)}`, null, env);
-}
-return;
-}
-if (text.startsWith('/risk')) { await sendMessage(userId, "ACP V20 uses EV-based sizing with strict budgets; /risk is informational only.", null, env); return; }
-if (text === '/manual') { await saveSession(env, userId, { bot_mode: 'manual', status: 'active' }); await sendDashboard(env, userId, isCb ? messageId : 0); return; }
-if (text === '/auto') { await saveSession(env, userId, { bot_mode: 'auto', status: 'active', auto_paused: 'false' }); await sendDashboard(env, userId, isCb ? messageId : 0); return; }
-if (text === '/pause') { await saveSession(env, userId, { auto_paused: 'true' }); await sendDashboard(env, userId, isCb ? messageId : 0); return; }
-if (text === '/resume') { await saveSession(env, userId, { auto_paused: 'false' }); await sendDashboard(env, userId, isCb ? messageId : 0); return; }
+  // Slash commands
+  if (/^\/price\s+/i.test(text)) {
+    const parts = text.trim().split(/\s+/); const sym = (parts[1] || "").toUpperCase();
+    if (!sym) { await sendMessage(userId, "Usage: /price BTC", null, env); return; }
+    const p = await getCurrentPrice(sym); await sendMessage(userId, `${sym}USDT price: ${formatMoney(p)}`, null, env); return;
+  }
+  if (text.startsWith('/approve')) {
+    const id = parseInt((text.split(/\s+/)[1] || ''), 10);
+    const row = await env.DB.prepare("SELECT id, extra_json, status FROM trades WHERE user_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1").bind(userId).first();
+    const tradeId = id || row?.id;
+    if (!tradeId) { await sendMessage(userId, "No pending trade to approve.", null, env); return; }
+    const row2 = row || await env.DB.prepare("SELECT extra_json, status FROM trades WHERE id = ? AND user_id = ?").bind(tradeId, userId).first();
+    if (!row2 || row2.status !== 'pending') { await sendMessage(userId, `Trade #${tradeId} not pending.`, null, env); return; }
+    const extra = JSON.parse(row2.extra_json || '{}');
+    if (extra.funds_ok !== true) { await sendMessage(userId, `Insufficient funds to approve trade #${tradeId}.`, null, env); return; }
+    const ok = await executeTrade(env, userId, tradeId);
+    await sendMessage(userId, ok ? `Trade #${tradeId} approved and executed.` : `Failed to execute trade #${tradeId}.`, null, env);
+    return;
+  }
+  if (text.startsWith('/reject')) {
+    const id = parseInt((text.split(/\s+/)[1] || ''), 10);
+    const row = await env.DB.prepare("SELECT id FROM trades WHERE user_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1").bind(userId).first();
+    const tradeId = id || row?.id;
+    if (!tradeId) { await sendMessage(userId, "No pending trade to reject.", null, env); return; }
+    await env.DB.prepare("UPDATE trades SET status = 'rejected', updated_at = ? WHERE id = ? AND user_id = ?").bind(nowISO(), tradeId, userId).run();
+    await sendMessage(userId, `Trade #${tradeId} rejected.`, null, env);
+    return;
+  }
+  if (text.startsWith('/refresh')) {
+    const id = parseInt((text.split(/\s+/)[1] || ''), 10);
+    if (!id) { await sendMessage(userId, "Usage: /refresh <tradeId>", null, env); return; }
+    await sendTradeDetailsUI(env, userId, id);
+    return;
+  }
+  if (text.startsWith('/close')) {
+    const id = parseInt((text.split(/\s+/)[1] || ''), 10);
+    if (!id) { await sendMessage(userId, "Usage: /close <tradeId>", null, env); return; }
+    const res = await closeTradeNow(env, userId, id);
+    await sendMessage(userId, res.ok ? `Closed trade #${id}.` : `Close failed: ${res.msg}`, null, env);
+    return;
+  }
+  if (text === '/trades') { await sendTradesListUI(env, userId, 1); return; }
+  if (text === '/funds')  { const bal = await getWalletBalance(env, userId); await sendMessage(userId, `Wallet Available (USDT): ${formatMoney(bal)}`, null, env); return; }
+  if (text === '/detect') {
+    const s2 = await getSession(env, userId);
+    if (!s2?.api_key_encrypted) { await sendMessage(userId, "No API keys saved yet.", null, env); return; }
+    const apiKey = await decrypt(s2.api_key_encrypted, env);
+    const apiSecret = await decrypt(s2.api_secret_encrypted, env);
+    const res = await verifyApiKeys(apiKey, apiSecret, s2.exchange_name);
+    if (!res.success) { await sendMessage(userId, `Detect failed: ${res.reason}`, null, env); return; }
+    const detectedBal = parseFloat(String(res.data.balance || "0").replace(" USDT",""));
+    const feeRate = res.data.feeRate ?? 0.001;
+    const protocol = await getProtocolState(env, userId);
+    if (!protocol) {
+      await initProtocolDynamic(env, userId, feeRate, 0.01);
+      await sendMessage(userId, `Protocol initialized.\nBalance: ${formatMoney(detectedBal)}\nFee: ${formatPercent(feeRate)}`, null, env);
+    } else {
+      await updateProtocolState(env, userId, { fee_rate: feeRate });
+      await sendMessage(userId, `Detected.\nBalance: ${formatMoney(detectedBal)}\nFee updated: ${formatPercent(feeRate)}`, null, env);
+    }
+    return;
+  }
+  if (text.startsWith('/risk')) { await sendMessage(userId, "ACP V20 uses EV-based sizing with strict budgets; /risk is informational only.", null, env); return; }
+  if (text === '/manual') { await saveSession(env, userId, { bot_mode: 'manual', status: 'active' }); await sendDashboard(env, userId, isCb ? messageId : 0); return; }
+  if (text === '/auto')   { await saveSession(env, userId, { bot_mode: 'auto', status: 'active', auto_paused: 'false' }); await sendDashboard(env, userId, isCb ? messageId : 0); return; }
+  if (text === '/pause')  { await saveSession(env, userId, { auto_paused: 'true' }); await sendDashboard(env, userId, isCb ? messageId : 0); return; }
+  if (text === '/resume') { await saveSession(env, userId, { auto_paused: 'false' }); await sendDashboard(env, userId, isCb ? messageId : 0); return; }
 
-// Navigation
-if (text === "manage_trades") { await sendTradesListUI(env, userId, 1, isCb ? messageId : 0); return; }
-if (text === "action_back_to_exchange") { await saveSession(env, userId, { current_step: 'awaiting_exchange' }); await restartWizardAtExchange(env, userId, isCb ? messageId : 0); return; }
-if (text === "auto_toggle") {
-const row = await env.DB.prepare("SELECT auto_paused FROM user_sessions WHERE user_id = ?").bind(userId).first();
-const paused = (row?.auto_paused || "false") === "true";
-await saveSession(env, userId, { auto_paused: paused ? "false" : "true" });
-await sendDashboard(env, userId, isCb ? messageId : 0);
-return;
-}
-if (text === "/report" || text === "protocol_status") { await renderProtocolStatus(env, userId, isCb ? messageId : 0); return; }
+  // Navigation
+  if (text === "manage_trades") { await sendTradesListUI(env, userId, 1, isCb ? messageId : 0); return; }
+  if (text === "action_back_to_exchange") { await saveSession(env, userId, { current_step: 'awaiting_exchange' }); await restartWizardAtExchange(env, userId, isCb ? messageId : 0); return; }
+  if (text === "auto_toggle") {
+    const row = await env.DB.prepare("SELECT auto_paused FROM user_sessions WHERE user_id = ?").bind(userId).first();
+    const paused = (row?.auto_paused || "false") === "true";
+    await saveSession(env, userId, { auto_paused: paused ? "false" : "true" });
+    await sendDashboard(env, userId, isCb ? messageId : 0);
+    return;
+  }
+  if (text === "/report" || text === "protocol_status") { await renderProtocolStatus(env, userId, isCb ? messageId : 0); return; }
 
-// Delegate trade-specific callbacks
-if (text.startsWith("tr_")) { await handleTradeAction(env, userId, text, isCb ? messageId : 0); return; }
+  // Delegate trade-specific callbacks
+  if (text.startsWith("tr_")) { await handleTradeAction(env, userId, text, isCb ? messageId : 0); return; }
 
-// Wizard state machine (condensed)
-let nextStep = session.current_step, updates = {};
-switch (session.current_step) {
-case "start": if (text === "/start") nextStep = "awaiting_accept"; break;
-case "awaiting_accept": if (text === "action_accept_terms") nextStep = "awaiting_mode"; break;
-case "awaiting_mode":
-if (text === "mode_manual" || text === "mode_auto") { updates.bot_mode = text === "mode_manual" ? "manual" : "auto"; nextStep = "awaiting_exchange"; }
-else if (text === "action_back_to_start") nextStep = "awaiting_accept"; break;
-case "awaiting_exchange":
-if (text.startsWith("exchange_")) {
-const exKey = text.slice("exchange_".length);
-if (SUPPORTED_EXCHANGES[exKey]) { updates.exchange_name = exKey; nextStep = "awaiting_api_key"; }
-} else if (text === "action_back_to_mode") nextStep = "awaiting_mode";
-break;
-case "awaiting_api_key":
-if (!isCb) { updates.temp_api_key = text; nextStep = "awaiting_api_secret"; }
-else if (text === "action_back_to_exchange") nextStep = "awaiting_exchange";
-break;
-case "awaiting_api_secret":
-if (!isCb) {
-const tempKey = session.temp_api_key; const exName = session.exchange_name;
-if (tempKey && exName) {
-try {
-const result = await verifyApiKeys(tempKey, text, exName);
-if (result.success) {
-updates.api_key_encrypted = await encrypt(tempKey, env);
-updates.api_secret_encrypted = await encrypt(text, env);
-updates.temp_api_key = null;
-const detectedBal = parseFloat(String(result.data.balance || "0").replace(" USDT",""));
-const feeRate = result.data.feeRate ?? 0.001;
-await initProtocolDynamic(env, userId, feeRate, 0.01);
-updates.pending_action_data = JSON.stringify({ bal: detectedBal, feeRate });
-nextStep = session.bot_mode === 'manual' ? "confirm_manual" : "confirm_auto_funds";
-} else {
-const t = `Key check failed.\nReason: ${result.reason || "Unknown error"}`;
-if (isCb && messageId) await editMessage(userId, messageId, t, [[{ text: "Try again", callback_data: "action_retry_apikey" }], [{ text: "Stop", callback_data: "action_direct_stop" }]], env);
-else await sendMessage(userId, t, [[{ text: "Try again", callback_data: "action_retry_apikey" }], [{ text: "Stop", callback_data: "action_direct_stop" }]], env);
-return;
-}
-} catch (e) {
-const t = "Key check failed.\nReason: internal error";
-if (isCb && messageId) await editMessage(userId, messageId, t, [[{ text: "Try again", callback_data: "action_retry_apikey" }], [{ text: "Stop", callback_data: "action_direct_stop" }]], env);
-else await sendMessage(userId, t, [[{ text: "Try again", callback_data: "action_retry_apikey" }], [{ text: "Stop", callback_data: "action_direct_stop" }]], env);
-return;
-}
-}
-}
-break;
-case "confirm_manual":
-if (text === "action_start_manual") {
-updates.status = 'active';
-updates.needs_protocol_onboarding = 'true';
-nextStep = "active_manual_running";
-await renderProtocolStatus(env, userId, isCb ? messageId : 0);
-} break;
-case "confirm_auto_funds":
-if (text === "action_start_auto") {
-const bal = await getWalletBalance(env, userId);
-if (bal < 16) {
-const t = `Wallet available: ${formatMoney(bal)}. Please deposit to enable auto trades.`;
-if (isCb && messageId) await editMessage(userId, messageId, t, [[{ text: "Wipe API Key & Go Back", callback_data: "action_wipe_keys" }]], env);
-else await sendMessage(userId, t, [[{ text: "Wipe API Key & Go Back", callback_data: "action_wipe_keys" }]], env);
-return;
-}
-updates.status = 'active';
-updates.auto_paused = 'false';
-updates.needs_protocol_onboarding = 'true';
-nextStep = "active_auto_running";
-await renderProtocolStatus(env, userId, isCb ? messageId : 0);
-} break;
-case "active_manual_running":
-case "active_auto_running":
-break;
-}
+  // Wizard state machine (condensed)
+  let nextStep = session.current_step, updates = {};
+  switch (session.current_step) {
+    case "start": if (text === "/start") nextStep = "awaiting_accept"; break;
+    case "awaiting_accept": if (text === "action_accept_terms") nextStep = "awaiting_mode"; break;
+    case "awaiting_mode":
+      if (text === "mode_manual" || text === "mode_auto") { updates.bot_mode = text === "mode_manual" ? "manual" : "auto"; nextStep = "awaiting_exchange"; }
+      else if (text === "action_back_to_start") nextStep = "awaiting_accept"; break;
+    case "awaiting_exchange":
+      if (text.startsWith("exchange_")) {
+        const exKey = text.slice("exchange_".length);
+        if (SUPPORTED_EXCHANGES[exKey]) { updates.exchange_name = exKey; nextStep = "awaiting_api_key"; }
+      } else if (text === "action_back_to_mode") nextStep = "awaiting_mode";
+      break;
+    case "awaiting_api_key":
+      if (!isCb) { updates.temp_api_key = text; nextStep = "awaiting_api_secret"; }
+      else if (text === "action_back_to_exchange") nextStep = "awaiting_exchange";
+      break;
+    case "awaiting_api_secret":
+      if (!isCb) {
+        const tempKey = session.temp_api_key; const exName = session.exchange_name;
+        if (tempKey && exName) {
+          try {
+            const result = await verifyApiKeys(tempKey, text, exName);
+            if (result.success) {
+              updates.api_key_encrypted = await encrypt(tempKey, env);
+              updates.api_secret_encrypted = await encrypt(text, env);
+              updates.temp_api_key = null;
+              const detectedBal = parseFloat(String(result.data.balance || "0").replace(" USDT",""));
+              const feeRate = result.data.feeRate ?? 0.001;
+              await initProtocolDynamic(env, userId, feeRate, 0.01);
+              updates.pending_action_data = JSON.stringify({ bal: detectedBal, feeRate });
+              nextStep = session.bot_mode === 'manual' ? "confirm_manual" : "confirm_auto_funds";
+            } else {
+              const t = `Key check failed.\nReason: ${result.reason || "Unknown error"}`;
+              if (isCb && messageId) await editMessage(userId, messageId, t, [[{ text: "Try again", callback_data: "action_retry_apikey" }], [{ text: "Stop", callback_data: "action_direct_stop" }]], env);
+              else await sendMessage(userId, t, [[{ text: "Try again", callback_data: "action_retry_apikey" }], [{ text: "Stop", callback_data: "action_direct_stop" }]], env);
+              return;
+            }
+          } catch (e) {
+            const t = "Key check failed.\nReason: internal error";
+            if (isCb && messageId) await editMessage(userId, messageId, t, [[{ text: "Try again", callback_data: "action_retry_apikey" }], [{ text: "Stop", callback_data: "action_direct_stop" }]], env);
+            else await sendMessage(userId, t, [[{ text: "Try again", callback_data: "action_retry_apikey" }], [{ text: "Stop", callback_data: "action_direct_stop" }]], env);
+            return;
+          }
+        }
+      }
+      break;
+    case "confirm_manual":
+      if (text === "action_start_manual") {
+        updates.status = 'active';
+        updates.needs_protocol_onboarding = 'true';
+        nextStep = "active_manual_running";
+        await renderProtocolStatus(env, userId, isCb ? messageId : 0);
+      } break;
+    case "confirm_auto_funds":
+      if (text === "action_start_auto") {
+        const bal = await getWalletBalance(env, userId);
+        if (bal < 16) {
+          const t = `Wallet available: ${formatMoney(bal)}. Please deposit to enable auto trades.`;
+          if (isCb && messageId) await editMessage(userId, messageId, t, [[{ text: "Wipe API Key & Go Back", callback_data: "action_wipe_keys" }]], env);
+          else await sendMessage(userId, t, [[{ text: "Wipe API Key & Go Back", callback_data: "action_wipe_keys" }]], env);
+          return;
+        }
+        updates.status = 'active';
+        updates.auto_paused = 'false';
+        updates.needs_protocol_onboarding = 'true';
+        nextStep = "active_auto_running";
+        await renderProtocolStatus(env, userId, isCb ? messageId : 0);
+      } break;
+    case "active_manual_running":
+    case "active_auto_running":
+      break;
+  }
 
-let outText = "", buttons = null;
-switch (nextStep) {
-case "awaiting_accept":
-outText = welcomeText();
-buttons = [[{ text: "Accept ✅", callback_data: "action_accept_terms" }],[{ text: "Stop ⛔", callback_data: "action_stop_confirm" }]];
-break;
-case "awaiting_mode":
-outText = modeText();
-buttons = [[{ text: "Manual (approve each trade)", callback_data: "mode_manual" }],[{ text: "Fully Automatic", callback_data: "mode_auto" }],[{ text: "Back ◀️", callback_data: "action_back_to_start" },{ text: "Stop ⛔", callback_data: "action_stop_confirm" }]];
-break;
-case "awaiting_exchange":
-outText = exchangeText(); buttons = exchangeButtons(); break;
-case "awaiting_api_key":
-outText = askApiKeyText(session.exchange_name);
-buttons = [[{ text: "Back ◀️", callback_data: "action_back_to_exchange" }],[{ text: "Stop ⛔", callback_data: "action_stop_confirm" }]];
-break;
-case "awaiting_api_secret":
-outText = askApiSecretText();
-buttons = [[{ text: "Back ◀️", callback_data: "action_back_to_exchange" }],[{ text: "Stop ⛔", callback_data: "action_stop_confirm" }]];
-break;
-case "confirm_manual": {
-const { bal, feeRate } = JSON.parse(updates.pending_action_data || session.pending_action_data || '{}');
-outText = confirmManualTextB(bal ?? 0, feeRate ?? 0.001);
-buttons = [[{ text: "Start Manual ▶️", callback_data: "action_start_manual" }],[{ text: "Wipe API Key & Go Back", callback_data: "action_wipe_keys" }]];
-break;
-}
-case "confirm_auto_funds": {
-const { bal, feeRate } = JSON.parse(updates.pending_action_data || session.pending_action_data || '{}');
-outText = confirmAutoTextB(bal ?? 0, feeRate ?? 0.001);
-buttons = [[{ text: "Yes, Start Auto 🚀", callback_data: "action_start_auto" }],[{ text: "Wipe API Key & Go Back", callback_data: "action_wipe_keys" }]];
-break;
-}
-default: /* no text */ ;
-}
+  let outText = "", buttons = null;
+  switch (nextStep) {
+    case "awaiting_accept":
+      outText = welcomeText();
+      buttons = [[{ text: "Accept ✅", callback_data: "action_accept_terms" }],[{ text: "Stop ⛔", callback_data: "action_stop_confirm" }]];
+      break;
+    case "awaiting_mode":
+      outText = modeText();
+      buttons = [[{ text: "Manual (approve each trade)", callback_data: "mode_manual" }],[{ text: "Fully Automatic", callback_data: "mode_auto" }],[{ text: "Back ◀️", callback_data: "action_back_to_start" },{ text: "Stop ⛔", callback_data: "action_stop_confirm" }]];
+      break;
+    case "awaiting_exchange":
+      outText = exchangeText(); buttons = exchangeButtons(); break;
+    case "awaiting_api_key":
+      outText = askApiKeyText(session.exchange_name);
+      buttons = [[{ text: "Back ◀️", callback_data: "action_back_to_exchange" }],[{ text: "Stop ⛔", callback_data: "action_stop_confirm" }]];
+      break;
+    case "awaiting_api_secret":
+      outText = askApiSecretText();
+      buttons = [[{ text: "Back ◀️", callback_data: "action_back_to_exchange" }],[{ text: "Stop ⛔", callback_data: "action_stop_confirm" }]];
+      break;
+    case "confirm_manual": {
+      const { bal, feeRate } = JSON.parse(updates.pending_action_data || session.pending_action_data || '{}');
+      outText = confirmManualTextB(bal ?? 0, feeRate ?? 0.001);
+      buttons = [[{ text: "Start Manual ▶️", callback_data: "action_start_manual" }],[{ text: "Wipe API Key & Go Back", callback_data: "action_wipe_keys" }]];
+      break;
+    }
+    case "confirm_auto_funds": {
+      const { bal, feeRate } = JSON.parse(updates.pending_action_data || session.pending_action_data || '{}');
+      outText = confirmAutoTextB(bal ?? 0, feeRate ?? 0.001);
+      buttons = [[{ text: "Yes, Start Auto 🚀", callback_data: "action_start_auto" }],[{ text: "Wipe API Key & Go Back", callback_data: "action_wipe_keys" }]];
+      break;
+    }
+    default: /* no text */ ;
+  }
 
-updates.current_step = nextStep;
-await saveSession(env, userId, updates);
-if (outText) {
-if (isCb && messageId) await editMessage(userId, messageId, outText, buttons, env);
-else await sendMessage(userId, outText, buttons, env);
-}
+  updates.current_step = nextStep;
+  await saveSession(env, userId, updates);
+  if (outText) {
+    if (isCb && messageId) await editMessage(userId, messageId, outText, buttons, env);
+    else await sendMessage(userId, outText, buttons, env);
+  }
 }
 
 /* ---------- Cron with fan out fallback (never needs manual calls) ---------- */
 async function runCron(env) {
-const lockValue = Date.now().toString();
-const existing = await env.DB.prepare(
-"SELECT value FROM kv_state WHERE key = ? AND CAST(value AS INTEGER) > ?"
-).bind(CRON_LOCK_KEY, Date.now() - CRON_LOCK_TTL * 1000).first();
-if (existing) { console.log('Cron already running, skipping'); return; }
+  const lockValue = Date.now().toString();
+  const existing = await env.DB.prepare(
+    "SELECT value FROM kv_state WHERE key = ? AND CAST(value AS INTEGER) > ?"
+  ).bind(CRON_LOCK_KEY, Date.now() - CRON_LOCK_TTL * 1000).first();
+  if (existing) { console.log('Cron already running, skipping'); return; }
 
-await env.DB.prepare("INSERT OR REPLACE INTO kv_state (key, value) VALUES (?, ?)").bind(CRON_LOCK_KEY, lockValue).run();
+  await env.DB.prepare("INSERT OR REPLACE INTO kv_state (key, value) VALUES (?, ?)").bind(CRON_LOCK_KEY, lockValue).run();
 
-try {
-// Active users
-const activeUsers = await env.DB
-.prepare("SELECT user_id FROM user_sessions WHERE status IN ('active','halted') AND bot_mode IN ('manual','auto')")
-.all();
+  try {
+    // Active users
+    const activeUsers = await env.DB
+      .prepare("SELECT user_id FROM user_sessions WHERE status IN ('active','halted') AND bot_mode IN ('manual','auto')")
+      .all();
 
-// Config (trim to avoid stray whitespace)
-const base = String(env.SELF_BASE_URL || "").trim().replace(/\/+$/, "");
-const token = String(env.TASK_TOKEN || "").trim();
-const haveTaskEndpoint = !!base && !!token;
-const forceInline = String(env.DEBUG_FORCE_INLINE || "0") === "1";
+    // Config (trim to avoid stray whitespace)
+    const base = String(env.SELF_BASE_URL || "").trim().replace(/\/+$/, "");
+    const token = String(env.TASK_TOKEN || "").trim();
+    const haveTaskEndpoint = !!base && !!token;
+    const forceInline = String(env.DEBUG_FORCE_INLINE || "0") === "1";
 
-for (const u of (activeUsers.results || [])) {
-  const uid = u.user_id;
-  const budgetMs = Number(env.USER_CPU_BUDGET_MS || 20000);
+    for (const u of (activeUsers.results || [])) {
+      const uid = u.user_id;
+      const budgetMs = Number(env.USER_CPU_BUDGET_MS || 20000);
 
-  if (haveTaskEndpoint && !forceInline) {
-    try {
-      const url = `${base}/task/process-user?uid=${encodeURIComponent(uid)}`;
-      const r = await safeFetch(url, {
-        method: "POST",
-        headers: { "Authorization": `Bearer ${token}` }
-      }, 6000);
+      if (haveTaskEndpoint && !forceInline) {
+        try {
+          const url = `${base}/task/process-user?uid=${encodeURIComponent(uid)}`;
+          const r = await safeFetch(url, {
+            method: "POST",
+            headers: { "Authorization": `Bearer ${token}` }
+          }, 6000);
 
-      // If we got a response object, consume its body to release the connection.
-      if (r) {
-        await r.text();
-      }
+          // If we got a response object, consume its body to release the connection.
+          if (r) {
+            await r.text();
+          }
 
-      // Then, check if the fan-out was successful. If not, fallback to inline.
-      if (!r || !r.ok) {
-        console.warn("[cron] fanout non-OK; fallback inline", { uid, status: r?.status });
+          // Then, check if the fan-out was successful. If not, fallback to inline.
+          if (!r || !r.ok) {
+            console.warn("[cron] fanout non-OK; fallback inline", { uid, status: r?.status });
+            await processUser(env, uid, createCpuBudget(budgetMs));
+          }
+        } catch (e) {
+          console.error("[cron] fanout error; fallback inline", { uid, err: e?.message || e });
+          await processUser(env, uid, createCpuBudget(budgetMs));
+        }
+      } else {
+        // Inline mode
         await processUser(env, uid, createCpuBudget(budgetMs));
       }
-    } catch (e) {
-      console.error("[cron] fanout error; fallback inline", { uid, err: e?.message || e });
-      await processUser(env, uid, createCpuBudget(budgetMs));
     }
-  } else {
-    // Inline mode
-    await processUser(env, uid, createCpuBudget(budgetMs));
-  }
-}
 
-// No local idea generation; GitHub pushes to /signals/push
-} catch (e) {
-console.error("runCron error:", e);
-} finally {
-await env.DB.prepare("DELETE FROM kv_state WHERE key = ? AND value = ?").bind(CRON_LOCK_KEY, lockValue).run();
-}
+    // No local idea generation; GitHub pushes to /signals/push
+  } catch (e) {
+    console.error("runCron error:", e);
+  } finally {
+    await env.DB.prepare("DELETE FROM kv_state WHERE key = ? AND value = ?").bind(CRON_LOCK_KEY, lockValue).run();
+  }
 }
 
 /* ---------- Worker Export ---------- */
 export default {
-async fetch(request, env, ctx) {
-try {
-const url = new URL(request.url);
-
-  // Per-user task endpoint (self-fan-out), token-protected
-  if (url.pathname === "/task/process-user" && request.method === "POST") {
-    const auth = request.headers.get("Authorization") || "";
-    const token = String(env.TASK_TOKEN || "").trim();
-    const good = auth.startsWith("Bearer ") && auth.split(" ")[1] === token;
-    if (!good) return new Response("Unauthorized", { status: 401 });
-
-    const uid = url.searchParams.get("uid");
-    if (!uid) return new Response("Missing uid", { status: 400 });
-
+  async fetch(request, env, ctx) {
     try {
-      const ms = Number(env.TASK_WALL_BUDGET_MS || 12000);
-      await processUser(env, uid, createCpuBudget(ms));
-      return new Response(JSON.stringify({ ok: true, uid }), { headers: { "Content-Type": "application/json" } });
+      const url = new URL(request.url);
+
+      // Per-user task endpoint (self-fan-out), token-protected
+      if (url.pathname === "/task/process-user" && request.method === "POST") {
+        const auth = request.headers.get("Authorization") || "";
+        const token = String(env.TASK_TOKEN || "").trim();
+        const good = auth.startsWith("Bearer ") && auth.split(" ")[1] === token;
+        if (!good) return new Response("Unauthorized", { status: 401 });
+
+        const uid = url.searchParams.get("uid");
+        if (!uid) return new Response("Missing uid", { status: 400 });
+
+        try {
+          const ms = Number(env.TASK_WALL_BUDGET_MS || 12000);
+          await processUser(env, uid, createCpuBudget(ms));
+          return new Response(JSON.stringify({ ok: true, uid }), { headers: { "Content-Type": "application/json" } });
+        } catch (e) {
+          console.error("task/process-user error:", e);
+          return new Response(JSON.stringify({ ok: false, error: e.message || "fail" }), {
+            status: 500, headers: { "Content-Type": "application/json" }
+          });
+        }
+      }
+
+      if (url.pathname === "/health") {
+        return new Response(JSON.stringify({ ok: true, time: nowISO() }), { headers: { "Content-Type": "application/json" } });
+      }
+
+      if (url.pathname === "/telegram" && request.method === "POST") {
+        const update = await request.json();
+        await handleTelegramUpdate(update, env, ctx);
+        return new Response("OK");
+      }
+
+      if (url.pathname === "/signals/push" && request.method === "POST") {
+        // Optional bearer protection (set PUSH_TOKEN to enforce)
+        const auth = request.headers.get("Authorization") || "";
+        const expected = String(env.PUSH_TOKEN || "").trim();
+        if (expected && auth !== `Bearer ${expected}`) {
+          console.warn("[push] 401 unauthorized");
+          return new Response("Unauthorized", { status: 401 });
+        }
+
+        let ideas;
+        try {
+          ideas = await request.json();
+        } catch (e) {
+          console.error("[push] bad json", e);
+          return new Response("Bad JSON", { status: 400 });
+        }
+
+        // Visibility in tail/logs
+        const len = Array.isArray(ideas?.ideas) ? ideas.ideas.length : 0;
+        console.log(`[push] received ${len} ideas, origin=${ideas?.meta?.origin}, ts=${ideas?.ts || nowISO()}`);
+
+        try {
+          await env.DB.prepare("INSERT INTO ideas (ts, mode, ideas_json) VALUES (?, ?, ?)")
+            .bind(ideas.ts || nowISO(), ideas.mode || 'normal', JSON.stringify(ideas)).run();
+          console.log("[push] stored ideas snapshot in D1");
+          return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+        } catch (e) {
+          console.error("[push] D1 insert error:", e);
+          return new Response("DB error", { status: 500 });
+        }
+      }
+
+      return new Response("Not found", { status: 404 });
     } catch (e) {
-      console.error("task/process-user error:", e);
-      return new Response(JSON.stringify({ ok: false, error: e.message || "fail" }), {
-        status: 500, headers: { "Content-Type": "application/json" }
-      });
+      console.error("fetch error:", e);
+      return new Response("Error", { status: 500 });
     }
-  }
+  },
 
-  if (url.pathname === "/health") {
-    return new Response(JSON.stringify({ ok: true, time: nowISO() }), { headers: { "Content-Type": "application/json" } });
-  }
-
-  if (url.pathname === "/telegram" && request.method === "POST") {
-    const update = await request.json();
-    await handleTelegramUpdate(update, env, ctx);
-    return new Response("OK");
-  }
-
-  if (url.pathname === "/signals/push" && request.method === "POST") {
-    // Optional bearer protection (set PUSH_TOKEN to enforce)
-    const auth = request.headers.get("Authorization") || "";
-    const expected = String(env.PUSH_TOKEN || "").trim();
-    if (expected && auth !== `Bearer ${expected}`) {
-      console.warn("[push] 401 unauthorized");
-      return new Response("Unauthorized", { status: 401 });
-    }
-
-    let ideas;
-    try {
-      ideas = await request.json();
-    } catch (e) {
-      console.error("[push] bad json", e);
-      return new Response("Bad JSON", { status: 400 });
-    }
-
-    // Visibility in tail/logs
-    const len = Array.isArray(ideas?.ideas) ? ideas.ideas.length : 0;
-    console.log(`[push] received ${len} ideas, origin=${ideas?.meta?.origin}, ts=${ideas?.ts || nowISO()}`);
-
-    try {
-      await env.DB.prepare("INSERT INTO ideas (ts, mode, ideas_json) VALUES (?, ?, ?)")
-        .bind(ideas.ts || nowISO(), ideas.mode || 'normal', JSON.stringify(ideas)).run();
-      console.log("[push] stored ideas snapshot in D1");
-      return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
-    } catch (e) {
-      console.error("[push] D1 insert error:", e);
-      return new Response("DB error", { status: 500 });
-    }
-  }
-
-  return new Response("Not found", { status: 404 });
-} catch (e) {
-  console.error("fetch error:", e);
-  return new Response("Error", { status: 500 });
-}
-},
-
-async scheduled(event, env, ctx) {
-await runCron(env);
-},
+  async scheduled(event, env, ctx) {
+    await runCron(env);
+  },
 };
-
