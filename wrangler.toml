@@ -2,23 +2,24 @@
 # Cloudflare Wrangler Config
 # ========================
 
-# 👇 Worker name — must match your Worker service in Cloudflare
 name = "exchange-server"
-
-# 👇 Entry file (your repo has `index.js` at root)
 main = "index.js"
-
-# 👇 Always set a compatibility date to “lock” Worker runtime features
-compatibility_date = "2024-03-01"
-
-# 👇 Your Cloudflare account ID
+compatibility_date = "2024-10-01"
 account_id = "d6846addb712ea8c4283cab3eabf02dc"
 
+# Make fetch endpoints reachable on *.workers.dev during dev/staging
+workers_dev = true
+# If you use a custom domain, comment out workers_dev and use routes instead:
+# routes = [
+#   { pattern = "api.yourdomain.com/*", zone_id = "YOUR_ZONE_ID" }
+# ]
+
 # ========================
-# LOGGING / OBSERVABILITY  <-- I've added this new section
+# OBSERVABILITY
 # ========================
-[observability.logs]
+[observability]
 enabled = true
+head_sampling_rate = 1.0
 
 # ========================
 # D1 DATABASE
@@ -27,13 +28,13 @@ enabled = true
 binding = "DB"                          # use in code as env.DB
 database_name = "exchange_db"
 database_id = "c3779437-f414-45f9-9c67-a083880de786"
-preview_database_id = "c3779437-f414-45f9-9c67-a083880de786"
+preview_database_id = "REPLACE_WITH_YOUR_PREVIEW_DB_ID"  # use a separate preview DB
 
 # ========================
 # CRON TRIGGERS
 # ========================
 [triggers]
-crons = ["*/1 * * * *"]                 # run every minute (Corrected this comment for you)
+crons = ["*/1 * * * *"]                 # run every minute
 
 # ========================
 # SERVICES
