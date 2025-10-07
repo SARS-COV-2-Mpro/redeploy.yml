@@ -9,19 +9,23 @@ const SUPPORTED_EXCHANGES = {
   crypto_parrot: { label: "Crypto Parrot (Demo)", kind: "demoParrot", hasOrders: true },
 
   // Spot
-  mexc:    { label: "MEXC",    kind: "binanceLike", baseUrl: "https://api.mexc.com",     accountPath: "/api/v3/account", apiKeyHeader: "X-MEXC-APIKEY",  defaultQuery: "",                hasOrders: true },
-  binance: { label: "Binance", kind: "binanceLike", baseUrl: "https://api.binance.com",  accountPath: "/api/v3/account", apiKeyHeader: "X-MBX-APIKEY",   defaultQuery: "recvWindow=5000", hasOrders: true },
-  lbank:   { label: "LBank",   kind: "lbankV2",     baseUrl: "https://api.lbkex.com", hasOrders: true },
-  coinex:  { label: "CoinEx",  kind: "coinexV2",    baseUrl: "https://api.coinex.com", hasOrders: true },
+  mexc:   { label: "MEXC",   kind: "binanceLike", baseUrl: "https://api.mexc.com",    accountPath: "/api/v3/account", apiKeyHeader: "X-MEXC-APIKEY", defaultQuery: "",          hasOrders: true },
+  binance:{ label: "Binance",kind: "binanceLike", baseUrl: "https://api.binance.com", accountPath: "/api/v3/account", apiKeyHeader: "X-MBX-APIKEY",  defaultQuery: "recvWindow=5000", hasOrders: true },
+  lbank:  { label: "LBank",  kind: "lbankV2",     baseUrl: "https://api.lbkex.com",   hasOrders: true },
+  coinex: { label: "CoinEx",  kind: "coinexV2",   baseUrl: "https://api.coinex.com",  hasOrders: true },
 
   // Futures / Margin (USDT-M)
   binance_futures: { label: "Binance Futures (USDT-M)", kind: "binanceFuturesUSDT", baseUrl: "https://fapi.binance.com", apiKeyHeader: "X-MBX-APIKEY", hasOrders: true },
 
+  // Bybit Futures (NEW — trading enabled)
+  bybit_futures_testnet: { label: "Bybit Futures (Testnet)", kind: "bybitFuturesV5", baseUrl: "https://api-testnet.bybit.com", hasOrders: true },
+  bybit_futures:         { label: "Bybit Futures",           kind: "bybitFuturesV5", baseUrl: "https://api.bybit.com",        hasOrders: true },
+
   // Read-only in this worker
-  bybit:   { label: "Bybit",   kind: "bybitV5",     baseUrl: "https://api.bybit.com", hasOrders: false },
-  kraken:  { label: "Kraken",  kind: "krakenV0",    baseUrl: "https://api.kraken.com", hasOrders: false },
-  gate:    { label: "Gate",    kind: "gateV4",      baseUrl: "https://api.gateio.ws", hasOrders: false },
-  huobi:   { label: "Huobi",   kind: "huobiV1",     baseHost: "api.huobi.pro", scheme: "https", hasOrders: false }
+  bybit:  { label: "Bybit (Wallet)", kind: "bybitV5", baseUrl: "https://api.bybit.com", hasOrders: false },
+  kraken: { label: "Kraken", kind: "krakenV0", baseUrl: "https://api.kraken.com", hasOrders: false },
+  gate:   { label: "Gate",   kind: "gateV4",   baseUrl: "https://api.gateio.ws",   hasOrders: false },
+  huobi:  { label: "Huobi",  kind: "huobiV1",  baseHost: "api.huobi.pro", scheme: "https", hasOrders: false }
 };
 
 /* ---------- Brain & Risk Parameters (original behavior) ---------- */
@@ -51,6 +55,11 @@ const AUTO_NO_FUNDS_THRESHOLD = 0.000001;
 
 const DEFAULT_MAX_CONCURRENT_POS = 3;
 const DEFAULT_MAX_NEW_POSITIONS_PER_CYCLE = 3;
+
+const CRON_LAST_RUN_KEY = "cron_last_run_ts";
+function cronIntervalMs(env) { return Math.max(60000, Number(env.CRON_INTERVAL_MS || 60000)); } // default 60s
+function cronCatchupMax(env) { return Math.max(0, Math.floor(Number(env.CRON_CATCHUP_MAX_CYCLES || 3))); } // cap catch-up passes
+function cronGapAlertMs(env) { return Math.max(0, Number(env.CRON_GAP_ALERT_MS || 300000)); } // alert if >5m gap
 
 /* ---------- Tiny utils ---------- */
 const te = new TextEncoder();
@@ -406,7 +415,6 @@ function gistFindPendingIdxByCID(state, cid) {
 
 /* Exports (optional) */
 export { gistOn, gistGetState, gistPatchState, gistFindPendingIdxByCID };
-
 /* ======================================================================
    SECTION 2/7 — Market Data, Orderbook, and Ideas selection
    (Prefer latest GitHub snapshot; origin 'gha' or 'github_actions')
@@ -1083,6 +1091,40 @@ function md5Hex(str) {
   return md51(str).map(rhex).join("");
 }
 
+/* ---------- Bybit V5 sign + wrappers (linear futures) ---------- */
+async function bybitV5Headers(apiKey, apiSecret, payloadStr = "") {
+  const ts = Date.now().toString();
+  const recv = "5000";
+  const pre = ts + apiKey + recv + payloadStr;
+  const sig = await hmacHexStr(apiSecret, pre, "SHA-256");
+  return {
+    "X-BAPI-API-KEY": apiKey,
+    "X-BAPI-TIMESTAMP": ts,
+    "X-BAPI-RECV-WINDOW": recv,
+    "X-BAPI-SIGN": sig,
+    "Content-Type": "application/json"
+  };
+}
+async function bybitV5POST(ex, apiKey, apiSecret, path, payload, timeoutMs = 8000) {
+  const body = JSON.stringify(payload || {});
+  const headers = await bybitV5Headers(apiKey, apiSecret, body);
+  const url = `${ex.baseUrl}${path}`;
+  const r = await safeFetch(url, { method: "POST", headers, body }, timeoutMs).catch(()=>null);
+  const d = r ? await r.json().catch(()=> ({})) : {};
+  if (!r || !r.ok || d?.retCode !== 0) throw new Error(d?.retMsg || `HTTP ${r?.status || 0}`);
+  return d;
+}
+async function bybitV5GET(ex, apiKey, apiSecret, path, qsObj = {}, timeoutMs = 8000) {
+  const sp = new URLSearchParams(qsObj);
+  const qs = sp.toString();
+  const headers = await bybitV5Headers(apiKey, apiSecret, qs);
+  const url = `${ex.baseUrl}${path}?${qs}`;
+  const r = await safeFetch(url, { method: "GET", headers }, timeoutMs).catch(()=>null);
+  const d = r ? await r.json().catch(()=> ({})) : {};
+  if (!r || !r.ok || d?.retCode !== 0) throw new Error(d?.retMsg || `HTTP ${r?.status || 0}`);
+  return d;
+}
+
 /* ---------- Balance parsers ---------- */
 function parseUSDT_BinanceLike(data) {
   if (Array.isArray(data?.balances)) {
@@ -1341,6 +1383,7 @@ async function verifyApiKeys(apiKey, apiSecret, exchangeName) {
 
       // Futures
       case "binanceFuturesUSDT": return await verifyBinanceFutures(apiKey, apiSecret, ex);
+      case "bybitFuturesV5":     return await verifyBybit(apiKey, apiSecret, ex); // uses same wallet call
 
       default: return { success: false, reason: "Not implemented." };
     }
@@ -1546,6 +1589,46 @@ async function placeBinanceFuturesLimitPostOnly(ex, apiKey, apiSecret, symbol, s
   return { orderId: data.orderId, executedQty, avgPrice, status: data.status || 'NEW' };
 }
 
+/* ---------- Bybit Futures V5 MARKET ---------- */
+async function placeBybitFuturesOrder(ex, apiKey, apiSecret, symbol, side, baseQty, reduceOnly = false, clientOrderId) {
+  const sym = symbol.toUpperCase() + "USDT";
+  const payload = {
+    category: "linear",
+    symbol: sym,
+    side: side === "BUY" ? "Buy" : "Sell",
+    orderType: "Market",
+    qty: Number(baseQty).toFixed(6),
+    reduceOnly: !!reduceOnly,
+    orderLinkId: clientOrderId || undefined
+  };
+  const d = await bybitV5POST(ex, apiKey, apiSecret, "/v5/order/create", payload, 8000);
+  const orderId = d?.result?.orderId || d?.result?.orderID;
+
+  // Query status for exec details
+  const st = await getBybitFuturesOrderStatus(ex, apiKey, apiSecret, symbol, { orderId, orderLinkId: clientOrderId });
+  return { orderId, executedQty: st.executedQty, avgPrice: st.avgPrice, status: st.status };
+}
+
+/* ---------- Bybit Futures V5 LIMIT (PostOnly) ---------- */
+async function placeBybitFuturesLimitPostOnly(ex, apiKey, apiSecret, symbol, side, baseQty, price, reduceOnly = false, clientOrderId) {
+  const sym = symbol.toUpperCase() + "USDT";
+  const payload = {
+    category: "linear",
+    symbol: sym,
+    side: side === "BUY" ? "Buy" : "Sell",
+    orderType: "Limit",
+    qty: Number(baseQty).toFixed(6),
+    price: Number(price).toFixed(8),
+    timeInForce: "PostOnly",
+    reduceOnly: !!reduceOnly,
+    orderLinkId: clientOrderId || undefined
+  };
+  const d = await bybitV5POST(ex, apiKey, apiSecret, "/v5/order/create", payload, 8000);
+  const orderId = d?.result?.orderId || d?.result?.orderID;
+  const st = await getBybitFuturesOrderStatus(ex, apiKey, apiSecret, symbol, { orderId, orderLinkId: clientOrderId });
+  return { orderId, executedQty: st.executedQty, avgPrice: st.avgPrice, status: st.status || "NEW" };
+}
+
 /* ---------- Optional: Exit/Bracket orders (default OFF, UX unchanged) ---------- */
 /* Spot (Binance-like): place TAKE_PROFIT_LIMIT and STOP_LOSS_LIMIT with CID suffixes.
    Note: OCO is possible but per-order client IDs are limited; this approach keeps explicit suffixes. */
@@ -1644,6 +1727,65 @@ async function placeBinanceFuturesBracketOrders(ex, apiKey, apiSecret, symbol, i
   };
 }
 
+/* ---------- Bybit Futures V5 Brackets (reduce-only TP/SL as conditional) ---------- */
+async function placeBybitFuturesBracketOrders(ex, apiKey, apiSecret, symbol, isLong, baseQty, tpPrice, slPrice, clientOrderIdPrefix) {
+  const sym = symbol.toUpperCase() + "USDT";
+  const exitSide = isLong ? "Sell" : "Buy";
+  const common = { category: "linear", symbol: sym, side: exitSide, orderType: "Market", qty: Number(baseQty).toFixed(6), reduceOnly: true, triggerBy: "LastPrice" };
+
+  const mkPayload = (triggerPrice, suffix) => ({
+    ...common,
+    triggerPrice: Number(triggerPrice).toFixed(8),
+    orderLinkId: clientOrderIdPrefix ? `${clientOrderIdPrefix}:${suffix}` : undefined
+  });
+
+  let tp = null, sl = null;
+  try { const d1 = await bybitV5POST(ex, apiKey, apiSecret, "/v5/order/create", mkPayload(tpPrice, "tp"), 8000); tp = { orderId: d1?.result?.orderId, status: "NEW" }; } catch(e) { console.warn("Bybit TP failed:", e?.message||e); }
+  try { const d2 = await bybitV5POST(ex, apiKey, apiSecret, "/v5/order/create", mkPayload(slPrice, "sl"), 8000); sl = { orderId: d2?.result?.orderId, status: "NEW" }; } catch(e) { console.warn("Bybit SL failed:", e?.message||e); }
+
+  return { tp, sl };
+}
+
+/* ---------- Ensure 1x Isolated (Binance Futures + Bybit V5) ---------- */
+async function ensureBinanceFuturesIsolated1x(ex, apiKey, apiSecret, symbol) {
+  const sym = symbol.toUpperCase() + "USDT";
+  // margin type
+  try {
+    const p1 = { symbol: sym, marginType: "ISOLATED", timestamp: Date.now() };
+    const qs1 = Object.entries(p1).map(([k,v])=>`${k}=${encodeURIComponent(v)}`).join("&");
+    const sig1 = await hmacHexStr(apiSecret, qs1);
+    const url1 = `${ex.baseUrl}/fapi/v1/marginType?${qs1}&signature=${sig1}`;
+    await safeFetch(url1, { method: "POST", headers: { [ex.apiKeyHeader]: apiKey } }, 6000);
+  } catch(_) { /* already isolated */ }
+  // leverage=1
+  try {
+    const p2 = { symbol: sym, leverage: 1, timestamp: Date.now() };
+    const qs2 = Object.entries(p2).map(([k,v])=>`${k}=${encodeURIComponent(v)}`).join("&");
+    const sig2 = await hmacHexStr(apiSecret, qs2);
+    const url2 = `${ex.baseUrl}/fapi/v1/leverage?${qs2}&signature=${sig2}`;
+    await safeFetch(url2, { method: "POST", headers: { [ex.apiKeyHeader]: apiKey } }, 6000);
+  } catch(_) {}
+}
+async function ensureBybitFuturesIsolated1x(ex, apiKey, apiSecret, symbol) {
+  const sym = symbol.toUpperCase() + "USDT";
+  // tradeMode=1 (Isolated)
+  try {
+    await bybitV5POST(ex, apiKey, apiSecret, "/v5/position/switch-isolated", {
+      category: "linear", symbol: sym, tradeMode: 1
+    }, 6000);
+  } catch(_) {}
+  // leverage=1/1
+  try {
+    await bybitV5POST(ex, apiKey, apiSecret, "/v5/position/set-leverage", {
+      category: "linear", symbol: sym, buyLeverage: "1", sellLeverage: "1"
+    }, 6000);
+  } catch(_) {}
+}
+async function ensureFuturesIsolated1x(ex, apiKey, apiSecret, symbol) {
+  if (ex.kind === "binanceFuturesUSDT") return ensureBinanceFuturesIsolated1x(ex, apiKey, apiSecret, symbol);
+  if (ex.kind === "bybitFuturesV5")     return ensureBybitFuturesIsolated1x(ex, apiKey, apiSecret, symbol);
+}
+
 /* ---------- Demo order (robust price fallback) ---------- */
 async function placeDemoOrder(symbol, side, amount, isQuoteOrder, clientOrderId) {
   let currentPrice = await getCurrentPrice(symbol);
@@ -1676,26 +1818,29 @@ async function placeMarketBuy(env, userId, symbol, quoteAmount, opts = {}) {
     return await placeDemoOrder(symbol, "BUY", quoteAmount, true, opts.clientOrderId);
   }
 
+  // Futures-only enforcement (non-demo)
+  if (["binanceLike","lbankV2","coinexV2"].includes(ex.kind)) {
+    throw new Error("Futures-only mode: pick a futures exchange (Bybit Futures or Binance Futures).");
+  }
+
   const apiKey = await decrypt(session.api_key_encrypted, env);
   const apiSecret = await decrypt(session.api_secret_encrypted, env);
 
   switch (ex.kind) {
-    case "binanceLike":
-      return await placeBinanceLikeOrder(ex, apiKey, apiSecret, symbol, "BUY", quoteAmount, true, opts.clientOrderId);
-    case "lbankV2": {
-      const price = await getCurrentPrice(symbol);
-      return await placeLBankOrder(ex, apiKey, apiSecret, symbol, "buy_market", Number(quoteAmount) / price);
-    }
-    case "coinexV2": {
-      const price = await getCurrentPrice(symbol);
-      return await placeCoinExOrder(ex, apiKey, apiSecret, symbol, "buy", Number(quoteAmount) / price);
-    }
     case "binanceFuturesUSDT": {
       const price = await getCurrentPrice(symbol);
       const baseQty = Number(quoteAmount) / price;
+      await ensureFuturesIsolated1x(ex, apiKey, apiSecret, symbol);
       return await placeBinanceFuturesOrder(ex, apiKey, apiSecret, symbol, "BUY", baseQty, opts.reduceOnly === true, opts.clientOrderId);
     }
-    default: throw new Error(`Orders not supported for ${ex.label}`);
+    case "bybitFuturesV5": {
+      const price = await getCurrentPrice(symbol);
+      const baseQty = Number(quoteAmount) / price;
+      await ensureFuturesIsolated1x(ex, apiKey, apiSecret, symbol);
+      return await placeBybitFuturesOrder(ex, apiKey, apiSecret, symbol, "BUY", baseQty, opts.reduceOnly === true, opts.clientOrderId);
+    }
+    default:
+      throw new Error(`Orders not supported for ${ex.label}`);
   }
 }
 
@@ -1707,29 +1852,35 @@ async function placeMarketSell(env, userId, symbol, amount, isQuoteOrder = false
     return await placeDemoOrder(symbol, "SELL", amount, isQuoteOrder, opts.clientOrderId);
   }
 
+  // Futures-only enforcement (non-demo)
+  if (["binanceLike","lbankV2","coinexV2"].includes(ex.kind)) {
+    throw new Error("Futures-only mode: pick a futures exchange (Bybit Futures or Binance Futures).");
+  }
+
   const apiKey = await decrypt(session.api_key_encrypted, env);
   const apiSecret = await decrypt(session.api_secret_encrypted, env);
 
   switch (ex.kind) {
-    case "binanceLike":
-      return await placeBinanceLikeOrder(ex, apiKey, apiSecret, symbol, "SELL", amount, isQuoteOrder, opts.clientOrderId);
-    case "lbankV2": {
-      const baseAmt = isQuoteOrder ? Number(amount) / (await getCurrentPrice(symbol)) : Number(amount);
-      return await placeLBankOrder(ex, apiKey, apiSecret, symbol, "sell_market", baseAmt);
-    }
-    case "coinexV2": {
-      const baseAmt = isQuoteOrder ? Number(amount) / (await getCurrentPrice(symbol)) : Number(amount);
-      return await placeCoinExOrder(ex, apiKey, apiSecret, symbol, "sell", baseAmt);
-    }
     case "binanceFuturesUSDT": {
       let baseQty = Number(amount);
       if (isQuoteOrder) {
         const price = await getCurrentPrice(symbol);
         baseQty = Number(amount) / price;
       }
+      await ensureFuturesIsolated1x(ex, apiKey, apiSecret, symbol);
       return await placeBinanceFuturesOrder(ex, apiKey, apiSecret, symbol, "SELL", baseQty, opts.reduceOnly === true, opts.clientOrderId);
     }
-    default: throw new Error(`Orders not supported for ${ex.label}`);
+    case "bybitFuturesV5": {
+      let baseQty = Number(amount);
+      if (isQuoteOrder) {
+        const price = await getCurrentPrice(symbol);
+        baseQty = Number(amount) / price;
+      }
+      await ensureFuturesIsolated1x(ex, apiKey, apiSecret, symbol);
+      return await placeBybitFuturesOrder(ex, apiKey, apiSecret, symbol, "SELL", baseQty, opts.reduceOnly === true, opts.clientOrderId);
+    }
+    default:
+      throw new Error(`Orders not supported for ${ex.label}`);
   }
 }
 
@@ -1797,6 +1948,32 @@ async function cancelBinanceFuturesOrder(ex, apiKey, apiSecret, symbol, { orderI
   return d;
 }
 
+/* ---------- Bybit Futures V5 Status/Cancel ---------- */
+async function getBybitFuturesOrderStatus(ex, apiKey, apiSecret, symbol, { orderId, orderLinkId }) {
+  const sym = symbol.toUpperCase() + "USDT";
+  const d = await bybitV5GET(ex, apiKey, apiSecret, "/v5/order/realtime", {
+    category: "linear",
+    symbol: sym,
+    ...(orderId ? { orderId } : {}),
+    ...(orderLinkId ? { orderLinkId } : {})
+  }, 8000);
+  const row = (d?.result?.list || [])[0] || {};
+  const status = row.orderStatus || "";
+  const executedQty = parseFloat(row.cumExecQty || "0");
+  const avgPrice = parseFloat(row.avgPrice || "0");
+  return { status, executedQty, avgPrice };
+}
+async function cancelBybitFuturesOrder(ex, apiKey, apiSecret, symbol, { orderId, orderLinkId }) {
+  const sym = symbol.toUpperCase() + "USDT";
+  const d = await bybitV5POST(ex, apiKey, apiSecret, "/v5/order/cancel", {
+    category: "linear",
+    symbol: sym,
+    ...(orderId ? { orderId } : {}),
+    ...(orderLinkId ? { orderLinkId } : {})
+  }, 8000);
+  return d?.result || {};
+}
+
 /* ---------- Trades/fills fetchers (for reconciliation; default OFF, UX unchanged) ---------- */
 async function getBinanceLikeMyTrades(ex, apiKey, apiSecret, symbol, { startTime, endTime, limit = 1000 } = {}) {
   const endpoint = "/api/v3/myTrades";
@@ -1837,24 +2014,62 @@ async function getBinanceFuturesUserTrades(ex, apiKey, apiSecret, symbol, { star
   return Array.isArray(d) ? d : [];
 }
 
+/* ---------- Bybit Futures V5 fills (for reconciliation) ---------- */
+async function getBybitFuturesUserTrades(ex, apiKey, apiSecret, symbol, { startTime, endTime, limit = 100 } = {}) {
+  const sym = symbol.toUpperCase() + "USDT";
+  const d = await bybitV5GET(ex, apiKey, apiSecret, "/v5/execution/list", {
+    category: "linear",
+    symbol: sym,
+    ...(Number.isFinite(startTime) ? { startTime: Math.floor(startTime) } : {}),
+    ...(Number.isFinite(endTime) ? { endTime: Math.floor(endTime) } : {}),
+    ...(limit ? { limit: Math.max(1, Math.min(1000, limit)) } : {})
+  }, 8000).catch(()=>({ result: { list: [] }}));
+  const list = d?.result?.list || [];
+  // Normalize to resemble Binance-like records used downstream
+  return list.map(x => ({
+    id: x.execId,
+    orderId: x.orderId,
+    side: (x.side || "").toUpperCase() === "BUY" ? "BUY" : "SELL",
+    isBuyer: (x.side || "").toUpperCase() === "BUY",
+    price: x.execPrice,
+    qty: x.execQty,
+    isMaker: x.isMaker === "1" || x.isMaker === true,
+    commission: x.fee,
+    commissionAsset: x.feeAsset
+  }));
+}
+
 /* Exports */
 export {
   hmacHexStr, hmacB64Str, hmacB64Bytes, sha256Bytes, md5Hex,
   parseUSDT_BinanceLike, parseUSDT_Gate, parseUSDT_Bybit, parseUSDT_Kraken, parseUSDT_CoinEx, parseUSDT_Huobi, parseUSDT_LBank,
   verifyBinanceLike, verifyBinanceFutures, verifyBybit, verifyKraken, verifyGate, huobiSignedGet, verifyHuobi, verifyCoinEx, verifyLBank,
   verifyApiKeys,
+
   placeBinanceLikeOrder, placeBinanceLikeLimitMaker,
   placeLBankOrder, placeCoinExOrder,
   placeBinanceFuturesOrder, placeBinanceFuturesLimitPostOnly,
+
+  // NEW: Bybit futures orders/brackets
+  placeBybitFuturesOrder, placeBybitFuturesLimitPostOnly, placeBybitFuturesBracketOrders,
+
   // optional exits (enabled from other sections; defaults keep UX unchanged)
   placeBinanceLikeExitOrders, placeBinanceFuturesBracketOrders,
+
   // demo + routing
   placeDemoOrder,
   placeMarketBuy, placeMarketSell,
+
   // status/cancel + fills for reconciliation
   getBinanceLikeOrderStatus, getBinanceFuturesOrderStatus,
   cancelBinanceLikeOrder, cancelBinanceFuturesOrder,
-  getBinanceLikeMyTrades, getBinanceFuturesUserTrades
+  getBinanceLikeMyTrades, getBinanceFuturesUserTrades,
+
+  // NEW: Bybit status/cancel/fills
+  getBybitFuturesOrderStatus, cancelBybitFuturesOrder, getBybitFuturesUserTrades,
+
+  // NEW: ensure isolated 1x
+  ensureFuturesIsolated1x
 };
 
 /* ======================================================================
@@ -2534,6 +2749,7 @@ async function cancelBracketsIfAny(env, userId, trade, session, ex, extra) {
   try {
     const ob = extra?.open_brackets;
     if (!ob) return;
+
     const apiKey = await decrypt(session.api_key_encrypted, env);
     const apiSecret = await decrypt(session.api_secret_encrypted, env);
 
@@ -2543,8 +2759,12 @@ async function cancelBracketsIfAny(env, userId, trade, session, ex, extra) {
     } else if (ex.kind === "binanceFuturesUSDT") {
       if (ob.tp?.orderId) { try { await cancelBinanceFuturesOrder(ex, apiKey, apiSecret, trade.symbol, { orderId: ob.tp.orderId }); } catch {} }
       if (ob.sl?.orderId) { try { await cancelBinanceFuturesOrder(ex, apiKey, apiSecret, trade.symbol, { orderId: ob.sl.orderId }); } catch {} }
+    } else if (ex.kind === "bybitFuturesV5") {
+      if (ob.tp?.orderId) { try { await cancelBybitFuturesOrder(ex, apiKey, apiSecret, trade.symbol, { orderId: ob.tp.orderId }); } catch {} }
+      if (ob.sl?.orderId) { try { await cancelBybitFuturesOrder(ex, apiKey, apiSecret, trade.symbol, { orderId: ob.sl.orderId }); } catch {} }
     }
-    // remove from extra
+
+    // remove from extra and persist
     delete extra.open_brackets;
     await env.DB.prepare("UPDATE trades SET extra_json = ?, updated_at = ? WHERE id = ?")
       .bind(JSON.stringify(extra), nowISO(), trade.id).run();
@@ -2565,16 +2785,17 @@ async function executeTrade(env, userId, tradeId) {
   const CID = extra?.client_order_id || null;
   const protocol = await getProtocolState(env, userId);
   const isShort = trade.side === 'SELL';
-  const useBrackets = String(env?.USE_BRACKETS || "0") === "1";
+  
+  const session = await getSession(env, userId);
+  const ex = SUPPORTED_EXCHANGES[session.exchange_name];
+  const isFutures = (ex.kind === "binanceFuturesUSDT" || ex.kind === "bybitFuturesV5");
+  const useBrackets = isFutures ? true : (String(env?.USE_BRACKETS || "0") === "1");
 
   const respectExec = envFlag(env, 'RESPECT_EXEC_POLICY', '1');
   const takerFallback = envFlag(env, 'POST_ONLY_TAKER_FALLBACK', '1');
   const wantPostOnly = respectExec && ((extra?.exec?.exec || '').toLowerCase() === 'post_only' || (extra?.entry?.policy || '').toLowerCase() === 'maker_join');
 
   try {
-    const session = await getSession(env, userId);
-    const ex = SUPPORTED_EXCHANGES[session.exchange_name];
-
     if (!wantPostOnly) {
       let orderResult;
       if (!isShort) orderResult = await placeMarketBuy(env, userId, trade.symbol, extra.quote_size, { reduceOnly: false, clientOrderId: CID });
@@ -2598,8 +2819,8 @@ async function executeTrade(env, userId, tradeId) {
 
       await gistMarkOpen(env, trade, orderResult.avgPrice, orderResult.executedQty);
 
-      // Optional bracket placement (default OFF; UX unchanged)
-      if (useBrackets && (ex.kind === "binanceLike" || ex.kind === "binanceFuturesUSDT")) {
+      // Optional bracket placement (default ON for futures)
+      if (useBrackets) {
         try {
           let br = null;
           const isLong = !isShort;
@@ -2611,6 +2832,10 @@ async function executeTrade(env, userId, tradeId) {
             const apiKey = await decrypt(session.api_key_encrypted, env);
             const apiSecret = await decrypt(session.api_secret_encrypted, env);
             br = await placeBinanceFuturesBracketOrders(ex, apiKey, apiSecret, trade.symbol, isLong, orderResult.executedQty, actualTpPrice, actualStopPrice, CID || undefined);
+          } else if (ex.kind === "bybitFuturesV5") {
+            const apiKey = await decrypt(session.api_key_encrypted, env);
+            const apiSecret = await decrypt(session.api_secret_encrypted, env);
+            br = await placeBybitFuturesBracketOrders(ex, apiKey, apiSecret, trade.symbol, isLong, orderResult.executedQty, actualTpPrice, actualStopPrice, CID || undefined);
           }
           if (br) {
             extra.open_brackets = { tp: br.tp ? { orderId: br.tp.orderId } : null, sl: br.sl ? { orderId: br.sl.orderId } : null };
@@ -2661,7 +2886,10 @@ async function executeTrade(env, userId, tradeId) {
     } else if (ex.kind === 'binanceFuturesUSDT') {
       const baseQty = (quoteAmt / Math.max(1e-12, makerPx));
       try {
-        result = await placeBinanceFuturesLimitPostOnly(ex, await decrypt(session.api_key_encrypted, env), await decrypt(session.api_secret_encrypted, env),
+        const apiKey = await decrypt(session.api_key_encrypted, env);
+        const apiSecret = await decrypt(session.api_secret_encrypted, env);
+        await ensureFuturesIsolated1x(ex, apiKey, apiSecret, trade.symbol);
+        result = await placeBinanceFuturesLimitPostOnly(ex, apiKey, apiSecret,
           trade.symbol, isShort ? 'SELL' : 'BUY', baseQty, makerPx, false, CID);
       } catch (e) {
         if (takerFallback) {
@@ -2669,6 +2897,31 @@ async function executeTrade(env, userId, tradeId) {
             trade.symbol, isShort ? 'SELL' : 'BUY', baseQty, false, CID);
         } else {
           await env.DB.prepare("UPDATE trades SET status='rejected', updated_at=? WHERE id=?").bind(nowISO(), tradeId).run();
+          await logEvent(env, userId, 'order_rejected', { policy: 'post_only', symbol: trade.symbol, reason: String(e?.message||e) });
+          return false;
+        }
+      }
+    } else if (ex.kind === 'bybitFuturesV5') {
+      const baseQty = (quoteAmt / Math.max(1e-12, makerPx));
+      try {
+        const apiKey = await decrypt(session.api_key_encrypted, env);
+        const apiSecret = await decrypt(session.api_secret_encrypted, env);
+        await ensureFuturesIsolated1x(ex, apiKey, apiSecret, trade.symbol);
+        result = await placeBybitFuturesLimitPostOnly(
+          ex, apiKey, apiSecret, trade.symbol,
+          isShort ? 'SELL' : 'BUY', baseQty, makerPx, false, CID
+        );
+      } catch (e) {
+        if (takerFallback) {
+          const apiKey = await decrypt(session.api_key_encrypted, env);
+          const apiSecret = await decrypt(session.api_secret_encrypted, env);
+          result = await placeBybitFuturesOrder(
+            ex, apiKey, apiSecret, trade.symbol,
+            isShort ? 'SELL' : 'BUY', baseQty, false, CID
+          );
+        } else {
+          await env.DB.prepare("UPDATE trades SET status='rejected', updated_at=? WHERE id=?")
+            .bind(nowISO(), tradeId).run();
           await logEvent(env, userId, 'order_rejected', { policy: 'post_only', symbol: trade.symbol, reason: String(e?.message||e) });
           return false;
         }
@@ -2690,7 +2943,7 @@ async function executeTrade(env, userId, tradeId) {
       const qty = Number(result.executedQty || 0);
 
       const actualStopPrice = !isShort ? entryPx * (1 - trade.stop_pct) : entryPx * (1 + trade.stop_pct);
-      const actualTpPrice   = !isShort ? entryPx * (1 + trade.stop_pct * rUsed) : entryPx * (1 - trade.stop_pct * rUsed); // fixed + for long
+      const actualTpPrice   = !isShort ? entryPx * (1 + trade.stop_pct * rUsed) : entryPx * (1 - trade.stop_pct * rUsed);
 
       const tcAtEntry = await getTotalCapital(env, userId);
       const notionalAtEntry = entryPx * qty;
@@ -2706,8 +2959,8 @@ async function executeTrade(env, userId, tradeId) {
 
       await gistMarkOpen(env, trade, entryPx, qty);
 
-      // Optional bracket placement (default OFF)
-      if (useBrackets && (ex.kind === "binanceLike" || ex.kind === "binanceFuturesUSDT")) {
+      // Optional bracket placement (default ON for futures)
+      if (useBrackets) {
         try {
           let br = null;
           const isLong = !isShort;
@@ -2719,6 +2972,10 @@ async function executeTrade(env, userId, tradeId) {
             const apiKey = await decrypt(session.api_key_encrypted, env);
             const apiSecret = await decrypt(session.api_secret_encrypted, env);
             br = await placeBinanceFuturesBracketOrders(ex, apiKey, apiSecret, trade.symbol, isLong, qty, actualTpPrice, actualStopPrice, CID || undefined);
+          } else if (ex.kind === "bybitFuturesV5") {
+            const apiKey = await decrypt(session.api_key_encrypted, env);
+            const apiSecret = await decrypt(session.api_secret_encrypted, env);
+            br = await placeBybitFuturesBracketOrders(ex, apiKey, apiSecret, trade.symbol, isLong, qty, actualTpPrice, actualStopPrice, CID || undefined);
           }
           if (br) {
             extra.open_brackets = { tp: br.tp ? { orderId: br.tp.orderId } : null, sl: br.sl ? { orderId: br.sl.orderId } : null };
@@ -2767,6 +3024,43 @@ async function checkWorkingOrders(env, userId) {
       const oo = extra?.open_order;
       if (!oo?.id) continue;
 
+      // TTL cancel for unfilled entry orders
+      const ttlTs = Number(extra?.ttl?.ttl_ts_ms || 0);
+      if (ttlTs > 0 && Date.now() >= ttlTs) {
+        try {
+          if (ex.kind === 'demoParrot') {
+            // nothing to cancel on exchange
+          } else if (ex.kind === 'binanceLike') {
+            const apiKey = await decrypt(session.api_key_encrypted, env);
+            const apiSecret = await decrypt(session.api_secret_encrypted, env);
+            await cancelBinanceLikeOrder(ex, apiKey, apiSecret, t.symbol, { orderId: oo.id });
+          } else if (ex.kind === 'binanceFuturesUSDT') {
+            const apiKey = await decrypt(session.api_key_encrypted, env);
+            const apiSecret = await decrypt(session.api_secret_encrypted, env);
+            await cancelBinanceFuturesOrder(ex, apiKey, apiSecret, t.symbol, { orderId: oo.id });
+          } else if (ex.kind === 'bybitFuturesV5') {
+            const apiKey = await decrypt(session.api_key_encrypted, env);
+            const apiSecret = await decrypt(session.api_secret_encrypted, env);
+            await cancelBybitFuturesOrder(ex, apiKey, apiSecret, t.symbol, { orderId: oo.id });
+          }
+        } catch (_) {}
+
+        // Mark as rejected (TTL expired) and remove gist pending if CID present
+        await env.DB.prepare("UPDATE trades SET status='rejected', close_type='TTL_EXPIRED', updated_at=? WHERE id=?")
+          .bind(nowISO(), t.id).run();
+        if (extra?.client_order_id) {
+          try {
+            await gistPatchState(env, (state) => {
+              const idx = gistFindPendingIdxByCID(state, extra.client_order_id);
+              if (idx >= 0) state.pending.splice(idx, 1);
+              return state;
+            });
+          } catch {}
+        }
+        await logEvent(env, userId, 'order_ttl_cancel', { symbol: t.symbol, id: t.id, orderId: oo.id });
+        continue;
+      }
+
       // Query order status
       let st;
       if (ex.kind === 'demoParrot') {
@@ -2780,6 +3074,10 @@ async function checkWorkingOrders(env, userId) {
         const apiKey = await decrypt(session.api_key_encrypted, env);
         const apiSecret = await decrypt(session.api_secret_encrypted, env);
         st = await getBinanceFuturesOrderStatus(ex, apiKey, apiSecret, t.symbol, oo.id);
+      } else if (ex.kind === 'bybitFuturesV5') {
+        const apiKey = await decrypt(session.api_key_encrypted, env);
+        const apiSecret = await decrypt(session.api_secret_encrypted, env);
+        st = await getBybitFuturesOrderStatus(ex, apiKey, apiSecret, t.symbol, { orderId: oo.id });
       } else {
         continue;
       }
@@ -2799,7 +3097,7 @@ async function checkWorkingOrders(env, userId) {
         ? entryPx * (1 - t.stop_pct)
         : entryPx * (1 + t.stop_pct);
       const actualTpPrice = !isShort
-        ? entryPx * (1 + t.stop_pct * rUsed) // fixed + for long
+        ? entryPx * (1 + t.stop_pct * rUsed)
         : entryPx * (1 - t.stop_pct * rUsed);
 
       const tcAtEntry = await getTotalCapital(env, userId);
@@ -2807,7 +3105,7 @@ async function checkWorkingOrders(env, userId) {
       const pctOfTCAtEntry = tcAtEntry > 0 ? notionalAtEntry / tcAtEntry : 0;
 
       const openedAtMs = Date.now();
-      ensureTradeTtl(extra, openedAtMs, env);
+      ensureTradeTtl(extra, openedAtMs, env); // aligns TTL to open
       delete extra.open_order;
       extra.metrics = { ...(extra.metrics || {}), tc_at_entry: tcAtEntry, notional_at_entry: notionalAtEntry, pct_of_tc_at_entry: pctOfTCAtEntry };
 
@@ -2817,9 +3115,9 @@ async function checkWorkingOrders(env, userId) {
 
       await gistMarkOpen(env, t, entryPx, qty);
 
-      // Optional bracket placement
-      const useBrackets = String(env?.USE_BRACKETS || "0") === "1";
-      if (useBrackets && (ex.kind === "binanceLike" || ex.kind === "binanceFuturesUSDT")) {
+      // Optional bracket placement (default ON for futures)
+      const useBrackets = (ex.kind === "binanceFuturesUSDT" || ex.kind === "bybitFuturesV5") ? true : (String(env?.USE_BRACKETS || "0") === "1");
+      if (useBrackets) {
         try {
           let br = null;
           const isLong = !isShort;
@@ -2831,6 +3129,10 @@ async function checkWorkingOrders(env, userId) {
             const apiKey = await decrypt(session.api_key_encrypted, env);
             const apiSecret = await decrypt(session.api_secret_encrypted, env);
             br = await placeBinanceFuturesBracketOrders(ex, apiKey, apiSecret, t.symbol, isLong, qty, actualTpPrice, actualStopPrice, extra?.client_order_id || undefined);
+          } else if (ex.kind === "bybitFuturesV5") {
+            const apiKey = await decrypt(session.api_key_encrypted, env);
+            const apiSecret = await decrypt(session.api_secret_encrypted, env);
+            br = await placeBybitFuturesBracketOrders(ex, apiKey, apiSecret, t.symbol, isLong, qty, actualTpPrice, actualStopPrice, extra?.client_order_id || undefined);
           }
           if (br) {
             const ex2 = JSON.parse((await env.DB.prepare("SELECT extra_json FROM trades WHERE id=?").bind(t.id).first()).extra_json || '{}');
@@ -2880,6 +3182,8 @@ async function closeTradeNow(env, userId, tradeId) {
   if (!trade || trade.status !== "open") return { ok: false, msg: "Trade not open." };
   const protocol = await getProtocolState(env, userId);
   const isShort = trade.side === 'SELL';
+  const commFromEx = String(env?.COMMISSIONS_FROM_EXCHANGE || "1") === "1";
+
   try {
     let exitPrice = 0;
 
@@ -2887,7 +3191,7 @@ async function closeTradeNow(env, userId, tradeId) {
     const session = await getSession(env, userId);
     const ex = SUPPORTED_EXCHANGES[session.exchange_name];
     const extra = JSON.parse(trade.extra_json || '{}');
-    if (String(env?.USE_BRACKETS || "0") === "1") await cancelBracketsIfAny(env, userId, trade, session, ex, extra);
+    if (extra?.open_brackets) await cancelBracketsIfAny(env, userId, trade, session, ex, extra);
 
     if (!isShort) {
       const sellResult = await placeMarketSell(env, userId, trade.symbol, trade.qty, false, { reduceOnly: true, clientOrderId: extra?.client_order_id || null });
@@ -2904,14 +3208,81 @@ async function closeTradeNow(env, userId, tradeId) {
     }
 
     const grossPnl = !isShort ? (exitPrice - trade.entry_price) * trade.qty : (trade.entry_price - exitPrice) * trade.qty;
-    const fees = (trade.entry_price * trade.qty + exitPrice * trade.qty) * (protocol?.fee_rate ?? 0.001);
+
+    // Try to fetch true commissions + maker/taker + fingerprints
+    let details = null;
+    if (commFromEx) {
+      try {
+        const session2 = await getSession(env, userId);
+        const ex2 = SUPPORTED_EXCHANGES[session2.exchange_name];
+        const apiKey = await decrypt(session2.api_key_encrypted, env);
+        const apiSecret = await decrypt(session2.api_secret_encrypted, env);
+
+        // fetch fills in recent window
+        const startMs = Date.parse(trade.created_at || trade.updated_at || "") - 30 * 60 * 1000;
+        const fills = ex2.kind === "binanceLike"
+          ? await getBinanceLikeMyTrades(ex2, apiKey, apiSecret, trade.symbol, { startTime: startMs, limit: 1000 })
+          : ex2.kind === "binanceFuturesUSDT"
+          ? await getBinanceFuturesUserTrades(ex2, apiKey, apiSecret, trade.symbol, { startTime: startMs, limit: 1000 })
+          : ex2.kind === "bybitFuturesV5"
+          ? await getBybitFuturesUserTrades(ex2, apiKey, apiSecret, trade.symbol, { startTime: startMs, limit: 1000 })
+          : [];
+
+        const entrySideIsBuy = !isShort;
+        const exitSideIsBuy = isShort;
+
+        let commissionEntryUSDT = 0, entryMakerVotes = 0, entryTakerVotes = 0;
+        let commissionExitUSDT = 0, exitMakerVotes = 0, exitTakerVotes = 0;
+        let fp_entry = null, fp_exit = null;
+
+        for (const f of (fills || [])) {
+          const isBuyer = f.isBuyer === true || String(f.side||"").toUpperCase() === "BUY";
+          const qty = Number(f.qty || f.qty_filled || f.baseQty || 0);
+          const price = Number(f.price || f.avgPrice || 0);
+          if (!(qty > 0 && price > 0)) continue;
+
+          const isEntry = (isBuyer && entrySideIsBuy) || (!isBuyer && !entrySideIsBuy);
+          const isExit  = (isBuyer && exitSideIsBuy) || (!isBuyer && !exitSideIsBuy);
+
+          if (isEntry) {
+            if (f.isMaker === true) entryMakerVotes++; else entryTakerVotes++;
+            const cu = await convertCommissionToUSDT((f.commissionAsset || "").toUpperCase(), Number(f.commission || 0));
+            commissionEntryUSDT += cu;
+            if (!fp_entry) fp_entry = fillFingerprint(trade.symbol, f);
+          } else if (isExit) {
+            if (f.isMaker === true) exitMakerVotes++; else exitTakerVotes++;
+            const cu = await convertCommissionToUSDT((f.commissionAsset || "").toUpperCase(), Number(f.commission || 0));
+            commissionExitUSDT += cu;
+            if (!fp_exit) fp_exit = fillFingerprint(trade.symbol, f);
+          }
+        }
+
+        const commissionQuoteUSDT = commissionEntryUSDT + commissionExitUSDT;
+        const commissionBps = (trade.entry_price > 0 && trade.qty > 0) ? (commissionQuoteUSDT / (trade.entry_price * trade.qty)) * 10000 : 0;
+
+        details = {
+          fromExchange: true,
+          commission_quote_usdt: commissionQuoteUSDT,
+          commission_bps: commissionBps,
+          maker_taker_entry: entryMakerVotes >= entryTakerVotes ? "M" : "T",
+          maker_taker_exit: exitMakerVotes >= exitTakerVotes ? "M" : "T",
+          commission_asset_entry: "USDT",
+          commission_asset_exit: "USDT",
+          fingerprint_entry: fp_entry,
+          fingerprint_exit: fp_exit
+        };
+      } catch (_) {}
+    }
+
+    const fees = details?.commission_quote_usdt ?? (trade.entry_price * trade.qty + exitPrice * trade.qty) * (protocol?.fee_rate ?? 0.001);
     const netPnl = grossPnl - fees;
     const realizedR = trade.risk_usd > 0 ? netPnl / trade.risk_usd : 0;
+
     await env.DB.prepare(
       `UPDATE trades SET status='closed', price=?, realized_pnl=?, realized_r=?, fees=?, close_type='MANUAL', updated_at=? WHERE id=?`
     ).bind(exitPrice, netPnl, realizedR, fees, nowISO(), tradeId).run();
 
-    await gistReportClosed(env, trade, exitPrice, 'MANUAL', protocol?.fee_rate);
+    await gistReportClosed(env, trade, exitPrice, 'MANUAL', protocol?.fee_rate, details || null);
 
     await setSymbolCooldown(env, userId, trade.symbol);
     await logEvent(env, userId, 'trade_close', { symbol: trade.symbol, entry: trade.entry_price, exit: exitPrice, realizedR, close_type: 'MANUAL', pnl: netPnl, fees });
@@ -2979,13 +3350,12 @@ async function reconcileExchangeFills(env, userId) {
     "SELECT id, symbol, side, qty, entry_price, risk_usd, extra_json, created_at, updated_at FROM trades WHERE user_id = ? AND status = 'open'"
   ).bind(userId).all();
 
-  const commFromEx = String(env?.COMMISSIONS_FROM_EXCHANGE || "0") === "1";
+  const commFromEx = String(env?.COMMISSIONS_FROM_EXCHANGE || "1") === "1";
 
   for (const t of (open.results || [])) {
     try {
       const extra = JSON.parse(t.extra_json || '{}');
-      const useBrackets = String(env?.USE_BRACKETS || "0") === "1";
-      if (!useBrackets || !extra?.open_brackets) continue; // only reconcile bracket-driven
+      if (!extra?.open_brackets) continue; // only reconcile bracket-driven
 
       const isShort = t.side === 'SELL';
       // Check bracket order statuses
@@ -2999,6 +3369,11 @@ async function reconcileExchangeFills(env, userId) {
         const s = await getBinanceFuturesOrderStatus(ex, apiKey, apiSecret, t.symbol, extra.open_brackets?.tp?.orderId);
         if ((s?.status || "").toUpperCase() === "FILLED" && Number(s.executedQty||0) > 0) tpFill = s;
         const s2 = await getBinanceFuturesOrderStatus(ex, apiKey, apiSecret, t.symbol, extra.open_brackets?.sl?.orderId);
+        if ((s2?.status || "").toUpperCase() === "FILLED" && Number(s2.executedQty||0) > 0) slFill = s2;
+      } else if (ex.kind === "bybitFuturesV5") {
+        const s = await getBybitFuturesOrderStatus(ex, apiKey, apiSecret, t.symbol, { orderId: extra.open_brackets?.tp?.orderId });
+        if ((s?.status || "").toUpperCase() === "FILLED" && Number(s.executedQty||0) > 0) tpFill = s;
+        const s2 = await getBybitFuturesOrderStatus(ex, apiKey, apiSecret, t.symbol, { orderId: extra.open_brackets?.sl?.orderId });
         if ((s2?.status || "").toUpperCase() === "FILLED" && Number(s2.executedQty||0) > 0) slFill = s2;
       } else {
         continue;
@@ -3024,7 +3399,11 @@ async function reconcileExchangeFills(env, userId) {
         const startMs = Date.parse(t.created_at || t.updated_at || "") - 30 * 60 * 1000;
         const fills = ex.kind === "binanceLike"
           ? await getBinanceLikeMyTrades(ex, apiKey, apiSecret, t.symbol, { startTime: startMs, limit: 1000 })
-          : await getBinanceFuturesUserTrades(ex, apiKey, apiSecret, t.symbol, { startTime: startMs, limit: 1000 });
+          : ex.kind === "binanceFuturesUSDT"
+          ? await getBinanceFuturesUserTrades(ex, apiKey, apiSecret, t.symbol, { startTime: startMs, limit: 1000 })
+          : ex.kind === "bybitFuturesV5"
+          ? await getBybitFuturesUserTrades(ex, apiKey, apiSecret, t.symbol, { startTime: startMs, limit: 1000 })
+          : [];
 
         // Separate entry vs exit by side
         // For long (BUY entry), exit is SELL; for short (SELL entry), exit is BUY
@@ -3129,7 +3508,6 @@ async function checkAndExitTrades(env, userId) {
   // Fallback global time-stop (only if per-trade TTL not present)
   const AGE_MS_FALLBACK = getMaxTradeAgeMs(env);
   const overlayOn = envFlag(env, 'ENABLE_MGMT_OVERLAY', '1');
-  const useBracketsFlag = String(env?.USE_BRACKETS || "0") === "1";
 
   for (const trade of (openTrades.results || [])) {
     try {
@@ -3146,6 +3524,7 @@ async function checkAndExitTrades(env, userId) {
       // Management overlay (BE, trail, partial, TTL rescue, early cut)
       let extra = {};
       try { extra = JSON.parse(trade.extra_json || '{}'); } catch { extra = {}; }
+      const haveBrackets = !!(extra.open_brackets);
       const mgmt = extra?.mgmt || {};
       const rNow = unrealizedR(trade, currentPrice);
       const costBps = extra?.idea_fields?.cost_bps;
@@ -3189,10 +3568,10 @@ async function checkAndExitTrades(env, userId) {
           const bpsUnreal = ((currentPrice / trade.entry_price - 1) * (isShort ? -1 : 1)) * 10000;
           if (thrLe != null && bpsUnreal <= thrLe) {
             // Cancel brackets first (if any)
-            if (useBracketsFlag) {
-              const session = await getSession(env, userId);
-              const ex = SUPPORTED_EXCHANGES[session.exchange_name];
-              await cancelBracketsIfAny(env, userId, trade, session, ex, extra);
+            if (haveBrackets) {
+              const session2 = await getSession(env, userId);
+              const ex2 = SUPPORTED_EXCHANGES[session2.exchange_name];
+              await cancelBracketsIfAny(env, userId, trade, session2, ex2, extra);
             }
 
             // Immediate close
@@ -3258,7 +3637,7 @@ async function checkAndExitTrades(env, userId) {
       }
 
       // Priority: TP > SL > TTL
-      const useBracketsSkipPrice = useBracketsFlag && !!extra.open_brackets;
+      const useBracketsSkipPrice = haveBrackets;
       if (!useBracketsSkipPrice) {
         if (!isShort) {
           if (currentPrice <= newStop) { shouldExit = true; exitReason = 'SL'; }
@@ -3294,10 +3673,10 @@ async function checkAndExitTrades(env, userId) {
       if (!shouldExit) continue;
 
       // Cancel brackets first (if any) to avoid double-exec
-      if (useBracketsFlag) {
-        const session = await getSession(env, userId);
-        const ex = SUPPORTED_EXCHANGES[session.exchange_name];
-        await cancelBracketsIfAny(env, userId, trade, session, ex, extra);
+      if (haveBrackets) {
+        const session2 = await getSession(env, userId);
+        const ex2 = SUPPORTED_EXCHANGES[session2.exchange_name];
+        await cancelBracketsIfAny(env, userId, trade, session2, ex2, extra);
       }
 
       const cidBase = extra?.client_order_id || null;
@@ -3397,9 +3776,9 @@ function exchangeText() {
     "Choose your exchange.",
     "",
     "Spot orders supported: MEXC, Binance, LBank, CoinEx.",
-    "Futures (USDT-M): Binance Futures is integrated.",
+    "Futures (USDT-M): Binance Futures and Bybit Futures (Testnet) are integrated.",
     "",
-    "Bybit/Kraken/Gate/Huobi are read-only here (balances only).",
+    "Read-only (balances): Kraken, Gate, Huobi, (Bybit Spot wallet).",
     "Tip: If it doesn’t work click Refresh to restart this wizard step cleanly."
   ].join("\n");
 }
@@ -3476,6 +3855,15 @@ function pendingTradeCard(trade, extra) {
   const entryIntent = fmtExecIntent(extra);
   const mgmtTxt = fmtMgmtOverlay(extra);
 
+  const ttlTs = Number(extra?.ttl?.ttl_ts_ms || 0);
+  const ttlLeftMs = ttlTs > 0 ? (ttlTs - Date.now()) : 0;
+  const ttlLine = ttlTs > 0 ? `TTL: ${formatDurationShort(Math.max(0, ttlLeftMs))}` : "TTL: -";
+
+  const oo = extra?.open_order;
+  const ooLine = oo?.id
+    ? `Posted maker @ ${formatMoney(oo.px)} (CID: ${extra?.client_order_id || "-"})`
+    : "Not posted yet";
+
   return [
     `Trade Suggestion #${trade.id}`,
     "",
@@ -3495,8 +3883,10 @@ function pendingTradeCard(trade, extra) {
     "",
     `EV_R: ${Number(extra.EV_R ?? 0).toFixed(3)} | SQS: ${Number(extra.SQS ?? 0).toFixed(2)} | pH: ${Number(extra.pH ?? 0).toFixed(2)}`,
     `Mgmt overlay: ${mgmtTxt}`,
+    ttlLine,
+    ooLine,
     "",
-    "Approve to place the order now, or Reject to skip."
+    "Approve to place the order now (market or maker intent). Reject/Cancel to discard or cancel a posted maker order."
   ].join("\n");
 }
 function openTradeDetails(trade, extra, currentPrice) {
@@ -3572,8 +3962,9 @@ function exchangeButtons() {
     [{ text: "MEXC", callback_data: "exchange_mexc" }, { text: "Binance", callback_data: "exchange_binance" }],
     [{ text: "LBank", callback_data: "exchange_lbank" }, { text: "CoinEx", callback_data: "exchange_coinex" }],
     [{ text: "Binance Futures (USDT-M)", callback_data: "exchange_binance_futures" }],
-    [{ text: "Bybit", callback_data: "exchange_bybit" }, { text: "Kraken", callback_data: "exchange_kraken" }],
-    [{ text: "Gate", callback_data: "exchange_gate" }, { text: "Huobi", callback_data: "exchange_huobi" }],
+    [{ text: "Bybit Futures (Testnet)", callback_data: "exchange_bybit_futures_testnet" }, { text: "Bybit (Wallet)", callback_data: "exchange_bybit" }],
+    [{ text: "Kraken", callback_data: "exchange_kraken" }, { text: "Gate", callback_data: "exchange_gate" }],
+    [{ text: "Huobi", callback_data: "exchange_huobi" }],
     [{ text: "Back ◀️", callback_data: "action_back_to_mode" }],
     [{ text: "Refresh 🔄", callback_data: "action_refresh_wizard" }, { text: "Stop Bot ⛔", callback_data: "action_stop_confirm" }]
   ];
@@ -3586,10 +3977,14 @@ function kbDashboard(mode, paused, hasProtocol, hasOpenPositions) {
   buttons.push([{ text: "Stop Bot ⛔", callback_data: "action_stop_confirm" }]);
   return buttons;
 }
-function kbPendingTrade(tradeId, fundsOk) {
+function kbPendingTrade(tradeId, fundsOk, hasOpenOrder = false) {
   const rows = [];
-  if (fundsOk) rows.push([{ text: "Approve ✅", callback_data: `tr_appr:${tradeId}` }, { text: "Reject ❌", callback_data: `tr_rej:${tradeId}` }]);
-  else rows.push([{ text: "Reject ❌", callback_data: `tr_rej:${tradeId}` }]);
+  if (hasOpenOrder) {
+    rows.push([{ text: "Cancel order ❌", callback_data: `tr_cancel:${tradeId}` }, { text: "Refresh 🔄", callback_data: `tr_refresh:${tradeId}` }]);
+  } else {
+    if (fundsOk) rows.push([{ text: "Approve ✅", callback_data: `tr_appr:${tradeId}` }, { text: "Reject ❌", callback_data: `tr_rej:${tradeId}` }]);
+    else rows.push([{ text: "Reject ❌", callback_data: `tr_rej:${tradeId}` }]);
+  }
   rows.push([{ text: "Continue ▶️", callback_data: "continue_dashboard" }]);
   rows.push([{ text: "Back to list", callback_data: "manage_trades" }], [{ text: "Stop ⛔", callback_data: "action_stop_confirm" }]);
   return rows;
@@ -3614,9 +4009,9 @@ async function sendDashboard(env, userId, messageId = 0) {
   const paused = (session.auto_paused || "false") === "true";
   let text;
   if (session.bot_mode === "manual") {
-    text = "Bot is active (Manual).\n\nExits: dynamic RRR per idea when provided; fallback 2:1.\nACP V20 sizing.\nUse Manage Trades to inspect suggestions and open/closed positions.";
+    text = "Bot is active (Manual).\n\nExits: dynamic RRR per idea when provided; fallback 2:1.\nACP V20 sizing. Futures 1x isolated; non-demo requires a futures venue (Bybit Futures Testnet/Binance Futures).\nUse Manage Trades to inspect suggestions and open/closed positions.";
   } else {
-    text = `Bot is active (Auto).\nStatus: ${paused ? "Paused" : "Running"}.\n\nExits: dynamic RRR per idea when provided; fallback 2:1.\nACP V20 sizing.\nUse Manage Trades to inspect positions.`;
+    text = `Bot is active (Auto).\nStatus: ${paused ? "Paused" : "Running"}.\n\nExits: dynamic RRR per idea when provided; fallback 2:1.\nACP V20 sizing. Futures 1x isolated; non-demo requires a futures venue (Bybit Futures Testnet/Binance Futures).\nUse Manage Trades to inspect positions.`;
   }
   const buttons = kbDashboard(session.bot_mode, paused, !!protocol, hasOpenPositions);
   if (messageId) await editMessage(userId, messageId, text, buttons, env);
@@ -3701,7 +4096,8 @@ async function sendTradeDetailsUI(env, userId, tradeId, messageId = 0) {
 
   if (trade.status === 'pending') {
     const text = pendingTradeCard(trade, extra);
-    const buttons = kbPendingTrade(tradeId, extra.funds_ok);
+    const hasOO = !!(extra?.open_order?.id);
+    const buttons = kbPendingTrade(tradeId, extra.funds_ok, hasOO);
     if (messageId) await editMessage(userId, messageId, text, buttons, env);
     else await sendMessage(userId, text, buttons, env);
     return;
@@ -3728,6 +4124,21 @@ async function sendTradeDetailsUI(env, userId, tradeId, messageId = 0) {
     const buttons = [[{ text: "Continue ▶️", callback_data: "continue_dashboard" }], [{ text: "Back to list", callback_data: "manage_trades" }]];
     if (messageId) await editMessage(userId, messageId, text, buttons, env);
     else await sendMessage(userId, text, buttons, env);
+    return;
+  }
+
+  if (trade.status === 'rejected' && !extra?.auto_skip) {
+    const reason = trade.close_type || 'REJECTED';
+    const t = [
+      `Suggestion #${trade.id} (Rejected)`,
+      "",
+      `Symbol: ${trade.symbol}`,
+      `Direction: ${trade.side === 'SELL' ? 'Short' : 'Long'}`,
+      `Reason: ${reason}`
+    ].join("\n");
+    const b = [[{ text: "Continue ▶️", callback_data: "continue_dashboard" }], [{ text: "Back to list", callback_data: "manage_trades" }]];
+    if (messageId) await editMessage(userId, messageId, t, b, env);
+    else await sendMessage(userId, t, b, env);
     return;
   }
 
@@ -3782,10 +4193,78 @@ async function handleTradeAction(env, userId, action, messageId = 0) {
       else await editMessage(userId, messageId, `Failed to execute trade #${tradeId}.`, [[{ text: "Continue ▶️", callback_data: "continue_dashboard" }]], env);
       break;
     }
-    case 'tr_rej':
-      await env.DB.prepare("UPDATE trades SET status = 'rejected', updated_at = ? WHERE id = ? AND user_id = ?").bind(nowISO(), tradeId, userId).run();
+    case 'tr_cancel': {
+      const row = await env.DB.prepare("SELECT * FROM trades WHERE id = ? AND user_id = ?").bind(tradeId, userId).first();
+      if (!row || row.status !== 'pending') {
+        await editMessage(userId, messageId, `Trade #${tradeId} not cancellable.`, [[{ text: "Continue ▶️", callback_data: "continue_dashboard" }]], env);
+        break;
+      }
+      let extra = {};
+      try { extra = JSON.parse(row.extra_json || '{}'); } catch {}
+      const oo = extra?.open_order;
+      if (!oo?.id) {
+        // nothing on exchange; mark rejected
+        await env.DB.prepare("UPDATE trades SET status='rejected', close_type='MANUAL_CANCEL', updated_at=? WHERE id=? AND user_id=?")
+          .bind(nowISO(), tradeId, userId).run();
+        await sendTradeDetailsUI(env, userId, tradeId, messageId);
+        break;
+      }
+      try {
+        const session = await getSession(env, userId);
+        const ex = SUPPORTED_EXCHANGES[session.exchange_name];
+        const apiKey = await decrypt(session.api_key_encrypted, env);
+        const apiSecret = await decrypt(session.api_secret_encrypted, env);
+        if (ex.kind === 'binanceLike')        await cancelBinanceLikeOrder(ex, apiKey, apiSecret, row.symbol, { orderId: oo.id });
+        else if (ex.kind === 'binanceFuturesUSDT') await cancelBinanceFuturesOrder(ex, apiKey, apiSecret, row.symbol, { orderId: oo.id });
+        else if (ex.kind === 'bybitFuturesV5') await cancelBybitFuturesOrder(ex, apiKey, apiSecret, row.symbol, { orderId: oo.id });
+      } catch (_) {}
+      // Update DB (reject) and remove gist pending
+      delete extra.open_order;
+      await env.DB.prepare("UPDATE trades SET status='rejected', close_type='MANUAL_CANCEL', extra_json=?, updated_at=? WHERE id=? AND user_id=?")
+        .bind(JSON.stringify(extra), nowISO(), tradeId, userId).run();
+      if (extra?.client_order_id) {
+        await gistPatchState(env, (state) => {
+          const idx = gistFindPendingIdxByCID(state, extra.client_order_id);
+          if (idx >= 0) state.pending.splice(idx, 1);
+          return state;
+        }).catch(()=>{});
+      }
+      await sendTradeDetailsUI(env, userId, tradeId, messageId);
+      break;
+    }
+    case 'tr_rej': {
+      const row = await env.DB.prepare("SELECT * FROM trades WHERE id = ? AND user_id = ?").bind(tradeId, userId).first();
+      if (row && row.status === 'pending') {
+        let extra = {}; try { extra = JSON.parse(row.extra_json || '{}'); } catch {}
+        const oo = extra?.open_order;
+        if (oo?.id) {
+          try {
+            const session = await getSession(env, userId);
+            const ex = SUPPORTED_EXCHANGES[session.exchange_name];
+            const apiKey = await decrypt(session.api_key_encrypted, env);
+            const apiSecret = await decrypt(session.api_secret_encrypted, env);
+            if (ex.kind === 'binanceLike') await cancelBinanceLikeOrder(ex, apiKey, apiSecret, row.symbol, { orderId: oo.id });
+            else if (ex.kind === 'binanceFuturesUSDT')await cancelBinanceFuturesOrder(ex, apiKey, apiSecret, row.symbol, { orderId: oo.id });
+            else if (ex.kind === 'bybitFuturesV5') await cancelBybitFuturesOrder(ex, apiKey, apiSecret, row.symbol, { orderId: oo.id });
+          } catch (_) {}
+          delete extra.open_order;
+          await env.DB.prepare("UPDATE trades SET extra_json=?, updated_at=? WHERE id=? AND user_id=?")
+            .bind(JSON.stringify(extra), nowISO(), tradeId, userId).run();
+        }
+        // remove gist pending by CID (if any)
+        if (extra?.client_order_id) {
+          await gistPatchState(env, (state) => {
+            const idx = gistFindPendingIdxByCID(state, extra.client_order_id);
+            if (idx >= 0) state.pending.splice(idx, 1);
+            return state;
+          }).catch(()=>{});
+        }
+      }
+      await env.DB.prepare("UPDATE trades SET status = 'rejected', updated_at = ? WHERE id = ? AND user_id = ?")
+        .bind(nowISO(), tradeId, userId).run();
       await sendTradesListUI(env, userId, 1, messageId);
       break;
+    }
     case 'tr_refresh':
       await sendTradeDetailsUI(env, userId, tradeId, messageId);
       break;
@@ -3933,6 +4412,24 @@ async function processUser(env, userId, budget = null) {
     if (budget?.isExpired()) return;
     const session = await getSession(env, userId);
     if (!session) return;
+    
+    const ex = SUPPORTED_EXCHANGES[session.exchange_name];
+    if (!ex) return;
+
+    // Enforce futures-only for non-demo; optionally log and skip ideas
+    if (session.exchange_name !== 'crypto_parrot' && ["binanceLike","lbankV2","coinexV2"].includes(ex.kind)) {
+      // Option 1: log once and return
+      await logEvent(env, userId, 'futures_only_block', { exchange: session.exchange_name });
+      // Option 2 (verbose): mark each idea as skipped (requires loading ideas)
+    //  const ideasTmp = await (await buildIdeasFromGistPending(env)) || await getLatestIdeas(env);
+    //  if (ideasTmp?.ideas?.length) {
+    //    const protocol = await getProtocolState(env, userId);
+    //    for (const idea of ideasTmp.ideas) {
+    //      await createAutoSkipRecord(env, userId, idea, protocol, 'exchange_requires_futures', { exchange: session.exchange_name });
+    //    }
+    //  }
+      return;
+    }
 
     // Helper: force all ideas through (env.NO_REJECTS = '1')
     const forceAll = () => String(env?.NO_REJECTS || '0') === '1';
@@ -4215,10 +4712,49 @@ async function handleTelegramUpdate(update, env, ctx) {
     return;
   }
   if (text === "action_stop_closeall") {
+    const cidsForPrune = [];
+    // Cancel live pending entry orders
+    try {
+      const session2 = await getSession(env, userId);
+      const ex2 = SUPPORTED_EXCHANGES[session2.exchange_name];
+      if (ex2 && session2?.api_key_encrypted && session2?.api_secret_encrypted) {
+        const apiKey = await decrypt(session2.api_key_encrypted, env);
+        const apiSecret = await decrypt(session2.api_secret_encrypted, env);
+        const pendLive = await env.DB.prepare(
+          "SELECT id, symbol, extra_json FROM trades WHERE user_id = ? AND status = 'pending' AND json_extract(extra_json,'$.open_order.id') IS NOT NULL"
+        ).bind(userId).all();
+        for (const r of (pendLive.results || [])) {
+          try {
+            const exj = JSON.parse(r.extra_json || '{}');
+            if (exj?.client_order_id) cidsForPrune.push(exj.client_order_id);
+            const oid = exj?.open_order?.id;
+            if (!oid) continue;
+            if (ex2.kind === 'binanceLike')             await cancelBinanceLikeOrder(ex2, apiKey, apiSecret, r.symbol, { orderId: oid });
+            else if (ex2.kind === 'binanceFuturesUSDT') await cancelBinanceFuturesOrder(ex2, apiKey, apiSecret, r.symbol, { orderId: oid });
+            else if (ex2.kind === 'bybitFuturesV5')     await cancelBybitFuturesOrder(ex2, apiKey, apiSecret, r.symbol, { orderId: oid });
+            // mark row rejected
+            await env.DB.prepare("UPDATE trades SET status='rejected', close_type='MANUAL_CANCEL', updated_at=? WHERE id=?")
+              .bind(nowISO(), r.id).run();
+          } catch(_) {}
+        }
+      }
+    } catch(_) {}
+    
+    if (cidsForPrune.length) {
+      await gistPatchState(env, (state) => {
+        const arr = Array.isArray(state?.pending) ? state.pending : [];
+        state.pending = arr.filter(p => !cidsForPrune.includes(p?.client_order_id));
+        state.lastReconcileTs = Date.now();
+        return state;
+      }).catch(()=>{});
+    }
+  
+    // Close open positions
     const openTrades = await env.DB.prepare("SELECT id FROM trades WHERE user_id = ? AND status = 'open'").bind(userId).all();
     let closed = 0;
     for (const t of (openTrades.results || [])) { try { const res = await closeTradeNow(env, userId, t.id); if (res.ok) closed++; } catch(_){} }
-    const t = `All positions closed (${closed}).`; if (isCb && messageId) await editMessage(userId, messageId, t, null, env); else await sendMessage(userId, t, null, env);
+    const t = `All positions closed (${closed}).`;
+    if (isCb && messageId) await editMessage(userId, messageId, t, null, env); else await sendMessage(userId, t, null, env);
     await handleDirectStop(env, userId); return;
   }
   if (text === "action_wipe_keys") {
@@ -4240,7 +4776,44 @@ async function handleTelegramUpdate(update, env, ctx) {
     return;
   }
   if (text === "clean_pending") {
-    // Remove pending/rejected and resync flat-CPU pacing counters
+    // Cancel live pending entry orders first
+    const session2 = await getSession(env, userId);
+    const ex2 = SUPPORTED_EXCHANGES[session2.exchange_name];
+    if (ex2 && session2?.api_key_encrypted && session2?.api_secret_encrypted) {
+      const apiKey = await decrypt(session2.api_key_encrypted, env);
+      const apiSecret = await decrypt(session2.api_secret_encrypted, env);
+      const pendLive = await env.DB.prepare(
+        "SELECT id, symbol, extra_json FROM trades WHERE user_id = ? AND status = 'pending' AND json_extract(extra_json,'$.open_order.id') IS NOT NULL"
+      ).bind(userId).all();
+      for (const r of (pendLive.results || [])) {
+        try {
+          const exj = JSON.parse(r.extra_json || '{}');
+          const oid = exj?.open_order?.id;
+          if (!oid) continue;
+          if (ex2.kind === 'binanceLike')             await cancelBinanceLikeOrder(ex2, apiKey, apiSecret, r.symbol, { orderId: oid });
+          else if (ex2.kind === 'binanceFuturesUSDT') await cancelBinanceFuturesOrder(ex2, apiKey, apiSecret, r.symbol, { orderId: oid });
+          else if (ex2.kind === 'bybitFuturesV5')     await cancelBybitFuturesOrder(ex2, apiKey, apiSecret, r.symbol, { orderId: oid });
+        } catch(_) {}
+      }
+    }
+
+    const pendRows = await env.DB.prepare(
+      "SELECT extra_json FROM trades WHERE user_id = ? AND status = 'pending'"
+    ).bind(userId).all();
+    const cids = [];
+    for (const r of (pendRows.results || [])) {
+      try { const exj = JSON.parse(r.extra_json || '{}'); if (exj?.client_order_id) cids.push(exj.client_order_id); } catch {}
+    }
+    if (cids.length) {
+      await gistPatchState(env, (state) => {
+        const arr = Array.isArray(state?.pending) ? state.pending : [];
+        state.pending = arr.filter(p => !cids.includes(p?.client_order_id));
+        state.lastReconcileTs = Date.now();
+        return state;
+      }).catch(()=>{});
+    }
+  
+    // Remove pending/rejected and resync pacing counters
     await env.DB.prepare("DELETE FROM trades WHERE user_id = ? AND status IN ('pending','rejected')").bind(userId).run();
     await resyncPacingFromDB(env, userId);
     await sendTradesListUI(env, userId, 1, isCb ? messageId : 0);
@@ -4255,6 +4828,43 @@ async function handleTelegramUpdate(update, env, ctx) {
       return;
     }
     try {
+      // Cancel live pending entry orders first
+      const session2 = await getSession(env, userId);
+      const ex2 = SUPPORTED_EXCHANGES[session2.exchange_name];
+      if (ex2 && session2?.api_key_encrypted && session2?.api_secret_encrypted) {
+        const apiKey = await decrypt(session2.api_key_encrypted, env);
+        const apiSecret = await decrypt(session2.api_secret_encrypted, env);
+        const pendLive = await env.DB.prepare(
+          "SELECT id, symbol, extra_json FROM trades WHERE user_id = ? AND status = 'pending' AND json_extract(extra_json,'$.open_order.id') IS NOT NULL"
+        ).bind(userId).all();
+        for (const r of (pendLive.results || [])) {
+          try {
+            const exj = JSON.parse(r.extra_json || '{}');
+            const oid = exj?.open_order?.id;
+            if (!oid) continue;
+            if (ex2.kind === 'binanceLike')             await cancelBinanceLikeOrder(ex2, apiKey, apiSecret, r.symbol, { orderId: oid });
+            else if (ex2.kind === 'binanceFuturesUSDT') await cancelBinanceFuturesOrder(ex2, apiKey, apiSecret, r.symbol, { orderId: oid });
+            else if (ex2.kind === 'bybitFuturesV5')     await cancelBybitFuturesOrder(ex2, apiKey, apiSecret, r.symbol, { orderId: oid });
+          } catch(_) {}
+        }
+      }
+      
+      const pendRows = await env.DB.prepare(
+        "SELECT extra_json FROM trades WHERE user_id = ? AND status = 'pending'"
+      ).bind(userId).all();
+      const cids = [];
+      for (const r of (pendRows.results || [])) {
+        try { const exj = JSON.parse(r.extra_json || '{}'); if (exj?.client_order_id) cids.push(exj.client_order_id); } catch {}
+      }
+      if (cids.length) {
+        await gistPatchState(env, (state) => {
+          const arr = Array.isArray(state?.pending) ? state.pending : [];
+          state.pending = arr.filter(p => !cids.includes(p?.client_order_id));
+          state.lastReconcileTs = Date.now();
+          return state;
+        }).catch(()=>{});
+      }
+
       await env.DB.prepare("DELETE FROM events_log WHERE user_id = ?").bind(userId).run();
       await env.DB.prepare("DELETE FROM trades WHERE user_id = ?").bind(userId).run();
       await env.DB.prepare("DELETE FROM protocol_state WHERE user_id = ?").bind(userId).run();
@@ -4314,10 +4924,40 @@ async function handleTelegramUpdate(update, env, ctx) {
   }
   if (text.startsWith('/reject')) {
     const id = parseInt((text.split(/\s+/)[1] || ''), 10);
-    const row = await env.DB.prepare("SELECT id FROM trades WHERE user_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1").bind(userId).first();
+    const row = await env.DB.prepare(
+      "SELECT * FROM trades WHERE user_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1"
+    ).bind(userId).first();
     const tradeId = id || row?.id;
     if (!tradeId) { await sendMessage(userId, "No pending trade to reject.", null, env); return; }
-    await env.DB.prepare("UPDATE trades SET status = 'rejected', updated_at = ? WHERE id = ? AND user_id = ?").bind(nowISO(), tradeId, userId).run();
+
+    let extra = {};
+    try { extra = JSON.parse(row.extra_json || '{}'); } catch {}
+    const oo = extra?.open_order;
+
+    if (oo?.id) {
+      try {
+        const session2 = await getSession(env, userId);
+        const ex2 = SUPPORTED_EXCHANGES[session2.exchange_name];
+        const apiKey = await decrypt(session2.api_key_encrypted, env);
+        const apiSecret = await decrypt(session2.api_secret_encrypted, env);
+        if (ex2.kind === 'binanceLike') await cancelBinanceLikeOrder(ex2, apiKey, apiSecret, row.symbol, { orderId: oo.id });
+        else if (ex2.kind === 'binanceFuturesUSDT') await cancelBinanceFuturesOrder(ex2, apiKey, apiSecret, row.symbol, { orderId: oo.id });
+        else if (ex2.kind === 'bybitFuturesV5') await cancelBybitFuturesOrder(ex2, apiKey, apiSecret, row.symbol, { orderId: oo.id });
+      } catch (_) {}
+    }
+
+    await env.DB.prepare(
+      "UPDATE trades SET status = 'rejected', close_type='MANUAL_CANCEL', updated_at = ? WHERE id = ? AND user_id = ?"
+    ).bind(nowISO(), tradeId, userId).run();
+
+    if (extra?.client_order_id) {
+      await gistPatchState(env, (state) => {
+        const idx = gistFindPendingIdxByCID(state, extra.client_order_id);
+        if (idx >= 0) state.pending.splice(idx, 1);
+        return state;
+      }).catch(()=>{});
+    }
+
     await sendMessage(userId, `Trade #${tradeId} rejected.`, null, env);
     return;
   }
@@ -4505,54 +5145,67 @@ async function runCron(env) {
   await env.DB.prepare("INSERT OR REPLACE INTO kv_state (key, value) VALUES (?, ?)").bind(CRON_LOCK_KEY, lockValue).run();
 
   try {
-    // Active users
-    const activeUsers = await env.DB
-      .prepare("SELECT user_id FROM user_sessions WHERE status IN ('active','halted') AND bot_mode IN ('manual','auto')")
-      .all();
+    // NEW: detect and handle gaps
+    const now = Date.now();
+    const lastRunRaw = await kvGet(env, CRON_LAST_RUN_KEY);
+    const lastRun = Number(lastRunRaw || 0);
+    const expected = cronIntervalMs(env);
+    const gap = lastRun ? (now - lastRun) : 0;
+    const missed = lastRun && gap > expected ? Math.floor(gap / expected) : 0;
+    const maxCatchup = cronCatchupMax(env);
+    const cyclesToRun = 1 + Math.min(missed, maxCatchup);
 
-    // Config (trim to avoid stray whitespace)
-    const base = String(env.SELF_BASE_URL || "").trim().replace(/\/+$/, "");
-    const token = String(env.TASK_TOKEN || "").trim();
-    const haveTaskEndpoint = !!base && !!token;
-    const forceInline = String(env.DEBUG_FORCE_INLINE || "0") === "1";
+    // NEW: Optional alert on large gap
+    if (gap > cronGapAlertMs(env) && env.ADMIN_TELEGRAM_CHAT_ID) {
+      try {
+        await sendMessage(env.ADMIN_TELEGRAM_CHAT_ID, `Cron gap detected: ${(gap/1000).toFixed(0)}s. Catch-up cycles=${cyclesToRun-1}`, null, env);
+      } catch (_) {}
+    }
 
-    for (const u of (activeUsers.results || [])) {
-      const uid = u.user_id;
-      const budgetMs = Number(env.USER_CPU_BUDGET_MS || 20000);
+    for (let pass = 0; pass < cyclesToRun; pass++) {
+      const activeUsers = await env.DB
+        .prepare("SELECT user_id FROM user_sessions WHERE status IN ('active','halted') AND bot_mode IN ('manual','auto')")
+        .all();
 
-      if (haveTaskEndpoint && !forceInline) {
-        try {
-          const url = `${base}/task/process-user?uid=${encodeURIComponent(uid)}`;
-          const r = await safeFetch(url, {
-            method: "POST",
-            headers: { "Authorization": `Bearer ${token}` }
-          }, 6000);
+      const base = String(env.SELF_BASE_URL || "").trim().replace(/\/+$/, "");
+      const token = String(env.TASK_TOKEN || "").trim();
+      const haveTaskEndpoint = !!base && !!token;
+      const forceInline = String(env.DEBUG_FORCE_INLINE || "0") === "1";
 
-          // If we got a response object, consume its body to release the connection.
-          if (r) {
-            await r.text();
-          }
+      // Slightly smaller CPU budget on catch-up passes
+      for (const u of (activeUsers.results || [])) {
+        const uid = u.user_id;
+        const budgetMs = Number(pass === 0 ? (env.USER_CPU_BUDGET_MS || 20000) : (env.USER_CPU_BUDGET_MS_CATCHUP || 12000));
 
-          // Then, check if the fan-out was successful. If not, fallback to inline.
-          if (!r || !r.ok) {
-            console.warn("[cron] fanout non-OK; fallback inline", { uid, status: r?.status });
+        if (haveTaskEndpoint && !forceInline) {
+          try {
+            const url = `${base}/task/process-user?uid=${encodeURIComponent(uid)}`;
+            const r = await safeFetch(url, {
+              method: "POST",
+              headers: { "Authorization": `Bearer ${token}` }
+            }, 6000);
+            if (r) await r.text();
+            if (!r || !r.ok) {
+              console.warn("[cron] fanout non-OK; fallback inline", { uid, status: r?.status });
+              await processUser(env, uid, createCpuBudget(budgetMs));
+            }
+          } catch (e) {
+            console.error("[cron] fanout error; fallback inline", { uid, err: e?.message || e });
             await processUser(env, uid, createCpuBudget(budgetMs));
           }
-        } catch (e) {
-          console.error("[cron] fanout error; fallback inline", { uid, err: e?.message || e });
+        } else {
           await processUser(env, uid, createCpuBudget(budgetMs));
         }
-      } else {
-        // Inline mode
-        await processUser(env, uid, createCpuBudget(budgetMs));
       }
     }
 
-    // No local idea generation; GitHub pushes to /signals/push
+    // NEW: record last-run timestamp
+    await kvSet(env, CRON_LAST_RUN_KEY, Date.now());
   } catch (e) {
     console.error("runCron error:", e);
   } finally {
-    await env.DB.prepare("DELETE FROM kv_state WHERE key = ? AND value = ?").bind(CRON_LOCK_KEY, lockValue).run();
+    await env.DB.prepare("DELETE FROM kv_state WHERE key = ? AND value = ?")
+      .bind(CRON_LOCK_KEY, lockValue).run();
   }
 }
 
@@ -4626,6 +5279,26 @@ export default {
         }
       }
 
+      if (url.pathname === "/cron/trigger" && request.method === "POST") {
+        const auth = request.headers.get("Authorization") || "";
+        const token = String(env.CRON_TOKEN || env.TASK_TOKEN || "").trim();
+        const good = token && auth === `Bearer ${token}`;
+        if (!good) return new Response("Unauthorized", { status: 401 });
+
+        try {
+          await runCron(env);
+          return new Response(JSON.stringify({ ok: true, ran: "cron" }), {
+            headers: { "Content-Type": "application/json" }
+          });
+        } catch (e) {
+          console.error("cron/trigger error:", e);
+          return new Response(JSON.stringify({ ok: false, error: e.message || "fail" }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+      }
+
       return new Response("Not found", { status: 404 });
     } catch (e) {
       console.error("fetch error:", e);
@@ -4634,6 +5307,6 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    await runCron(env);
+    ctx.waitUntil(runCron(env));  // ensures non-blocking execution
   },
 };
