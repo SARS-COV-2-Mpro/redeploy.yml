@@ -18,7 +18,7 @@ const SUPPORTED_EXCHANGES = {
   binance_futures: { label: "Binance Futures (USDT-M)", kind: "binanceFuturesUSDT", baseUrl: "https://fapi.binance.com", apiKeyHeader: "X-MBX-APIKEY", hasOrders: true },
 
   // Bybit Futures (NEW — trading enabled)
-  bybit_futures_testnet: { label: "Bybit Futures (Testnet)", kind: "bybitFuturesV5", baseUrl: "https://api-testnet.bybit.com", hasOrders: true },
+  bybit_futures_testnet: { label: "Bybit Futures (Demo-Testnet)", kind: "bybitFuturesV5", baseUrl: "https://api-demo-testnet.bybit.com", hasOrders: true },
   bybit_futures:         { label: "Bybit Futures",           kind: "bybitFuturesV5", baseUrl: "https://api.bybit.com",        hasOrders: true },
 
   // Read-only in this worker
@@ -65,8 +65,15 @@ function cronGapAlertMs(env) { return Math.max(0, Number(env.CRON_GAP_ALERT_MS |
 const te = new TextEncoder();
 const td = new TextDecoder();
 const b64url = {
-  encode: (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_"),
-  decode: (str) => Uint8Array.from(atob(str.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0)),
+  encode: (buf) =>
+    btoa(String.fromCharCode(...new Uint8Array(buf)))
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_"),
+  decode: (str) =>
+    Uint8Array.from(
+      atob(str.replace(/-/g, "+").replace(/_/g, "/")),
+      (c) => c.charCodeAt(0)
+    ),
 };
 const b64std = {
   encode: (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))),
@@ -78,8 +85,9 @@ const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
 const clamp01 = (x) => Math.max(0, Math.min(1, x));
 const clampRange = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
 const sigmoid = (x) => 1 / (1 + Math.exp(-x));
-const percentEncode = (str) => encodeURIComponent(str).replace(/[!*'()]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
-function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+const percentEncode = (str) =>
+  encodeURIComponent(str).replace(/[!*'()]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 function pctChange(a, b) { return b > 0 ? (a - b) / b : 0; }
 const bpsToFrac = (bps) => Number(bps || 0) / 10000;
 
@@ -415,6 +423,7 @@ function gistFindPendingIdxByCID(state, cid) {
 
 /* Exports (optional) */
 export { gistOn, gistGetState, gistPatchState, gistFindPendingIdxByCID };
+
 /* ======================================================================
    SECTION 2/7 — Market Data, Orderbook, and Ideas selection
    (Prefer latest GitHub snapshot; origin 'gha' or 'github_actions')
@@ -692,15 +701,44 @@ async function getWalletBalance(env, userId) {
 
   // Real exchanges
   if (!session.api_key_encrypted) return 0;
-  const apiKey = await decrypt(session.api_key_encrypted, env);
-  const apiSecret = await decrypt(session.api_secret_encrypted, env);
+
+  let apiKey, apiSecret;
+  try {
+    apiKey = await decrypt(session.api_key_encrypted, env);
+    apiSecret = await decrypt(session.api_secret_encrypted, env);
+  } catch (e) {
+    console.error("getWalletBalance decrypt error:", e?.message || e);
+    await saveSession(env, userId, { last_balance_err: "decrypt_failed" }).catch(()=>{});
+    return 0;
+  }
+
   try {
     const result = await verifyApiKeys(apiKey, apiSecret, session.exchange_name);
-    if (result.success && result.data.balance) {
-      return parseFloat(String(result.data.balance).replace(" USDT", ""));
+
+    if (!result?.success) {
+      console.warn("getWalletBalance verify fail:", result?.reason);
+      await saveSession(env, userId, { last_balance_err: String(result?.reason || "verify_failed") }).catch(()=>{});
+      return 0;
+    }
+
+    // Success: clear any stale error flag
+    if (session.last_balance_err) {
+      await saveSession(env, userId, { last_balance_err: null }).catch(()=>{});
+    }
+
+    const thr = Number(env.DUST_AVAIL_THRESHOLD ?? 1e-6); // e.g., 1e-6 or 1e-5
+    const a = Number(result?.data?.available);
+    if (Number.isFinite(a) && a > thr) return a; // real available
+    const e = Number(result?.data?.equity);
+    if (Number.isFinite(e) && e > 0) return e; // fallback to equity (Bybit/MEXC)
+    if (result.data?.balance) {
+      const n = Number(String(result.data.balance).replace(/[^\d.]/g, ""));
+      if (Number.isFinite(n)) return n; // legacy fallback
+      await saveSession(env, userId, { last_balance_err: "bad_balance_format" }).catch(()=>{});
     }
   } catch (e) {
-    console.error("getWalletBalance error:", e);
+    console.error("getWalletBalance error:", e?.message || e);
+    await saveSession(env, userId, { last_balance_err: "network_or_parse" }).catch(()=>{});
   }
   return 0;
 }
@@ -1032,12 +1070,15 @@ export {
   utcDayKey, ensureDayRoll, bumpTradeCounters, getPacingCounters, resyncPacingFromDB,
   dayProgressUTC, computeDynamicSqsGate, computeUserSqsGate
 };
-
 /* ======================================================================
    SECTION 4/7 — Exchange verification, signing helpers, orders & routing
    ====================================================================== */
 
 /* ---------- HMAC / Hash helpers ---------- */
+const num = (v) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+};
 async function hmacHexStr(secret, data, algo = "SHA-256") {
   const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: algo }, false, ["sign"]);
   const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(data));
@@ -1127,70 +1168,104 @@ async function bybitV5GET(ex, apiKey, apiSecret, path, qsObj = {}, timeoutMs = 8
 
 /* ---------- Balance parsers ---------- */
 function parseUSDT_BinanceLike(data) {
-  if (Array.isArray(data?.balances)) {
-    const usdt = data.balances.find((b) => b.asset === "USDT");
-    if (usdt) return Number(usdt.free || "0").toFixed(2);
+  const balances = Array.isArray(data?.balances) ? data.balances : [];
+  const get = (asset) => {
+    const row = balances.find(b => (b.asset || b.currency || "").toUpperCase() === asset);
+    return row ? (num(row.free ?? row.available ?? row.freeBalance ?? row.balance ?? row.total) ?? null) : null;
+  };
+
+  const usdt = get("USDT");
+  if (usdt !== null) return usdt.toFixed(2);
+
+  // Fallback: sum known USD stables if USDT row missing/empty
+  const stables = ["USDT","USDC","BUSD","TUSD","FDUSD","USDP","DAI","USD"];
+  let sum = 0, got = false;
+  for (const s of stables) {
+    const v = get(s);
+    if (v !== null) { sum += v; got = true; }
   }
-  return "0.00";
+  return got ? sum.toFixed(2) : "0.00";
 }
 function parseUSDT_Gate(data) {
-  if (Array.isArray(data)) {
-    const row = data.find((x) => (x.currency || "").toUpperCase() === "USDT");
-    if (row) return Number(row.available || "0").toFixed(2);
-  }
-  return "0.00";
+  const arr = Array.isArray(data) ? data : [];
+  const row = arr.find(x => (x.currency || "").toUpperCase() === "USDT");
+  if (!row) return "0.00";
+  const n = num(row.available ?? row.free ?? row.balance);
+  return n !== null ? n.toFixed(2) : "0.00";
 }
 function parseUSDT_Bybit(data) {
-  const coins = data?.result?.list?.[0]?.coin;
-  if (Array.isArray(coins)) {
-    const c = coins.find((x) => (x.coin || "").toUpperCase() === "USDT");
-    if (c) {
-      const v = c.availableToWithdraw ?? c.walletBalance ?? c.equity ?? "0";
-      return Number(v).toFixed(2);
-    }
+  // Unified account (v5) typical shape: result.list[0]
+  const list0 = data?.result?.list?.[0] || {};
+  const coins = Array.isArray(list0.coin) ? list0.coin : [];
+
+  // Prefer USDT from coin[] (ignore empty strings)
+  const usdt = coins.find(c => (c.coin || "").toUpperCase() === "USDT");
+  if (usdt) {
+    const n =
+      num(usdt.availableToWithdraw) ??
+      num(usdt.walletBalance) ??
+      num(usdt.equity) ??
+      num(usdt.marginBalance);
+    if (n !== null) return n.toFixed(2);
   }
+
+  // Fallback to unified totals
+  const nAvail = num(list0.totalAvailableBalance);
+  if (nAvail !== null) return nAvail.toFixed(2);
+
+  const nWallet = num(list0.totalWalletBalance);
+  if (nWallet !== null) return nWallet.toFixed(2);
+
+  const nEquity = num(list0.totalEquity);
+  if (nEquity !== null) return nEquity.toFixed(2);
+
+  // Older spot-like fallbacks
   const spot = data?.result?.balances || data?.result?.spot || [];
   if (Array.isArray(spot)) {
-    const c = spot.find((x) => (x.coin || x.asset || "").toUpperCase() === "USDT");
-    if (c) {
-      const v = c.free ?? c.available ?? "0";
-      return Number(v).toFixed(2);
+    const row = spot.find(x => (x.coin || x.asset || "").toUpperCase() === "USDT");
+    if (row) {
+      const n = num(row.free ?? row.available ?? row.walletBalance ?? row.equity);
+      if (n !== null) return n.toFixed(2);
     }
   }
   return "0.00";
 }
 function parseUSDT_Kraken(data) {
-  if (data?.result && typeof data.result === "object") {
-    const v = data.result.USDT || data.result.usdt || "0";
-    return Number(v).toFixed(2);
-  }
-  return "0.00";
+  const v = data?.result ? (data.result.USDT ?? data.result.usdt) : null;
+  const n = num(v);
+  return n !== null ? n.toFixed(2) : "0.00";
 }
 function parseUSDT_CoinEx(data) {
-  const balances = data?.data?.balances;
-  if (Array.isArray(balances)) {
-    const row = balances.find((b) => (b.asset || b.currency || "").toUpperCase() === "USDT");
-    if (row) return Number(row.available || row.available_balance || row.balance || "0").toFixed(2);
+  const balances = Array.isArray(data?.data?.balances) ? data.data.balances : null;
+  if (balances) {
+    const row = balances.find(b => (b.asset || b.currency || "").toUpperCase() === "USDT");
+    const n = num(row?.available ?? row?.available_balance ?? row?.balance);
+    if (n !== null) return n.toFixed(2);
   }
   const list = data?.data?.list;
   if (list && typeof list === "object" && list.USDT) {
-    const v = list.USDT.available || list.USDT.available_amount || list.USDT.balance || "0";
-    return Number(v).toFixed(2);
+    const v = list.USDT.available ?? list.USDT.available_amount ?? list.USDT.balance;
+    const n = num(v);
+    if (n !== null) return n.toFixed(2);
   }
   return "0.00";
 }
 function parseUSDT_Huobi(data) {
-  const arr = data?.data?.list || [];
-  let sum = 0;
+  const arr = Array.isArray(data?.data?.list) ? data.data.list : [];
+  let sum = 0, got = false;
   for (const r of arr) {
-    if ((r.currency || "").toUpperCase() === "USDT" && r.type === "trade") sum += Number(r.balance || "0");
+    if ((r.currency || "").toUpperCase() === "USDT" && r.type === "trade") {
+      const n = num(r.balance);
+      if (n !== null) { sum += n; got = true; }
+    }
   }
-  return sum.toFixed(2);
+  return got ? sum.toFixed(2) : "0.00";
 }
 function parseUSDT_LBank(data) {
-  const free = data?.info?.funds?.free || data?.data?.free || data?.free;
-  const v = free?.usdt || free?.USDT || "0";
-  return Number(v).toFixed(2);
+  const free = data?.info?.funds?.free || data?.data?.free || data?.free || {};
+  const v = free.usdt ?? free.USDT;
+  const n = num(v);
+  return n !== null ? n.toFixed(2) : "0.00";
 }
 
 /* ---------- Exchange verification calls ---------- */
@@ -1208,10 +1283,65 @@ async function verifyBinanceLike(apiKey, apiSecret, ex) {
     const reason = data?.msg || data?.message || `HTTP ${res.status}`;
     return { success: false, reason };
   }
-  const bal = parseUSDT_BinanceLike(data);
+  // Build numeric available/equity
+  const balances = Array.isArray(data?.balances) ? data.balances : [];
+  const pick = (sym) => {
+    const row = balances.find(b => (b.asset || b.currency || "").toUpperCase() === sym);
+    return row
+      ? {
+          free: num(row.free ?? row.available ?? row.freeBalance ?? row.balance ?? row.total),
+          locked: num(row.locked ?? row.freeze ?? row.frozen),
+        }
+      : null;
+  };
+
+  let available = 0, equity = 0;
+  const usdt = pick("USDT");
+  if (usdt && usdt.free !== null) {
+    available = usdt.free || 0;
+    equity = (usdt.free || 0) + (usdt.locked || 0);
+  } else {
+    // Stable-coin fallback if no USDT row (covers USDC/BUSD/TUSD/FDUSD/USDP/DAI)
+    const stables = ["USDT","USDC","BUSD","TUSD","FDUSD","USDP","DAI","USD"];
+    let freeSum = 0, lockedSum = 0, hit = false;
+    for (const s of stables) {
+      const r = pick(s);
+      if (!r) continue;
+      if (r.free !== null) { freeSum += r.free; hit = true; }
+      if (r.locked !== null) lockedSum += r.locked;
+    }
+    if (hit) { available = freeSum; equity = freeSum + lockedSum; }
+  }
+
+  // total USD equity across all assets (fallback when USDT free is dust)
+  let totalEq = 0;
+  for (const b of balances) {
+    const asset = (b.asset || b.currency || '').toUpperCase();
+    const free = num(b.free ?? b.available ?? b.freeBalance ?? b.balance ?? b.total) ?? 0;
+    const locked = num(b.locked ?? b.freeze ?? b.frozen) ?? 0;
+    const qty = free + locked;
+    if (qty <= 0) continue;
+    if (asset === 'USDT') { totalEq += qty; continue; }
+    try {
+      const px = await getCurrentPrice(asset);
+      if (px > 0) totalEq += qty * px;
+    } catch {}
+  }
+  // prefer the larger of the two (covers non-stable holdings)
+  equity = Math.max(equity, totalEq);
+
   const maker = (data?.makerCommission ?? 10) / 10000;
   const taker = (data?.takerCommission ?? 10) / 10000;
-  return { success: true, data: { balance: `${bal} USDT`, feeRate: taker, fees: { maker, taker } } };
+  return {
+    success: true,
+    data: {
+      balance: `${available.toFixed(2)} USDT`,
+      available,
+      equity,
+      feeRate: taker,
+      fees: { maker, taker }
+    }
+  };
 }
 async function verifyBinanceFutures(apiKey, apiSecret, ex) {
   const ts = Date.now();
@@ -1225,12 +1355,23 @@ async function verifyBinanceFutures(apiKey, apiSecret, ex) {
     const reason = data?.msg || data?.message || `HTTP ${res.status}`;
     return { success: false, reason };
   }
-  let bal = "0.00";
+  let available = 0, wallet = 0;
   try {
     const usdt = (data.assets || []).find(a => (a.asset || "").toUpperCase() === "USDT");
-    if (usdt) bal = Number(usdt.availableBalance ?? usdt.walletBalance ?? 0).toFixed(2);
+    if (usdt) {
+      available = num(usdt.availableBalance) ?? 0;
+      wallet = num(usdt.walletBalance) ?? available;
+    }
   } catch {}
-  return { success: true, data: { balance: `${bal} USDT`, feeRate: 0.0004 } };
+  return {
+    success: true,
+    data: {
+      balance: `${available.toFixed(2)} USDT`,
+      available,
+      equity: wallet,
+      feeRate: 0.0004
+    }
+  };
 }
 async function verifyBybit(apiKey, apiSecret, ex) {
   const ts = Date.now().toString();
@@ -1242,17 +1383,41 @@ async function verifyBybit(apiKey, apiSecret, ex) {
     const url = `${ex.baseUrl}/v5/account/wallet-balance?${qs}`;
     const r = await safeFetch(url, {
       headers: {
-        "X-BAPI-API-KEY": apiKey, "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": recv, "X-BAPI-SIGN": sig,
-      },
-    }, 5000);
-    const d = await r.json().catch(() => ({}));
-    return { ok: r.ok && d?.retCode === 0, d, status: r.status };
+        "X-BAPI-API-KEY": apiKey,
+        "X-BAPI-TIMESTAMP": ts,
+        "X-BAPI-RECV-WINDOW": recv,
+        "X-BAPI-SIGN": sig
+      }
+    }, 5000).catch(()=>null);
+    const d = r ? await r.json().catch(()=>({})) : {};
+    return { ok: r && r.ok && d?.retCode === 0, d, status: r?.status || 0 };
   };
-  let r = await tryKind("UNIFIED");
-  if (!r.ok) r = await tryKind("SPOT");
-  if (!r.ok) return { success: false, reason: r.d?.retMsg || `HTTP ${r.status}` };
-  const bal = parseUSDT_Bybit(r.d);
-  return { success: true, data: { balance: `${bal} USDT` } };
+
+  let last = null;
+  for (const kind of ["UNIFIED", "CONTRACT", "SPOT"]) {
+    const r = await tryKind(kind);
+    last = r;
+    if (r.ok) {
+      const list0 = r.d?.result?.list?.[0] || {};
+      const coins = Array.isArray(list0.coin) ? list0.coin : [];
+      const usdt = coins.find(x => (x.coin || "").toUpperCase() === "USDT");
+      const availCoin = (num(usdt?.availableToWithdraw) ?? num(usdt?.walletBalance) ?? num(usdt?.equity));
+      const totalAvail = num(list0.totalAvailableBalance);
+      const available = (totalAvail ?? availCoin ?? 0);
+      const equity = (num(list0.totalEquity) ?? num(list0.totalWalletBalance) ?? available);
+      const balanceLabel = availCoin !== null ? "USDT" : "USD";
+      return {
+        success: true,
+        data: {
+          balance: `${available.toFixed(2)} ${balanceLabel}`,
+          available,
+          equity,
+          feeRate: 0.0006
+        }
+      };
+    }
+  }
+  return { success: false, reason: last?.d?.retMsg || `HTTP ${last?.status || 0}` };
 }
 async function verifyKraken(apiKey, apiSecret, ex) {
   const path = "/0/private/Balance";
@@ -1277,8 +1442,16 @@ async function verifyKraken(apiKey, apiSecret, ex) {
     const reason = (data?.error && data.error.join(", ")) || `HTTP ${res.status}`;
     return { success: false, reason };
   }
-  const bal = parseUSDT_Kraken(data);
-  return { success: true, data: { balance: `${bal} USDT` } };
+  const v = data?.result ? (data.result.USDT ?? data.result.usdt) : null;
+  const available = num(v) ?? 0;
+  return {
+    success: true,
+    data: {
+      balance: `${available.toFixed(2)} USDT`,
+      available,
+      equity: available
+    }
+  };
 }
 async function verifyGate(apiKey, apiSecret, ex) {
   const path = "/api/v4/spot/accounts";
@@ -1289,8 +1462,19 @@ async function verifyGate(apiKey, apiSecret, ex) {
   const res = await safeFetch(url, { method: "GET", headers: { KEY: apiKey, Timestamp: ts, SIGN: sign } }, 6000);
   const data = await res.json().catch(() => ({}));
   if (!res.ok) return { success: false, reason: data?.message || `HTTP ${res.status}` };
-  const bal = parseUSDT_Gate(data);
-  return { success: true, data: { balance: `${bal} USDT` } };
+  const arr = Array.isArray(data) ? data : [];
+  const row = arr.find(x => (x.currency || "").toUpperCase() === "USDT");
+  const available = num(row?.available ?? row?.free ?? row?.balance) ?? 0;
+  const locked = num(row?.locked ?? row?.freeze) ?? 0;
+  const equity = available + locked;
+  return {
+    success: true,
+    data: {
+      balance: `${available.toFixed(2)} USDT`,
+      available,
+      equity
+    }
+  };
 }
 async function huobiSignedGet(ex, apiKey, apiSecret, path, extraParams = {}) {
   const host = ex.baseHost;
@@ -1321,8 +1505,24 @@ async function verifyHuobi(apiKey, apiSecret, ex) {
     const reason = r2.data?.err_msg || r2.data?.message || `HTTP ${r2.res.status}`;
     return { success: false, reason };
   }
-  const bal = parseUSDT_Huobi(r2.data);
-  return { success: true, data: { balance: `${bal} USDT` } };
+  const arr = Array.isArray(r2.data?.data?.list) ? r2.data.data.list : [];
+  let available = 0, frozen = 0;
+  for (const it of arr) {
+    if ((it.currency || "").toUpperCase() !== "USDT") continue;
+    const n = num(it.balance);
+    if (n === null) continue;
+    if (it.type === "trade") available += n;
+    else if (it.type === "frozen") frozen += n;
+  }
+  const equity = available + frozen;
+  return {
+    success: true,
+    data: {
+      balance: `${available.toFixed(2)} USDT`,
+      available,
+      equity
+    }
+  };
 }
 async function verifyCoinEx(apiKey, apiSecret, ex) {
   const path = "/v2/assets/balance";
@@ -1343,8 +1543,26 @@ async function verifyCoinEx(apiKey, apiSecret, ex) {
   if (!res.ok || (data?.code && data.code !== 0)) {
     return { success: false, reason: data?.message || data?.msg || `HTTP ${res.status}` };
   }
-  const bal = parseUSDT_CoinEx(data);
-  return { success: true, data: { balance: `${bal} USDT` } };
+  const balances = Array.isArray(data?.data?.balances) ? data.data.balances : null;
+  let available = 0, frozen = 0;
+  if (balances) {
+    const row = balances.find(b => (b.asset || b.currency || "").toUpperCase() === "USDT");
+    available = num(row?.available ?? row?.available_balance ?? row?.balance) ?? 0;
+    frozen = num(row?.frozen ?? row?.freeze) ?? 0;
+  } else if (data?.data?.list?.USDT) {
+    const r = data.data.list.USDT;
+    available = num(r.available ?? r.available_amount ?? r.balance) ?? 0;
+    frozen = num(r.frozen ?? r.freeze) ?? 0;
+  }
+  const equity = available + frozen;
+  return {
+    success: true,
+    data: {
+      balance: `${available.toFixed(2)} USDT`,
+      available,
+      equity
+    }
+  };
 }
 async function verifyLBank(apiKey, apiSecret, ex) {
   const path = "/v2/user_info.do";
@@ -1358,7 +1576,19 @@ async function verifyLBank(apiKey, apiSecret, ex) {
   const res = await safeFetch(url, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body }, 6000);
   const data = await res.json().catch(()=>({}));
   if (!res.ok || data?.result === false) throw new Error(data?.error_code || data?.msg || `HTTP ${res.status}`);
-  return { success: true, data: { balance: parseUSDT_LBank(data) + " USDT" } };
+  const free = data?.info?.funds?.free || data?.data?.free || data?.free || {};
+  const freeze = data?.info?.funds?.freeze || data?.info?.funds?.freezed || data?.data?.freeze || data?.freeze || {};
+  const available = num(free.usdt ?? free.USDT) ?? 0;
+  const locked = num(freeze.usdt ?? freeze.USDT) ?? 0;
+  const equity = available + locked;
+  return {
+    success: true,
+    data: {
+      balance: `${available.toFixed(2)} USDT`,
+      available,
+      equity
+    }
+  };
 }
 
 /* ---------- Verify API keys (dispatcher) ---------- */
@@ -1370,7 +1600,16 @@ async function verifyApiKeys(apiKey, apiSecret, exchangeName) {
     switch (ex.kind) {
       case "demoParrot":
         if (!apiKey || !apiSecret) return { success: false, reason: "Please enter any text for API Key and Secret (e.g., 'demo')." };
-        return { success: true, data: { balance: "10000.00 USDT", feeRate: 0.001, fees: { maker: 0.001, taker: 0.001 } } };
+        return {
+          success: true,
+          data: {
+            balance: "10000.00 USDT",
+            available: 10000,
+            equity: 10000,
+            feeRate: 0.001,
+            fees: { maker: 0.001, taker: 0.001 }
+          }
+        };
 
       // Spot
       case "binanceLike":       return await verifyBinanceLike(apiKey, apiSecret, ex);
@@ -2407,7 +2646,10 @@ async function renderProtocolStatus(env, userId, messageId = 0) {
   const text = protocol
     ? protocolStatusTextB(protocol, tc, openRisk, stats, extras)
     : "No protocol initialized yet.";
-  const buttons = [[{ text: "Continue ▶️", callback_data: "continue_dashboard" }]];
+  const buttons = [
+    [{ text: "Refresh 🔄", callback_data: "action_refresh_balance" },
+    { text: "Continue ▶️", callback_data: "continue_dashboard" }]
+  ];
   if (messageId) await editMessage(userId, messageId, text, buttons, env);
   else await sendMessage(userId, text, buttons, env);
 }
@@ -4694,6 +4936,10 @@ async function handleTelegramUpdate(update, env, ctx) {
   // Quick navigation
   if (text === "continue_dashboard" || text === "back_dashboard") { await sendDashboard(env, userId, isCb ? messageId : 0); return; }
   if (text === "action_refresh_wizard") { await restartWizardAtExchange(env, userId, isCb ? messageId : 0); return; }
+  if (text === "action_refresh_balance") {
+    await renderProtocolStatus(env, userId, isCb ? messageId : 0);
+    return;
+  }
 
   // Stop actions
   if (text === "action_direct_stop") { await handleDirectStop(env, userId); return; }
@@ -4983,7 +5229,14 @@ async function handleTelegramUpdate(update, env, ctx) {
     const apiSecret = await decrypt(s2.api_secret_encrypted, env);
     const res = await verifyApiKeys(apiKey, apiSecret, s2.exchange_name);
     if (!res.success) { await sendMessage(userId, `Detect failed: ${res.reason}`, null, env); return; }
-    const detectedBal = parseFloat(String(res.data.balance || "0").replace(" USDT",""));
+    const detectedBal = (() => {
+      const a = Number(res.data?.available);
+      if (Number.isFinite(a) && a > 1e-6) return a; // prefer real available
+      const e = Number(res.data?.equity);
+      if (Number.isFinite(e)) return e; // fallback to equity (mirrors dashboard)
+      const s = Number(String(res.data?.balance || "0").replace(/[^\d.]/g, ""));
+      return Number.isFinite(s) ? s : 0; // legacy fallback
+    })();
     const feeRate = res.data.feeRate ?? 0.001;
     const protocol = await getProtocolState(env, userId);
     if (!protocol) {
@@ -5016,6 +5269,31 @@ async function handleTelegramUpdate(update, env, ctx) {
   // Delegate trade-specific callbacks
   if (text.startsWith("tr_")) { await handleTradeAction(env, userId, text, isCb ? messageId : 0); return; }
 
+  // Detect refresh
+  if (text === "action_refresh_detect") {
+    const s = await getSession(env, userId);
+    if (s?.api_key_encrypted && s?.api_secret_encrypted && s?.exchange_name) {
+      try {
+        const apiKey = await decrypt(s.api_key_encrypted, env);
+        const apiSecret = await decrypt(s.api_secret_encrypted, env);
+        const res = await verifyApiKeys(apiKey, apiSecret, s.exchange_name);
+        if (res.success) {
+          const detectedBal = (() => {
+            const a = Number(res.data?.available);
+            if (Number.isFinite(a) && a > 1e-6) return a; // prefer real available
+            const e = Number(res.data?.equity);
+            if (Number.isFinite(e)) return e; // fallback to equity (mirrors dashboard)
+            const s = Number(String(res.data?.balance || "0").replace(/[^\d.]/g, ""));
+            return Number.isFinite(s) ? s : 0; // legacy fallback
+          })();
+          const feeRate = res.data?.feeRate ?? 0.001;
+          await saveSession(env, userId, { pending_action_data: JSON.stringify({ bal: detectedBal, feeRate }) });
+        }
+      } catch (_) {}
+    }
+    // fall-through to renderer
+  }
+
   // Wizard state machine (condensed)
   let nextStep = session.current_step, updates = {};
   switch (session.current_step) {
@@ -5044,7 +5322,14 @@ async function handleTelegramUpdate(update, env, ctx) {
               updates.api_key_encrypted = await encrypt(tempKey, env);
               updates.api_secret_encrypted = await encrypt(text, env);
               updates.temp_api_key = null;
-              const detectedBal = parseFloat(String(result.data.balance || "0").replace(" USDT",""));
+              const detectedBal = (() => {
+                const a = Number(result.data?.available);
+                if (Number.isFinite(a) && a > 1e-6) return a; // prefer real available
+                const e = Number(result.data?.equity);
+                if (Number.isFinite(e)) return e; // fallback to equity (mirrors dashboard)
+                const s = Number(String(result.data?.balance || "0").replace(/[^\d.]/g, ""));
+                return Number.isFinite(s) ? s : 0; // legacy fallback
+              })();
               const feeRate = result.data.feeRate ?? 0.001;
               await initProtocolDynamic(env, userId, feeRate, 0.01);
               updates.pending_action_data = JSON.stringify({ bal: detectedBal, feeRate });
@@ -5112,15 +5397,17 @@ async function handleTelegramUpdate(update, env, ctx) {
       buttons = [[{ text: "Back ◀️", callback_data: "action_back_to_exchange" }],[{ text: "Stop ⛔", callback_data: "action_stop_confirm" }]];
       break;
     case "confirm_manual": {
+      session = await getSession(env, userId); // refresh session to get latest pending data
       const { bal, feeRate } = JSON.parse(updates.pending_action_data || session.pending_action_data || '{}');
       outText = confirmManualTextB(bal ?? 0, feeRate ?? 0.001);
-      buttons = [[{ text: "Start Manual ▶️", callback_data: "action_start_manual" }],[{ text: "Wipe API Key & Go Back", callback_data: "action_wipe_keys" }]];
+      buttons = [[{ text: "Start Manual ▶️", callback_data: "action_start_manual" }], [{ text: "Refresh 🔄", callback_data: "action_refresh_detect" }], [{ text: "Wipe API Key & Go Back", callback_data: "action_wipe_keys" }]];
       break;
     }
     case "confirm_auto_funds": {
+      session = await getSession(env, userId); // refresh session to get latest pending data
       const { bal, feeRate } = JSON.parse(updates.pending_action_data || session.pending_action_data || '{}');
       outText = confirmAutoTextB(bal ?? 0, feeRate ?? 0.001);
-      buttons = [[{ text: "Yes, Start Auto 🚀", callback_data: "action_start_auto" }],[{ text: "Wipe API Key & Go Back", callback_data: "action_wipe_keys" }]];
+      buttons = [[{ text: "Yes, Start Auto 🚀", callback_data: "action_start_auto" }], [{ text: "Refresh 🔄", callback_data: "action_refresh_detect" }], [{ text: "Wipe API Key & Go Back", callback_data: "action_wipe_keys" }]];
       break;
     }
     default: /* no text */ ;
