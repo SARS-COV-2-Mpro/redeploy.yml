@@ -5,7 +5,7 @@ on:
   push:
     branches: [ main ]
 
-  # Also run automatically every 30 minutes
+  # Run automatically every hour
   schedule:
     - cron: "0 0/1 * * *"
 
@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Publish to Cloudflare Workers
         uses: cloudflare/wrangler-action@v3
