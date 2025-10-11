@@ -18,7 +18,7 @@ const SUPPORTED_EXCHANGES = {
   binance_futures: { label: "Binance Futures (USDT-M)", kind: "binanceFuturesUSDT", baseUrl: "https://fapi.binance.com", apiKeyHeader: "X-MBX-APIKEY", hasOrders: true },
 
   // Bybit Futures (NEW — trading enabled)
-  bybit_futures_testnet: { label: "Bybit Futures (Demo-Testnet)", kind: "bybitFuturesV5", baseUrl: "https://api-demo-testnet.bybit.com", hasOrders: true },
+  bybit_futures_testnet: { label: "Bybit Futures (Demo-Testnet)", kind: "bybitFuturesV5", baseUrl: "https://api-testnet.bybit.com", hasOrders: true },
   bybit_futures:         { label: "Bybit Futures",           kind: "bybitFuturesV5", baseUrl: "https://api.bybit.com",        hasOrders: true },
 
   // Read-only in this worker
@@ -728,9 +728,11 @@ async function getWalletBalance(env, userId) {
 
     const thr = Number(env.DUST_AVAIL_THRESHOLD ?? 1e-6); // e.g., 1e-6 or 1e-5
     const a = Number(result?.data?.available);
-    if (Number.isFinite(a) && a > thr) return a; // real available
     const e = Number(result?.data?.equity);
-    if (Number.isFinite(e) && e > 0) return e; // fallback to equity (Bybit/MEXC)
+    const preferEq = envFlag(env, 'BALANCE_PREFER_EQUITY', '1'); // default mirror
+    if (preferEq && Number.isFinite(e) && e > 0) return e;
+    if (Number.isFinite(a) && a > thr) return a;
+    if (Number.isFinite(e) && e > 0) return e;
     if (result.data?.balance) {
       const n = Number(String(result.data.balance).replace(/[^\d.]/g, ""));
       if (Number.isFinite(n)) return n; // legacy fallback
@@ -1166,6 +1168,94 @@ async function bybitV5GET(ex, apiKey, apiSecret, path, qsObj = {}, timeoutMs = 8
   return d;
 }
 
+// Add this in SECTION 4/7 (near Bybit helpers, before order functions)
+const BYBIT_INSTR_CACHE = new TTLLRU(256, 10 * 60 * 1000);
+const BINANCE_INSTR_CACHE = new TTLLRU(256, 10 * 60 * 1000);
+
+function stepDecimals(step) {
+  const s = String(step || "");
+  const i = s.indexOf(".");
+  return i >= 0 ? (s.length - i - 1) : 0;
+}
+const roundStep = (val, step, mode = 'floor') => {
+  if (!(step > 0)) return val;
+  const inv = 1 / step;
+  if (mode === 'ceil') return Math.ceil(val * inv) / inv;
+  if (mode === 'round') return Math.round(val * inv) / inv;
+  return Math.floor(val * inv) / inv;
+};
+
+async function getBybitLinearInstr(ex, base) {
+  const sym = (base || "").toUpperCase() + "USDT";
+  const key = `${ex.baseUrl}|${sym}`;
+  const hit = BYBIT_INSTR_CACHE.get(key);
+  if (hit) return hit;
+
+  try {
+    const url = `${ex.baseUrl}/v5/market/instruments-info?category=linear&symbol=${sym}`;
+    const r = await safeFetch(url, {}, 6000);
+    const j = await r.json().catch(()=>null);
+    if (r.ok && j?.retCode === 0 && Array.isArray(j?.result?.list) && j.result.list.length) {
+      const it = j.result.list[0] || {};
+      const qtyStep = Number(it?.lotSizeFilter?.qtyStep || 0.001);
+      const minQty = Number(it?.lotSizeFilter?.minOrderQty || 0.001);
+      const minNotional = Number(it?.lotSizeFilter?.minNotionalValue || 0);
+      const tickSize = Number(it?.priceFilter?.tickSize || 0.0001);
+      const info = {
+        qtyStep, minQty, minNotional, tickSize,
+        qtyDecimals: stepDecimals(qtyStep),
+        priceDecimals: stepDecimals(tickSize)
+      };
+      BYBIT_INSTR_CACHE.set(key, info);
+      return info;
+    }
+  } catch (_) {}
+
+  const def = { qtyStep: 0.001, minQty: 0.001, minNotional: 0, tickSize: 0.0001, qtyDecimals: 3, priceDecimals: 4 };
+  BYBIT_INSTR_CACHE.set(key, def);
+  return def;
+}
+
+async function getBinanceInstrInfo(ex, base) {
+  const sym = (base || "").toUpperCase() + "USDT";
+  const key = `${ex.baseUrl}|${sym}`;
+  const hit = BINANCE_INSTR_CACHE.get(key);
+  if (hit) return hit;
+
+  try {
+    const isFutures = ex.kind === 'binanceFuturesUSDT';
+    const path = isFutures ? '/fapi/v1/exchangeInfo' : '/api/v3/exchangeInfo';
+    const url = `${ex.baseUrl}${path}`;
+    const r = await safeFetch(url, {}, 6000);
+    const j = await r.json().catch(()=>null);
+    if (r.ok && Array.isArray(j?.symbols)) {
+      const s = j.symbols.find(s => s.symbol === sym);
+      if (s) {
+        const priceFilter = s.filters.find(f => f.filterType === 'PRICE_FILTER');
+        const lotSize = s.filters.find(f => f.filterType === 'LOT_SIZE');
+        const minNotionalFilter = s.filters.find(f => f.filterType === 'MIN_NOTIONAL' || f.filterType === 'NOTIONAL');
+
+        const qtyStep = Number(lotSize?.stepSize || 0.001);
+        const minQty = Number(lotSize?.minQty || 0.001);
+        const tickSize = Number(priceFilter?.tickSize || 0.01);
+        const minNotional = Number(minNotionalFilter?.minNotional || minNotionalFilter?.notional || 1);
+
+        const info = {
+          qtyStep, minQty, minNotional, tickSize,
+          qtyDecimals: stepDecimals(qtyStep),
+          priceDecimals: stepDecimals(tickSize)
+        };
+        BINANCE_INSTR_CACHE.set(key, info);
+        return info;
+      }
+    }
+  } catch (_) {}
+
+  const def = { qtyStep: 0.001, minQty: 0.001, minNotional: 1, tickSize: 0.01, qtyDecimals: 3, priceDecimals: 2 };
+  BINANCE_INSTR_CACHE.set(key, def);
+  return def;
+}
+
 /* ---------- Balance parsers ---------- */
 function parseUSDT_BinanceLike(data) {
   const balances = Array.isArray(data?.balances) ? data.balances : [];
@@ -1406,12 +1496,14 @@ async function verifyBybit(apiKey, apiSecret, ex) {
       const available = (totalAvail ?? availCoin ?? 0);
       const equity = (num(list0.totalEquity) ?? num(list0.totalWalletBalance) ?? available);
       const balanceLabel = availCoin !== null ? "USDT" : "USD";
+      const availSafe = Number.isFinite(available) ? available : 0;
+      const equitySafe = Number.isFinite(equity) ? equity : availSafe;
       return {
         success: true,
         data: {
-          balance: `${available.toFixed(2)} ${balanceLabel}`,
-          available,
-          equity,
+          balance: `${availSafe.toFixed(2)} ${balanceLabel}`,
+          available: availSafe,
+          equity: equitySafe,
           feeRate: 0.0006
         }
       };
@@ -1636,22 +1728,26 @@ async function verifyApiKeys(apiKey, apiSecret, exchangeName) {
 /* Spot MARKET (Binance-like: Binance, MEXC) */
 async function placeBinanceLikeOrder(ex, apiKey, apiSecret, symbol, side, amount, isQuoteOrder, clientOrderId) {
   const endpoint = "/api/v3/order";
-  const params = { symbol: symbol + "USDT", side, type: "MARKET", newOrderRespType: "FULL", timestamp: Date.now() };
+  const sym = symbol.toUpperCase() + "USDT";
+  const info = await getBinanceInstrInfo(ex, symbol);
+  const params = { symbol: sym, side, type: "MARKET", newOrderRespType: "FULL", timestamp: Date.now() };
 
   if (clientOrderId) params.newClientOrderId = clientOrderId;
 
   if (side === "BUY" && isQuoteOrder) {
-    params.quoteOrderQty = Number(amount).toFixed(8);
-  } else if (side === "SELL" && !isQuoteOrder) {
-    params.quantity = Number(amount).toFixed(6);
-  } else if (side === "SELL" && isQuoteOrder) {
-    const price = await getCurrentPrice(symbol);
-    if (!price || !isFinite(price) || price <= 0) throw new Error("Failed to fetch valid price for quantity calculation (SELL)");
-    params.quantity = (Number(amount) / price).toFixed(6);
+    params.quoteOrderQty = Number(amount).toFixed(8); // Quote amount precision is not specified via API, 8 is a safe bet
   } else {
-    const price = await getCurrentPrice(symbol);
-    if (!price || !isFinite(price) || price <= 0) throw new Error("Failed to fetch valid price for quantity calculation");
-    params.quantity = (Number(amount) / price).toFixed(6);
+    let baseQty;
+    if (isQuoteOrder) { // SELL in quote
+      const price = await getCurrentPrice(symbol);
+      if (!price || price <= 0) throw new Error("Could not get price to convert quote to base");
+      baseQty = Number(amount) / price;
+    } else { // BUY or SELL in base
+      baseQty = Number(amount);
+    }
+    const qtyNorm = roundStep(baseQty, info.qtyStep, 'floor');
+    if (qtyNorm < info.minQty) throw new Error(`Quantity ${qtyNorm} is less than minQty ${info.minQty}`);
+    params.quantity = qtyNorm.toFixed(info.qtyDecimals);
   }
 
   if (ex.defaultQuery) {
@@ -1686,30 +1782,29 @@ async function placeBinanceLikeOrder(ex, apiKey, apiSecret, symbol, side, amount
 /* Spot LIMIT_MAKER (post-only) for Binance-like (Binance, likely MEXC) */
 async function placeBinanceLikeLimitMaker(ex, apiKey, apiSecret, symbol, side, limitPrice, amount, isQuoteOrder, clientOrderId) {
   const endpoint = "/api/v3/order";
+  const sym = symbol.toUpperCase() + "USDT";
+  const info = await getBinanceInstrInfo(ex, symbol);
+
+  const roundedPx = roundStep(Number(limitPrice), info.tickSize, side === "BUY" ? 'floor' : 'ceil');
+  const priceStr = roundedPx.toFixed(info.priceDecimals);
+
+  let baseQty;
+  if (isQuoteOrder) {
+    baseQty = Number(amount) / roundedPx;
+  } else {
+    baseQty = Number(amount);
+  }
+  const qtyNorm = roundStep(baseQty, info.qtyStep, 'floor');
+  const qtyStr = qtyNorm.toFixed(info.qtyDecimals);
+
   const params = {
-    symbol: symbol.toUpperCase() + "USDT",
-    side,
-    type: "LIMIT_MAKER",
-    newOrderRespType: "FULL",
-    price: Number(limitPrice).toFixed(8),
+    symbol: sym, side, type: "LIMIT_MAKER", newOrderRespType: "FULL",
+    price: priceStr,
+    quantity: qtyStr,
     timestamp: Date.now()
   };
 
   if (clientOrderId) params.newClientOrderId = clientOrderId;
-
-  // quoteOrderQty not supported for LIMIT; compute quantity
-  if (side === "BUY" && isQuoteOrder) {
-    const p = Number(limitPrice);
-    params.quantity = (Number(amount) / Math.max(1e-12, p)).toFixed(6);
-  } else if (side === "SELL" && !isQuoteOrder) {
-    params.quantity = Number(amount).toFixed(6);
-  } else if (side === "SELL" && isQuoteOrder) {
-    const p = Number(limitPrice);
-    params.quantity = (Number(amount) / Math.max(1e-12, p)).toFixed(6);
-  } else {
-    const p = Number(limitPrice);
-    params.quantity = (Number(amount) / Math.max(1e-12, p)).toFixed(6);
-  }
 
   if (ex.defaultQuery) {
     const defaults = new URLSearchParams(ex.defaultQuery);
@@ -1756,7 +1851,8 @@ async function placeLBankOrder(ex, apiKey, apiSecret, symbol, type, amount) {
 async function placeCoinExOrder(ex, apiKey, apiSecret, symbol, side, amount) {
   const path = "/v2/order/market";
   const ts = Date.now().toString();
-  const body = { market: symbol.toUpperCase() + "USDT", side, amount: Number(amount).toFixed(6) };
+  // CoinEx API: `amount` is quote for buy, base for sell.
+  const body = { market: symbol.toUpperCase() + "USDT", side, amount: Number(amount).toFixed(8) };
   const bodyStr = JSON.stringify(body);
   const signStr = ts + "POST" + path + bodyStr;
   const sign = await hmacHexStr(apiSecret, signStr);
@@ -1779,10 +1875,17 @@ async function placeCoinExOrder(ex, apiKey, apiSecret, symbol, side, amount) {
 // Binance Futures (USDT-M) MARKET
 async function placeBinanceFuturesOrder(ex, apiKey, apiSecret, symbol, side, baseQty, reduceOnly = false, clientOrderId) {
   const endpoint = "/fapi/v1/order";
+  const sym = symbol.toUpperCase() + "USDT";
+  const info = await getBinanceInstrInfo(ex, symbol);
+
+  const qtyNorm = roundStep(Number(baseQty), info.qtyStep, 'floor');
+  if (qtyNorm < info.minQty) throw new Error(`qty_lt_min (${qtyNorm} < ${info.minQty})`);
+  const qtyStr = qtyNorm.toFixed(info.qtyDecimals);
+
   const params = {
-    symbol: symbol.toUpperCase() + "USDT",
+    symbol: sym,
     side, type: "MARKET",
-    quantity: Number(baseQty).toFixed(6),
+    quantity: qtyStr,
     reduceOnly: reduceOnly ? "true" : "false",
     newOrderRespType: "RESULT",
     timestamp: Date.now()
@@ -1804,12 +1907,20 @@ async function placeBinanceFuturesOrder(ex, apiKey, apiSecret, symbol, side, bas
 /* Binance Futures LIMIT (post-only via GTX) */
 async function placeBinanceFuturesLimitPostOnly(ex, apiKey, apiSecret, symbol, side, baseQty, price, reduceOnly = false, clientOrderId) {
   const endpoint = "/fapi/v1/order";
+  const sym = symbol.toUpperCase() + "USDT";
+  const info = await getBinanceInstrInfo(ex, symbol);
+
+  const roundedPx = roundStep(Number(price), info.tickSize, side === "BUY" ? 'floor' : 'ceil');
+  const priceStr = roundedPx.toFixed(info.priceDecimals);
+
+  const qtyNorm = roundStep(Number(baseQty), info.qtyStep, 'floor');
+  const qtyStr = qtyNorm.toFixed(info.qtyDecimals);
+
   const params = {
-    symbol: symbol.toUpperCase() + "USDT",
-    side, type: "LIMIT",
+    symbol: sym, side, type: "LIMIT",
     timeInForce: "GTX",
-    price: Number(price).toFixed(8),
-    quantity: Number(baseQty).toFixed(6),
+    price: priceStr,
+    quantity: qtyStr,
     reduceOnly: reduceOnly ? "true" : "false",
     newOrderRespType: "RESULT",
     timestamp: Date.now()
@@ -1831,19 +1942,26 @@ async function placeBinanceFuturesLimitPostOnly(ex, apiKey, apiSecret, symbol, s
 /* ---------- Bybit Futures V5 MARKET ---------- */
 async function placeBybitFuturesOrder(ex, apiKey, apiSecret, symbol, side, baseQty, reduceOnly = false, clientOrderId) {
   const sym = symbol.toUpperCase() + "USDT";
+  const info = await getBybitLinearInstr(ex, symbol);
+
+  let qtyNorm = roundStep(Number(baseQty || 0), info.qtyStep, 'floor');
+  if (!(qtyNorm > 0)) throw new Error("qty_zero");
+  if (qtyNorm < info.minQty) throw new Error(`qty_lt_min (${qtyNorm} < ${info.minQty})`);
+
+  const qtyStr = info.qtyDecimals > 0 ? qtyNorm.toFixed(info.qtyDecimals) : String(Math.round(qtyNorm));
+
   const payload = {
     category: "linear",
     symbol: sym,
     side: side === "BUY" ? "Buy" : "Sell",
     orderType: "Market",
-    qty: Number(baseQty).toFixed(6),
+    qty: qtyStr,
     reduceOnly: !!reduceOnly,
     orderLinkId: clientOrderId || undefined
   };
   const d = await bybitV5POST(ex, apiKey, apiSecret, "/v5/order/create", payload, 8000);
   const orderId = d?.result?.orderId || d?.result?.orderID;
 
-  // Query status for exec details
   const st = await getBybitFuturesOrderStatus(ex, apiKey, apiSecret, symbol, { orderId, orderLinkId: clientOrderId });
   return { orderId, executedQty: st.executedQty, avgPrice: st.avgPrice, status: st.status };
 }
@@ -1851,13 +1969,24 @@ async function placeBybitFuturesOrder(ex, apiKey, apiSecret, symbol, side, baseQ
 /* ---------- Bybit Futures V5 LIMIT (PostOnly) ---------- */
 async function placeBybitFuturesLimitPostOnly(ex, apiKey, apiSecret, symbol, side, baseQty, price, reduceOnly = false, clientOrderId) {
   const sym = symbol.toUpperCase() + "USDT";
+  const info = await getBybitLinearInstr(ex, symbol);
+
+  let qtyNorm = roundStep(Number(baseQty || 0), info.qtyStep, 'floor');
+  if (!(qtyNorm > 0)) throw new Error("qty_zero");
+  if (qtyNorm < info.minQty) throw new Error(`qty_lt_min (${qtyNorm} < ${info.minQty})`);
+
+  const qtyStr = info.qtyDecimals > 0 ? qtyNorm.toFixed(info.qtyDecimals) : String(Math.round(qtyNorm));
+
+  const roundedPx = roundStep(Number(price || 0), info.tickSize, side === "BUY" ? 'floor' : 'ceil');
+  const priceStr = info.priceDecimals > 0 ? roundedPx.toFixed(info.priceDecimals) : String(roundedPx);
+
   const payload = {
     category: "linear",
     symbol: sym,
     side: side === "BUY" ? "Buy" : "Sell",
     orderType: "Limit",
-    qty: Number(baseQty).toFixed(6),
-    price: Number(price).toFixed(8),
+    qty: qtyStr,
+    price: priceStr,
     timeInForce: "PostOnly",
     reduceOnly: !!reduceOnly,
     orderLinkId: clientOrderId || undefined
@@ -1869,77 +1998,68 @@ async function placeBybitFuturesLimitPostOnly(ex, apiKey, apiSecret, symbol, sid
 }
 
 /* ---------- Optional: Exit/Bracket orders (default OFF, UX unchanged) ---------- */
-/* Spot (Binance-like): place TAKE_PROFIT_LIMIT and STOP_LOSS_LIMIT with CID suffixes.
-   Note: OCO is possible but per-order client IDs are limited; this approach keeps explicit suffixes. */
 async function placeBinanceLikeExitOrders(ex, apiKey, apiSecret, symbol, isLong, baseQty, tpPrice, slPrice, clientOrderIdPrefix) {
-  // For spot, exits are placed on SELL side for long, BUY side for short (rare on spot).
+  const sym = symbol.toUpperCase() + "USDT";
+  const info = await getBinanceInstrInfo(ex, symbol);
+
+  const qtyNorm = roundStep(Number(baseQty || 0), info.qtyStep, 'floor');
+  const qtyStr  = qtyNorm.toFixed(info.qtyDecimals);
+
+  const tpTick = roundStep(Number(tpPrice || 0), info.tickSize, isLong ? 'ceil' : 'floor');
+  const slTick = roundStep(Number(slPrice || 0), info.tickSize, isLong ? 'floor' : 'ceil');
+  const tpStr  = tpTick.toFixed(info.priceDecimals);
+  const slStr  = slTick.toFixed(info.priceDecimals);
+
   const sideExit = isLong ? "SELL" : "BUY";
-  const common = {
-    symbol: symbol.toUpperCase() + "USDT",
-    side: sideExit,
-    timeInForce: "GTC",
-    newOrderRespType: "RESULT",
-    timestamp: Date.now()
-  };
+  const common = { symbol: sym, side: sideExit, timeInForce: "GTC", newOrderRespType: "RESULT", timestamp: Date.now() };
 
-  // TAKE_PROFIT_LIMIT
-  const tpParams = {
-    ...common,
-    type: "TAKE_PROFIT_LIMIT",
-    quantity: Number(baseQty).toFixed(6),
-    price: Number(tpPrice).toFixed(8),
-    stopPrice: Number(tpPrice).toFixed(8),
-    newClientOrderId: clientOrderIdPrefix ? `${clientOrderIdPrefix}:tp` : undefined
-  };
-
-  // STOP_LOSS_LIMIT
-  const slParams = {
-    ...common,
-    type: "STOP_LOSS_LIMIT",
-    quantity: Number(baseQty).toFixed(6),
-    price: Number(slPrice).toFixed(8),
-    stopPrice: Number(slPrice).toFixed(8),
-    newClientOrderId: clientOrderIdPrefix ? `${clientOrderIdPrefix}:sl` : undefined
-  };
-
-  const endpoint = "/api/v3/order";
   const submit = async (params) => {
     const p = { ...params };
-    if (ex.defaultQuery) {
-      const defaults = new URLSearchParams(ex.defaultQuery);
-      for (const [k, v] of defaults) p[k] = v;
-    }
+    if (ex.defaultQuery) { const defaults = new URLSearchParams(ex.defaultQuery); for (const [k,v] of defaults) p[k]=v; }
     const qs = Object.entries(p).filter(([,v])=>v!==undefined).map(([k,v])=>`${k}=${encodeURIComponent(v)}`).join("&");
     const sig = await hmacHexStr(apiSecret, qs);
-    const url = `${ex.baseUrl}${endpoint}?${qs}&signature=${sig}`;
+    const url = `${ex.baseUrl}/api/v3/order?${qs}&signature=${sig}`;
     const r = await safeFetch(url, { method: "POST", headers: { [ex.apiKeyHeader]: apiKey } }, 8000);
     const d = await r.json().catch(()=>({}));
     if (!r.ok) throw new Error(d?.msg || d?.message || `HTTP ${r.status}`);
     return d;
   };
 
+  const tpParams = { ...common, type: "TAKE_PROFIT_LIMIT", quantity: qtyStr, price: tpStr, stopPrice: tpStr, newClientOrderId: clientOrderIdPrefix ? `${clientOrderIdPrefix}:tp` : undefined };
+  const slParams = { ...common, type: "STOP_LOSS_LIMIT",   quantity: qtyStr, price: slStr, stopPrice: slStr, newClientOrderId: clientOrderIdPrefix ? `${clientOrderIdPrefix}:sl` : undefined };
+
   const tpRes = await submit(tpParams).catch(e => { console.warn("TP order failed:", e?.message||e); return null; });
   const slRes = await submit(slParams).catch(e => { console.warn("SL order failed:", e?.message||e); return null; });
-  return {
-    tp: tpRes ? { orderId: tpRes.orderId, status: tpRes.status } : null,
-    sl: slRes ? { orderId: slRes.orderId, status: slRes.status } : null
-  };
+  return { tp: tpRes ? { orderId: tpRes.orderId, status: tpRes.status } : null, sl: slRes ? { orderId: slRes.orderId, status: slRes.status } : null };
 }
 
-/* Futures (Binance USDT-M): place TAKE_PROFIT_MARKET and STOP_MARKET reduceOnly with CID suffixes */
+/* Futures (Binance USDT-M): reduceOnly TP/SL triggers with step/tick rounding */
 async function placeBinanceFuturesBracketOrders(ex, apiKey, apiSecret, symbol, isLong, baseQty, tpPrice, slPrice, clientOrderIdPrefix) {
   const endpoint = "/fapi/v1/order";
-  const placeOne = async (type, stopPrice, side, cidSuffix) => {
+  const sym = symbol.toUpperCase() + "USDT";
+  const info = await getBinanceInstrInfo(ex, symbol);
+
+  const qtyNorm = roundStep(Number(baseQty || 0), info.qtyStep, 'floor');
+  if (!(qtyNorm > 0)) throw new Error("qty_zero");
+  if (qtyNorm < info.minQty) throw new Error(`qty_lt_min (${qtyNorm} < ${info.minQty})`);
+  const qtyStr = qtyNorm.toFixed(info.qtyDecimals);
+
+  const tpTick = roundStep(Number(tpPrice || 0), info.tickSize, isLong ? 'ceil' : 'floor');
+  const slTick = roundStep(Number(slPrice || 0), info.tickSize, isLong ? 'floor' : 'ceil');
+  const tpStr = tpTick.toFixed(info.priceDecimals);
+  const slStr = slTick.toFixed(info.priceDecimals);
+
+  const placeOne = async (type, stopPriceStr, side, cidSuffix) => {
     const params = {
-      symbol: symbol.toUpperCase() + "USDT",
+      symbol: sym,
       side,
       type,
-      stopPrice: Number(stopPrice).toFixed(8),
+      stopPrice: stopPriceStr,
       reduceOnly: "true",
       workingType: "CONTRACT_PRICE",
       newOrderRespType: "RESULT",
       timestamp: Date.now(),
-      quantity: Number(baseQty).toFixed(6)
+      quantity: qtyStr
     };
     if (clientOrderIdPrefix) params.newClientOrderId = `${clientOrderIdPrefix}:${cidSuffix}`;
     const qs = Object.entries(params).map(([k,v])=>`${k}=${encodeURIComponent(v)}`).join("&");
@@ -1951,15 +2071,12 @@ async function placeBinanceFuturesBracketOrders(ex, apiKey, apiSecret, symbol, i
     return d;
   };
 
-  // For a long: exit side is SELL; for a short: BUY
   const sideExit = isLong ? "SELL" : "BUY";
-  // TP trigger
   const tpType = "TAKE_PROFIT_MARKET";
-  // SL trigger
   const slType = "STOP_MARKET";
 
-  const tpRes = await placeOne(tpType, tpPrice, sideExit, "tp").catch(e => { console.warn("Futures TP failed:", e?.message||e); return null; });
-  const slRes = await placeOne(slType, slPrice, sideExit, "sl").catch(e => { console.warn("Futures SL failed:", e?.message||e); return null; });
+  const tpRes = await placeOne(tpType, tpStr, sideExit, "tp").catch(e => { console.warn("Futures TP failed:", e?.message||e); return null; });
+  const slRes = await placeOne(slType, slStr, sideExit, "sl").catch(e => { console.warn("Futures SL failed:", e?.message||e); return null; });
   return {
     tp: tpRes ? { orderId: tpRes.orderId, status: tpRes.status } : null,
     sl: slRes ? { orderId: slRes.orderId, status: slRes.status } : null
@@ -1970,17 +2087,31 @@ async function placeBinanceFuturesBracketOrders(ex, apiKey, apiSecret, symbol, i
 async function placeBybitFuturesBracketOrders(ex, apiKey, apiSecret, symbol, isLong, baseQty, tpPrice, slPrice, clientOrderIdPrefix) {
   const sym = symbol.toUpperCase() + "USDT";
   const exitSide = isLong ? "Sell" : "Buy";
-  const common = { category: "linear", symbol: sym, side: exitSide, orderType: "Market", qty: Number(baseQty).toFixed(6), reduceOnly: true, triggerBy: "LastPrice" };
+  const info = await getBybitLinearInstr(ex, symbol);
 
-  const mkPayload = (triggerPrice, suffix) => ({
+  // qty -> step
+  const qtyNorm = roundStep(Number(baseQty || 0), info.qtyStep, 'floor');
+  if (!(qtyNorm > 0)) throw new Error("qty_zero");
+  if (qtyNorm < info.minQty) throw new Error(`qty_lt_min (${qtyNorm} < ${info.minQty})`);
+  const qtyStr = info.qtyDecimals > 0 ? qtyNorm.toFixed(info.qtyDecimals) : String(Math.round(qtyNorm));
+
+  // triggers -> tick (bias favorable)
+  const tpTick = roundStep(Number(tpPrice || 0), info.tickSize, isLong ? 'ceil' : 'floor');
+  const slTick = roundStep(Number(slPrice || 0), info.tickSize, isLong ? 'floor' : 'ceil');
+  const tpStr = info.priceDecimals > 0 ? tpTick.toFixed(info.priceDecimals) : String(tpTick);
+  const slStr = info.priceDecimals > 0 ? slTick.toFixed(info.priceDecimals) : String(slTick);
+
+  const common = { category: "linear", symbol: sym, side: exitSide, orderType: "Market", qty: qtyStr, reduceOnly: true, triggerBy: "LastPrice" };
+
+  const mkPayload = (triggerPriceStr, suffix) => ({
     ...common,
-    triggerPrice: Number(triggerPrice).toFixed(8),
+    triggerPrice: triggerPriceStr,
     orderLinkId: clientOrderIdPrefix ? `${clientOrderIdPrefix}:${suffix}` : undefined
   });
 
   let tp = null, sl = null;
-  try { const d1 = await bybitV5POST(ex, apiKey, apiSecret, "/v5/order/create", mkPayload(tpPrice, "tp"), 8000); tp = { orderId: d1?.result?.orderId, status: "NEW" }; } catch(e) { console.warn("Bybit TP failed:", e?.message||e); }
-  try { const d2 = await bybitV5POST(ex, apiKey, apiSecret, "/v5/order/create", mkPayload(slPrice, "sl"), 8000); sl = { orderId: d2?.result?.orderId, status: "NEW" }; } catch(e) { console.warn("Bybit SL failed:", e?.message||e); }
+  try { const d1 = await bybitV5POST(ex, apiKey, apiSecret, "/v5/order/create", mkPayload(tpStr, "tp"), 8000); tp = { orderId: d1?.result?.orderId, status: "NEW" }; } catch(e) { console.warn("Bybit TP failed:", e?.message||e); }
+  try { const d2 = await bybitV5POST(ex, apiKey, apiSecret, "/v5/order/create", mkPayload(slStr, "sl"), 8000); sl = { orderId: d2?.result?.orderId, status: "NEW" }; } catch(e) { console.warn("Bybit SL failed:", e?.message||e); }
 
   return { tp, sl };
 }
@@ -2057,23 +2188,30 @@ async function placeMarketBuy(env, userId, symbol, quoteAmount, opts = {}) {
     return await placeDemoOrder(symbol, "BUY", quoteAmount, true, opts.clientOrderId);
   }
 
-  // Futures-only enforcement (non-demo)
-  if (["binanceLike","lbankV2","coinexV2"].includes(ex.kind)) {
-    throw new Error("Futures-only mode: pick a futures exchange (Bybit Futures or Binance Futures).");
-  }
-
   const apiKey = await decrypt(session.api_key_encrypted, env);
   const apiSecret = await decrypt(session.api_secret_encrypted, env);
 
   switch (ex.kind) {
+    case "binanceLike":
+      return await placeBinanceLikeOrder(ex, apiKey, apiSecret, symbol, "BUY", quoteAmount, true, opts.clientOrderId);
+    case "lbankV2": {
+      const price = await getCurrentPrice(symbol);
+      if (!price || price <= 0) throw new Error("Could not get price for LBank order");
+      const baseQty = Number(quoteAmount) / price;
+      return await placeLBankOrder(ex, apiKey, apiSecret, symbol, "buy", baseQty);
+    }
+    case "coinexV2":
+      return await placeCoinExOrder(ex, apiKey, apiSecret, symbol, "buy", quoteAmount);
     case "binanceFuturesUSDT": {
       const price = await getCurrentPrice(symbol);
+      if (!price || price <= 0) throw new Error("Could not get price for Binance Futures order");
       const baseQty = Number(quoteAmount) / price;
       await ensureFuturesIsolated1x(ex, apiKey, apiSecret, symbol);
       return await placeBinanceFuturesOrder(ex, apiKey, apiSecret, symbol, "BUY", baseQty, opts.reduceOnly === true, opts.clientOrderId);
     }
     case "bybitFuturesV5": {
       const price = await getCurrentPrice(symbol);
+      if (!price || price <= 0) throw new Error("Could not get price for Bybit Futures order");
       const baseQty = Number(quoteAmount) / price;
       await ensureFuturesIsolated1x(ex, apiKey, apiSecret, symbol);
       return await placeBybitFuturesOrder(ex, apiKey, apiSecret, symbol, "BUY", baseQty, opts.reduceOnly === true, opts.clientOrderId);
@@ -2091,19 +2229,35 @@ async function placeMarketSell(env, userId, symbol, amount, isQuoteOrder = false
     return await placeDemoOrder(symbol, "SELL", amount, isQuoteOrder, opts.clientOrderId);
   }
 
-  // Futures-only enforcement (non-demo)
-  if (["binanceLike","lbankV2","coinexV2"].includes(ex.kind)) {
-    throw new Error("Futures-only mode: pick a futures exchange (Bybit Futures or Binance Futures).");
-  }
-
   const apiKey = await decrypt(session.api_key_encrypted, env);
   const apiSecret = await decrypt(session.api_secret_encrypted, env);
 
   switch (ex.kind) {
+    case "binanceLike":
+      return await placeBinanceLikeOrder(ex, apiKey, apiSecret, symbol, "SELL", amount, isQuoteOrder, opts.clientOrderId);
+    case "lbankV2": {
+      let baseQty = Number(amount);
+      if (isQuoteOrder) {
+        const price = await getCurrentPrice(symbol);
+        if (!price || price <= 0) throw new Error("Could not get price for LBank order");
+        baseQty = Number(amount) / price;
+      }
+      return await placeLBankOrder(ex, apiKey, apiSecret, symbol, "sell", baseQty);
+    }
+    case "coinexV2": {
+      let baseQty = Number(amount);
+      if (isQuoteOrder) {
+        const price = await getCurrentPrice(symbol);
+        if (!price || price <= 0) throw new Error("Could not get price for CoinEx order");
+        baseQty = Number(amount) / price;
+      }
+      return await placeCoinExOrder(ex, apiKey, apiSecret, symbol, "sell", baseQty);
+    }
     case "binanceFuturesUSDT": {
       let baseQty = Number(amount);
       if (isQuoteOrder) {
         const price = await getCurrentPrice(symbol);
+        if (!price || price <= 0) throw new Error("Could not get price for Binance Futures order");
         baseQty = Number(amount) / price;
       }
       await ensureFuturesIsolated1x(ex, apiKey, apiSecret, symbol);
@@ -2113,6 +2267,7 @@ async function placeMarketSell(env, userId, symbol, amount, isQuoteOrder = false
       let baseQty = Number(amount);
       if (isQuoteOrder) {
         const price = await getCurrentPrice(symbol);
+        if (!price || price <= 0) throw new Error("Could not get price for Bybit Futures order");
         baseQty = Number(amount) / price;
       }
       await ensureFuturesIsolated1x(ex, apiKey, apiSecret, symbol);
@@ -3120,7 +3275,13 @@ async function executeTrade(env, userId, tradeId) {
           if (!isShort) result = await placeMarketBuy(env, userId, trade.symbol, quoteAmt, { reduceOnly: false, clientOrderId: CID });
           else result = await placeMarketSell(env, userId, trade.symbol, quoteAmt, true, { reduceOnly: false, clientOrderId: CID });
         } else {
-          await env.DB.prepare("UPDATE trades SET status='rejected', updated_at=? WHERE id=?").bind(nowISO(), tradeId).run();
+          // persist real error
+          let exj = {};
+          try { exj = JSON.parse(trade.extra_json || '{}'); } catch {}
+          exj.last_error = String(e?.message || e);
+          exj.last_error_ts = Date.now();
+          await env.DB.prepare("UPDATE trades SET status='rejected', extra_json=?, updated_at=? WHERE id=?")
+            .bind(JSON.stringify(exj), nowISO(), tradeId).run();
           await logEvent(env, userId, 'order_rejected', { policy: 'post_only', symbol: trade.symbol, reason: String(e?.message||e) });
           return false;
         }
@@ -3138,7 +3299,13 @@ async function executeTrade(env, userId, tradeId) {
           result = await placeBinanceFuturesOrder(ex, await decrypt(session.api_key_encrypted, env), await decrypt(session.api_secret_encrypted, env),
             trade.symbol, isShort ? 'SELL' : 'BUY', baseQty, false, CID);
         } else {
-          await env.DB.prepare("UPDATE trades SET status='rejected', updated_at=? WHERE id=?").bind(nowISO(), tradeId).run();
+          // persist real error
+          let exj = {};
+          try { exj = JSON.parse(trade.extra_json || '{}'); } catch {}
+          exj.last_error = String(e?.message || e);
+          exj.last_error_ts = Date.now();
+          await env.DB.prepare("UPDATE trades SET status='rejected', extra_json=?, updated_at=? WHERE id=?")
+            .bind(JSON.stringify(exj), nowISO(), tradeId).run();
           await logEvent(env, userId, 'order_rejected', { policy: 'post_only', symbol: trade.symbol, reason: String(e?.message||e) });
           return false;
         }
@@ -3162,8 +3329,13 @@ async function executeTrade(env, userId, tradeId) {
             isShort ? 'SELL' : 'BUY', baseQty, false, CID
           );
         } else {
-          await env.DB.prepare("UPDATE trades SET status='rejected', updated_at=? WHERE id=?")
-            .bind(nowISO(), tradeId).run();
+          // persist real error
+          let exj = {};
+          try { exj = JSON.parse(trade.extra_json || '{}'); } catch {}
+          exj.last_error = String(e?.message || e);
+          exj.last_error_ts = Date.now();
+          await env.DB.prepare("UPDATE trades SET status='rejected', extra_json=?, updated_at=? WHERE id=?")
+            .bind(JSON.stringify(exj), nowISO(), tradeId).run();
           await logEvent(env, userId, 'order_rejected', { policy: 'post_only', symbol: trade.symbol, reason: String(e?.message||e) });
           return false;
         }
@@ -3173,7 +3345,12 @@ async function executeTrade(env, userId, tradeId) {
         if (!isShort) result = await placeMarketBuy(env, userId, trade.symbol, quoteAmt, { reduceOnly: false, clientOrderId: CID });
         else result = await placeMarketSell(env, userId, trade.symbol, quoteAmt, true, { reduceOnly: false, clientOrderId: CID });
       } else {
-        await env.DB.prepare("UPDATE trades SET status='rejected', updated_at=? WHERE id=?").bind(nowISO(), tradeId).run();
+        let exj = {};
+        try { exj = JSON.parse(trade.extra_json || '{}'); } catch {}
+        exj.last_error = "unsupported_exchange";
+        exj.last_error_ts = Date.now();
+        await env.DB.prepare("UPDATE trades SET status='rejected', extra_json=?, updated_at=? WHERE id=?")
+          .bind(JSON.stringify(exj), nowISO(), tradeId).run();
         await logEvent(env, userId, 'order_rejected', { policy: 'post_only', symbol: trade.symbol, reason: 'unsupported_exchange' });
         return false;
       }
@@ -3244,6 +3421,16 @@ async function executeTrade(env, userId, tradeId) {
     }
   } catch (e) {
     console.error('executeTrade error:', e);
+    try {
+      const row = await env.DB.prepare("SELECT extra_json FROM trades WHERE id = ? AND user_id = ?")
+        .bind(tradeId, userId).first();
+      let exj = {};
+      try { exj = JSON.parse(row?.extra_json || '{}'); } catch {}
+      exj.last_error = String(e?.message || e);
+      exj.last_error_ts = Date.now();
+      await env.DB.prepare("UPDATE trades SET status = 'failed', extra_json = ?, updated_at = ? WHERE id = ? AND user_id = ?")
+        .bind(JSON.stringify(exj), nowISO(), tradeId, userId).run();
+    } catch (_) {}
     await logEvent(env, userId, 'error', { where: 'executeTrade', message: e.message });
     return false;
   }
@@ -4300,8 +4487,16 @@ async function sendTradesListUI(env, userId, page = 1, messageId = 0) {
         return `${emoji} ${r.symbol} ${r.side} ${qty.toFixed(4)} — pending | Entry~ ${formatMoney(r.price)} [${intent}] | SL ${formatMoney(r.stop_price)}${stopPctTxt} | TP ${formatMoney(r.tp_price)} (R ${rTxt})`;
       } else if (r.status === 'rejected') {
         let reason = '';
-        try { const exj = JSON.parse(r.extra_json || '{}'); if (exj.auto_skip && exj.skip_reason) reason = ` — skipped: ${String(exj.skip_reason).replace(/_/g,' ')}`; } catch (_) {}
+        try {
+          const exj = JSON.parse(r.extra_json || '{}');
+          if (exj.auto_skip && exj.skip_reason) reason = ` — skipped: ${String(exj.skip_reason).replace(/_/g,' ')}`;
+          else if (exj.last_error) reason = ` — ${String(exj.last_error).slice(0, 80)}`;
+        } catch (_) {}
         return `${emoji} ${r.symbol} ${r.side} ${qty.toFixed(4)} — rejected${reason} | Entry~ ${formatMoney(r.price)} [${intent}] | SL ${formatMoney(r.stop_price)}${stopPctTxt} | TP ${formatMoney(r.tp_price)} (R ${rTxt})`;
+      } else if (r.status === 'failed') {
+        let errTxt = '';
+        try { const exj = JSON.parse(r.extra_json || '{}'); if (exj.last_error) errTxt = ` — ${String(exj.last_error).slice(0, 80)}`; } catch {}
+        return `${emoji} ${r.symbol} ${r.side} ${qty.toFixed(4)} — failed${errTxt} | Entry~ ${formatMoney(r.price)} [${intent}]`;
       } else if (r.status === 'closed') {
         const pnl = Number(r.realized_pnl || 0);
         const rVal = Number(r.realized_r || 0);
@@ -4358,6 +4553,21 @@ async function sendTradeDetailsUI(env, userId, tradeId, messageId = 0) {
     const buttons = kbOpenTradeStrict(tradeId);
     if (messageId) await editMessage(userId, messageId, text, buttons, env);
     else await sendMessage(userId, text, buttons, env);
+    return;
+  }
+
+  if (trade.status === 'failed') {
+    const err = (() => { try { return JSON.parse(trade.extra_json || '{}')?.last_error || ''; } catch { return ''; } })();
+    const t = [
+      `Trade #${trade.id} (Failed)`,
+      "",
+      `Symbol: ${trade.symbol}`,
+      `Direction: ${trade.side === 'SELL' ? 'Short' : 'Long'}`,
+      err ? `Error: ${err}` : "Error: unknown"
+    ].join("\n");
+    const b = [[{ text: "Back to list", callback_data: "manage_trades" }], [{ text: "Continue ▶️", callback_data: "continue_dashboard" }]];
+    if (messageId) await editMessage(userId, messageId, t, b, env);
+    else await sendMessage(userId, t, b, env);
     return;
   }
 
@@ -5597,3 +5807,4 @@ export default {
     ctx.waitUntil(runCron(env));  // ensures non-blocking execution
   },
 };
+
