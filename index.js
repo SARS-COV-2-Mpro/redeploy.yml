@@ -1199,10 +1199,11 @@ async function getBybitLinearInstr(ex, base) {
       const it = j.result.list[0] || {};
       const qtyStep = Number(it?.lotSizeFilter?.qtyStep || 0.001);
       const minQty = Number(it?.lotSizeFilter?.minOrderQty || 0.001);
+      const maxQty = Number(it?.lotSizeFilter?.maxOrderQty || Number.POSITIVE_INFINITY);
       const minNotional = Number(it?.lotSizeFilter?.minNotionalValue || 0);
       const tickSize = Number(it?.priceFilter?.tickSize || 0.0001);
       const info = {
-        qtyStep, minQty, minNotional, tickSize,
+        qtyStep, minQty, maxQty, minNotional, tickSize,
         qtyDecimals: stepDecimals(qtyStep),
         priceDecimals: stepDecimals(tickSize)
       };
@@ -1211,7 +1212,7 @@ async function getBybitLinearInstr(ex, base) {
     }
   } catch (_) {}
 
-  const def = { qtyStep: 0.001, minQty: 0.001, minNotional: 0, tickSize: 0.0001, qtyDecimals: 3, priceDecimals: 4 };
+  const def = { qtyStep: 0.001, minQty: 0.001, maxQty: Number.POSITIVE_INFINITY, minNotional: 0, tickSize: 0.0001, qtyDecimals: 3, priceDecimals: 4 };
   BYBIT_INSTR_CACHE.set(key, def);
   return def;
 }
@@ -1237,11 +1238,12 @@ async function getBinanceInstrInfo(ex, base) {
 
         const qtyStep = Number(lotSize?.stepSize || 0.001);
         const minQty = Number(lotSize?.minQty || 0.001);
+        const maxQty = Number(lotSize?.maxQty || Number.POSITIVE_INFINITY);
         const tickSize = Number(priceFilter?.tickSize || 0.01);
         const minNotional = Number(minNotionalFilter?.minNotional || minNotionalFilter?.notional || 1);
 
         const info = {
-          qtyStep, minQty, minNotional, tickSize,
+          qtyStep, minQty, maxQty, minNotional, tickSize,
           qtyDecimals: stepDecimals(qtyStep),
           priceDecimals: stepDecimals(tickSize)
         };
@@ -1251,7 +1253,7 @@ async function getBinanceInstrInfo(ex, base) {
     }
   } catch (_) {}
 
-  const def = { qtyStep: 0.001, minQty: 0.001, minNotional: 1, tickSize: 0.01, qtyDecimals: 3, priceDecimals: 2 };
+  const def = { qtyStep: 0.001, minQty: 0.001, maxQty: Number.POSITIVE_INFINITY, minNotional: 1, tickSize: 0.01, qtyDecimals: 3, priceDecimals: 2 };
   BINANCE_INSTR_CACHE.set(key, def);
   return def;
 }
@@ -1738,15 +1740,21 @@ async function placeBinanceLikeOrder(ex, apiKey, apiSecret, symbol, side, amount
     params.quoteOrderQty = Number(amount).toFixed(8); // Quote amount precision is not specified via API, 8 is a safe bet
   } else {
     let baseQty;
+    let priceForCheck;
     if (isQuoteOrder) { // SELL in quote
       const price = await getCurrentPrice(symbol);
       if (!price || price <= 0) throw new Error("Could not get price to convert quote to base");
       baseQty = Number(amount) / price;
+      priceForCheck = price;
     } else { // BUY or SELL in base
       baseQty = Number(amount);
+      priceForCheck = await getCurrentPrice(symbol); // Need price for notional check
+      if (!priceForCheck || priceForCheck <= 0) throw new Error("Could not get price for checks");
     }
     const qtyNorm = roundStep(baseQty, info.qtyStep, 'floor');
     if (qtyNorm < info.minQty) throw new Error(`Quantity ${qtyNorm} is less than minQty ${info.minQty}`);
+    if (Number.isFinite(info.maxQty) && qtyNorm > info.maxQty) throw new Error(`qty_gt_max (${qtyNorm} > ${info.maxQty})`);
+    if (info.minNotional > 0 && (qtyNorm * priceForCheck) < info.minNotional) throw new Error(`min_notional (${(qtyNorm * priceForCheck).toFixed(8)} < ${info.minNotional})`);
     params.quantity = qtyNorm.toFixed(info.qtyDecimals);
   }
 
@@ -1795,6 +1803,13 @@ async function placeBinanceLikeLimitMaker(ex, apiKey, apiSecret, symbol, side, l
     baseQty = Number(amount);
   }
   const qtyNorm = roundStep(baseQty, info.qtyStep, 'floor');
+
+  if (!(qtyNorm > 0)) throw new Error("qty_zero");
+  if (qtyNorm < info.minQty) throw new Error(`qty_lt_min (${qtyNorm} < ${info.minQty})`);
+  if (Number.isFinite(info.maxQty) && qtyNorm > info.maxQty) throw new Error(`qty_gt_max (${qtyNorm} > ${info.maxQty})`);
+  const notional = qtyNorm * roundedPx;
+  if (info.minNotional > 0 && notional < info.minNotional) throw new Error(`min_notional (${notional} < ${info.minNotional})`);
+
   const qtyStr = qtyNorm.toFixed(info.qtyDecimals);
 
   const params = {
@@ -1880,6 +1895,10 @@ async function placeBinanceFuturesOrder(ex, apiKey, apiSecret, symbol, side, bas
 
   const qtyNorm = roundStep(Number(baseQty), info.qtyStep, 'floor');
   if (qtyNorm < info.minQty) throw new Error(`qty_lt_min (${qtyNorm} < ${info.minQty})`);
+  if (Number.isFinite(info.maxQty) && qtyNorm > info.maxQty) throw new Error(`qty_gt_max (${qtyNorm} > ${info.maxQty})`);
+
+  const pxHint = await getCurrentPrice(symbol);
+  if (info.minNotional > 0 && (qtyNorm * pxHint) < info.minNotional) throw new Error(`min_notional (${(qtyNorm*pxHint).toFixed(8)} < ${info.minNotional})`);
   const qtyStr = qtyNorm.toFixed(info.qtyDecimals);
 
   const params = {
@@ -1914,6 +1933,17 @@ async function placeBinanceFuturesLimitPostOnly(ex, apiKey, apiSecret, symbol, s
   const priceStr = roundedPx.toFixed(info.priceDecimals);
 
   const qtyNorm = roundStep(Number(baseQty), info.qtyStep, 'floor');
+
+  // Quantize and bounds
+  if (!(qtyNorm > 0)) throw new Error("qty_zero");
+  if (qtyNorm < info.minQty) throw new Error(`qty_lt_min (${qtyNorm} < ${info.minQty})`);
+  if (Number.isFinite(info.maxQty) && qtyNorm > info.maxQty) throw new Error(`qty_gt_max (${qtyNorm} > ${info.maxQty})`);
+
+  // Enforce minNotional on the rounded price
+  const notional = qtyNorm * roundedPx;
+  if (info.minNotional > 0 && notional < info.minNotional) {
+    throw new Error(`min_notional (${notional} < ${info.minNotional})`);
+  }
   const qtyStr = qtyNorm.toFixed(info.qtyDecimals);
 
   const params = {
@@ -1944,9 +1974,19 @@ async function placeBybitFuturesOrder(ex, apiKey, apiSecret, symbol, side, baseQ
   const sym = symbol.toUpperCase() + "USDT";
   const info = await getBybitLinearInstr(ex, symbol);
 
+  // Quantize and bounds
   let qtyNorm = roundStep(Number(baseQty || 0), info.qtyStep, 'floor');
   if (!(qtyNorm > 0)) throw new Error("qty_zero");
   if (qtyNorm < info.minQty) throw new Error(`qty_lt_min (${qtyNorm} < ${info.minQty})`);
+  if (Number.isFinite(info.maxQty) && qtyNorm > info.maxQty) throw new Error(`qty_gt_max (${qtyNorm} > ${info.maxQty})`);
+
+  // Min notional guard (use live price)
+  let pxHint = await getCurrentPrice(symbol);
+  if (!(pxHint > 0)) pxHint = (await getOrderBookSnapshot(symbol))?.bids?.[0]?.[0] || 0;
+  if (!(pxHint > 0)) throw new Error("price_unavailable");
+  if (info.minNotional > 0 && (qtyNorm * pxHint) < info.minNotional) {
+    throw new Error(`min_notional (${(qtyNorm * pxHint).toFixed(8)} < ${info.minNotional})`);
+  }
 
   const qtyStr = info.qtyDecimals > 0 ? qtyNorm.toFixed(info.qtyDecimals) : String(Math.round(qtyNorm));
 
@@ -1962,8 +2002,17 @@ async function placeBybitFuturesOrder(ex, apiKey, apiSecret, symbol, side, baseQ
   const d = await bybitV5POST(ex, apiKey, apiSecret, "/v5/order/create", payload, 8000);
   const orderId = d?.result?.orderId || d?.result?.orderID;
 
-  const st = await getBybitFuturesOrderStatus(ex, apiKey, apiSecret, symbol, { orderId, orderLinkId: clientOrderId });
-  return { orderId, executedQty: st.executedQty, avgPrice: st.avgPrice, status: st.status };
+  // Poll a few times for fill; if still 0, return cleanly (no throw)
+  let st = await getBybitFuturesOrderStatus(ex, apiKey, apiSecret, symbol, { orderId, orderLinkId: clientOrderId });
+  for (let i = 0; i < 3 && !(Number(st.executedQty) > 0) && !/CANCELED|REJECT/i.test(String(st.status||"")); i++) {
+    await sleep(200);
+    st = await getBybitFuturesOrderStatus(ex, apiKey, apiSecret, symbol, { orderId, orderLinkId: clientOrderId });
+  }
+  if (!(Number(st.executedQty) > 0)) {
+    // No fill (canceled or still new) — let caller reject the trade
+    return { orderId, executedQty: 0, avgPrice: 0, status: st.status || "CANCELED" };
+  }
+  return { orderId, executedQty: st.executedQty, avgPrice: st.avgPrice, status: st.status || "FILLED" };
 }
 
 /* ---------- Bybit Futures V5 LIMIT (PostOnly) ---------- */
@@ -1971,13 +2020,19 @@ async function placeBybitFuturesLimitPostOnly(ex, apiKey, apiSecret, symbol, sid
   const sym = symbol.toUpperCase() + "USDT";
   const info = await getBybitLinearInstr(ex, symbol);
 
+  const roundedPx = roundStep(Number(price || 0), info.tickSize, side === "BUY" ? 'floor' : 'ceil');
+
+  // Quantize and bounds
   let qtyNorm = roundStep(Number(baseQty || 0), info.qtyStep, 'floor');
   if (!(qtyNorm > 0)) throw new Error("qty_zero");
   if (qtyNorm < info.minQty) throw new Error(`qty_lt_min (${qtyNorm} < ${info.minQty})`);
+  if (Number.isFinite(info.maxQty) && qtyNorm > info.maxQty) throw new Error(`qty_gt_max (${qtyNorm} > ${info.maxQty})`);
+
+  // Price rounding already exists (roundedPx). Enforce minNotional on the rounded price:
+  const notional = qtyNorm * roundedPx;
+  if (info.minNotional > 0 && notional < info.minNotional) throw new Error(`min_notional (${notional} < ${info.minNotional})`);
 
   const qtyStr = info.qtyDecimals > 0 ? qtyNorm.toFixed(info.qtyDecimals) : String(Math.round(qtyNorm));
-
-  const roundedPx = roundStep(Number(price || 0), info.tickSize, side === "BUY" ? 'floor' : 'ceil');
   const priceStr = info.priceDecimals > 0 ? roundedPx.toFixed(info.priceDecimals) : String(roundedPx);
 
   const payload = {
@@ -2042,6 +2097,7 @@ async function placeBinanceFuturesBracketOrders(ex, apiKey, apiSecret, symbol, i
   const qtyNorm = roundStep(Number(baseQty || 0), info.qtyStep, 'floor');
   if (!(qtyNorm > 0)) throw new Error("qty_zero");
   if (qtyNorm < info.minQty) throw new Error(`qty_lt_min (${qtyNorm} < ${info.minQty})`);
+  if (Number.isFinite(info.maxQty) && qtyNorm > info.maxQty) throw new Error(`qty_gt_max (${qtyNorm} > ${info.maxQty})`);
   const qtyStr = qtyNorm.toFixed(info.qtyDecimals);
 
   const tpTick = roundStep(Number(tpPrice || 0), info.tickSize, isLong ? 'ceil' : 'floor');
@@ -2093,6 +2149,9 @@ async function placeBybitFuturesBracketOrders(ex, apiKey, apiSecret, symbol, isL
   const qtyNorm = roundStep(Number(baseQty || 0), info.qtyStep, 'floor');
   if (!(qtyNorm > 0)) throw new Error("qty_zero");
   if (qtyNorm < info.minQty) throw new Error(`qty_lt_min (${qtyNorm} < ${info.minQty})`);
+  if (Number.isFinite(info.maxQty) && qtyNorm > info.maxQty) {
+    throw new Error(`qty_gt_max (${qtyNorm} > ${info.maxQty})`);
+  }
   const qtyStr = info.qtyDecimals > 0 ? qtyNorm.toFixed(info.qtyDecimals) : String(Math.round(qtyNorm));
 
   // triggers -> tick (bias favorable)
@@ -3190,13 +3249,35 @@ async function executeTrade(env, userId, tradeId) {
 
   const respectExec = envFlag(env, 'RESPECT_EXEC_POLICY', '1');
   const takerFallback = envFlag(env, 'POST_ONLY_TAKER_FALLBACK', '1');
-  const wantPostOnly = respectExec && ((extra?.exec?.exec || '').toLowerCase() === 'post_only' || (extra?.entry?.policy || '').toLowerCase() === 'maker_join');
+  const entryMode = String(env.ENTRY_MODE || 'taker').toLowerCase();
+  let wantPostOnly;
+  if (entryMode === 'maker') {
+    wantPostOnly = true;
+  } else if (entryMode === 'idea') {
+    wantPostOnly = respectExec && ((extra?.exec?.exec || '').toLowerCase() === 'post_only' || (extra?.entry?.policy || '').toLowerCase() === 'maker_join');
+  } else {
+    // default 'taker'
+    wantPostOnly = false;
+  }
 
   try {
     if (!wantPostOnly) {
       let orderResult;
       if (!isShort) orderResult = await placeMarketBuy(env, userId, trade.symbol, extra.quote_size, { reduceOnly: false, clientOrderId: CID });
       else orderResult = await placeMarketSell(env, userId, trade.symbol, extra.quote_size, true, { reduceOnly: false, clientOrderId: CID });
+
+      // Guard: no fill => reject (mirror exchange)
+      if (!(Number(orderResult?.executedQty || 0) > 0)) {
+        let exj = {};
+        try { exj = JSON.parse(trade.extra_json || '{}'); } catch {}
+        exj.last_error = `no_fill_or_canceled (${orderResult?.status || 'unknown'})`;
+        exj.last_error_ts = Date.now();
+        await env.DB.prepare(
+          "UPDATE trades SET status = 'rejected', extra_json = ?, updated_at = ? WHERE id = ?"
+        ).bind(JSON.stringify(exj), nowISO(), tradeId).run();
+        await logEvent(env, userId, 'order_rejected', { policy: 'market', symbol: trade.symbol, reason: exj.last_error });
+        return false;
+      }
 
       const rUsed = Number(extra?.r_target || STRICT_RRR);
       const actualStopPrice = !isShort ? orderResult.avgPrice * (1 - trade.stop_pct) : orderResult.avgPrice * (1 + trade.stop_pct);
@@ -3263,6 +3344,7 @@ async function executeTrade(env, userId, tradeId) {
 
     const quoteAmt = Number(extra.quote_size || 0);
     let result;
+    let usedFallbackTaker = false;
 
     if (ex.kind === 'demoParrot') {
       result = await placeDemoOrder(trade.symbol, isShort ? "SELL" : "BUY", quoteAmt, true, CID);
@@ -3272,6 +3354,7 @@ async function executeTrade(env, userId, tradeId) {
           trade.symbol, isShort ? 'SELL' : 'BUY', makerPx, quoteAmt, true, CID);
       } catch (e) {
         if (takerFallback) {
+          usedFallbackTaker = true;
           if (!isShort) result = await placeMarketBuy(env, userId, trade.symbol, quoteAmt, { reduceOnly: false, clientOrderId: CID });
           else result = await placeMarketSell(env, userId, trade.symbol, quoteAmt, true, { reduceOnly: false, clientOrderId: CID });
         } else {
@@ -3296,6 +3379,7 @@ async function executeTrade(env, userId, tradeId) {
           trade.symbol, isShort ? 'SELL' : 'BUY', baseQty, makerPx, false, CID);
       } catch (e) {
         if (takerFallback) {
+          usedFallbackTaker = true;
           result = await placeBinanceFuturesOrder(ex, await decrypt(session.api_key_encrypted, env), await decrypt(session.api_secret_encrypted, env),
             trade.symbol, isShort ? 'SELL' : 'BUY', baseQty, false, CID);
         } else {
@@ -3322,6 +3406,7 @@ async function executeTrade(env, userId, tradeId) {
         );
       } catch (e) {
         if (takerFallback) {
+          usedFallbackTaker = true;
           const apiKey = await decrypt(session.api_key_encrypted, env);
           const apiSecret = await decrypt(session.api_secret_encrypted, env);
           result = await placeBybitFuturesOrder(
@@ -3342,6 +3427,7 @@ async function executeTrade(env, userId, tradeId) {
       }
     } else {
       if (takerFallback) {
+        usedFallbackTaker = true;
         if (!isShort) result = await placeMarketBuy(env, userId, trade.symbol, quoteAmt, { reduceOnly: false, clientOrderId: CID });
         else result = await placeMarketSell(env, userId, trade.symbol, quoteAmt, true, { reduceOnly: false, clientOrderId: CID });
       } else {
@@ -3354,6 +3440,18 @@ async function executeTrade(env, userId, tradeId) {
         await logEvent(env, userId, 'order_rejected', { policy: 'post_only', symbol: trade.symbol, reason: 'unsupported_exchange' });
         return false;
       }
+    }
+
+    if (usedFallbackTaker && !(Number(result?.executedQty || 0) > 0)) {
+      let exj = {};
+      try { exj = JSON.parse(trade.extra_json || '{}'); } catch {}
+      exj.last_error = `no_fill_or_canceled (${result?.status || 'unknown'})`;
+      exj.last_error_ts = Date.now();
+      await env.DB.prepare(
+        "UPDATE trades SET status = 'rejected', extra_json = ?, updated_at = ? WHERE id = ?"
+      ).bind(JSON.stringify(exj), nowISO(), tradeId).run();
+      await logEvent(env, userId, 'order_rejected', { policy: 'fallback_market', symbol: trade.symbol, reason: exj.last_error });
+      return false;
     }
 
     if (result && Number(result.executedQty || 0) > 0) {
@@ -3412,7 +3510,7 @@ async function executeTrade(env, userId, tradeId) {
         ttl_ts_ms: extra?.ttl?.ttl_ts_ms, policy: 'post_only_fill'
       });
       return true;
-    } else {
+    } else if (!usedFallbackTaker) {
       extra.open_order = { id: result?.orderId || null, px: makerPx, post_only: true, posted_at: nowISO() };
       await env.DB.prepare("UPDATE trades SET extra_json=?, updated_at=? WHERE id=?")
         .bind(JSON.stringify(extra), nowISO(), tradeId).run();
