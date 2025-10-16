@@ -18,7 +18,7 @@ const SUPPORTED_EXCHANGES = {
   binance_futures: { label: "Binance Futures (USDT-M)", kind: "binanceFuturesUSDT", baseUrl: "https://fapi.binance.com", apiKeyHeader: "X-MBX-APIKEY", hasOrders: true },
 
   // Bybit Futures (NEW — trading enabled)
-  bybit_futures_testnet: { label: "Bybit Futures (Demo-Testnet)", kind: "bybitFuturesV5", baseUrl: "https://api-testnet.bybit.com", hasOrders: true },
+  bybit_futures_testnet: { label: "Bybit Futures (Demo-Testnet)", kind: "bybitFuturesV5", baseUrl: "https://api-demo-testnet.bybit.com", hasOrders: true },
   bybit_futures:         { label: "Bybit Futures",           kind: "bybitFuturesV5", baseUrl: "https://api.bybit.com",        hasOrders: true },
 
   // Read-only in this worker
@@ -729,7 +729,9 @@ async function getWalletBalance(env, userId) {
     const thr = Number(env.DUST_AVAIL_THRESHOLD ?? 1e-6); // e.g., 1e-6 or 1e-5
     const a = Number(result?.data?.available);
     const e = Number(result?.data?.equity);
-    const preferEq = envFlag(env, 'BALANCE_PREFER_EQUITY', '1'); // default mirror
+    // Use totalAvailableBalance by default on Bybit (Requirement 4.1)
+    const isBybit = SUPPORTED_EXCHANGES?.[session.exchange_name]?.kind?.startsWith('bybit');
+    const preferEq = envFlag(env, 'BALANCE_PREFER_EQUITY', isBybit ? '0' : '1');
     if (preferEq && Number.isFinite(e) && e > 0) return e;
     if (Number.isFinite(a) && a > thr) return a;
     if (Number.isFinite(e) && e > 0) return e;
@@ -1072,7 +1074,8 @@ export {
   utcDayKey, ensureDayRoll, bumpTradeCounters, getPacingCounters, resyncPacingFromDB,
   dayProgressUTC, computeDynamicSqsGate, computeUserSqsGate
 };
-/* ======================================================================
+
+/* =TAKE_PROFIT_MARKET=====================================================================
    SECTION 4/7 — Exchange verification, signing helpers, orders & routing
    ====================================================================== */
 
@@ -1123,7 +1126,7 @@ function md5Hex(str) {
     a = ff(a,b,c,d,k[8],7,1770035416); d = ff(d,a,b,c,d,k[9],12,-1958414417); c = ff(c,d,a,b,k[10],17,-42063); b = ff(b,c,d,a,k[11],22,-1990404162);
     a = ff(a,b,c,d,k[12],7,1804603682); d = ff(d,a,b,c,d,k[13],12,-40341101); c = ff(c,d,a,b,k[14],17,-1502002290); b = ff(b,c,d,a,k[15],22,1236535329);
     a = gg(a,b,c,d,k[1],5,-165796510); d = gg(d,a,b,c,d,k[6],9,-1069501632); c = gg(c,d,a,b,k[11],14,643717713); b = gg(b,c,d,a,k[0],20,-373897302);
-    a = gg(a,b,c,d,k[5],5,-701558691); d = gg(d,a,b,c,d,k[10],9,38016083); c = gg(c,d,a,b,k[15],14,-660478335); b = gg(b,c,d,a,k[4],20,-405537848);
+    a = gg(a,b,c,d,k[5],5,-701558691); d = gg(d,a,b,c,d,k[10],9,38016083); c = gg(c,d,a,b,k[15],14,-660478335); b = ff(b,c,d,a,k[4],20,-405537848);
     a = gg(a,b,c,d,k[9],5,568446438); d = gg(d,a,b,c,d,k[14],9,-1019803690); c = gg(c,d,a,b,k[3],14,-187363961); b = gg(b,c,d,a,k[8],20,1163531501);
     a = ii(a,b,c,d,k[0],6,-198630844); d = ii(d,a,b,c,d,k[7],10,1126891415); c = ii(c,d,a,b,k[14],15,-1416354905); b = ii(b,c,d,a,k[5],21,-57434055);
     a = ii(a,b,c,d,k[12],6,1700485571); d = ii(d,a,b,c,d,k[3],10,-1894986606); c = ii(c,d,a,b,k[10],15,-1051523); b = ii(b,c,d,a,k[1],21,-2054922799);
@@ -1145,6 +1148,7 @@ async function bybitV5Headers(apiKey, apiSecret, payloadStr = "") {
     "X-BAPI-TIMESTAMP": ts,
     "X-BAPI-RECV-WINDOW": recv,
     "X-BAPI-SIGN": sig,
+    "X-BAPI-SIGN-TYPE": "2",
     "Content-Type": "application/json"
   };
 }
@@ -1166,6 +1170,49 @@ async function bybitV5GET(ex, apiKey, apiSecret, path, qsObj = {}, timeoutMs = 8
   const d = r ? await r.json().catch(()=> ({})) : {};
   if (!r || !r.ok || d?.retCode !== 0) throw new Error(d?.retMsg || `HTTP ${r?.status || 0}`);
   return d;
+}
+
+async function waitBybitFill(ex, apiKey, apiSecret, symbol, ids, tries = 16, delayMs = 300) {
+  for (let i = 0; i < tries; i++) {
+    try {
+      const st = await getBybitFuturesOrderStatus(ex, apiKey, apiSecret, symbol, ids);
+      if (Number(st.executedQty) > 0 && Number(st.avgPrice) > 0) return st;
+    } catch {}
+    await sleep(delayMs);
+  }
+  // Last-chance: pull recent executions
+  try {
+    const since = Date.now() - 5 * 60 * 1000;
+    const fills = await getBybitFuturesUserTrades(ex, apiKey, apiSecret, symbol, { startTime: since, limit: 100 });
+    const mine = fills.filter(f => (!ids.orderId || f.orderId === ids.orderId) || (!ids.orderLinkId || f.orderId === ids.orderLinkId));
+    if (mine.length) {
+      const base = mine.reduce((s, f) => s + Number(f.qty || 0), 0);
+      const qQuote = mine.reduce((s, f) => s + Number(f.price || 0) * Number(f.qty || 0), 0);
+      const avg = base > 0 ? qQuote / base : 0;
+      return { status: "FILLED", executedQty: base, avgPrice: avg };
+    }
+  } catch {}
+  return { status: "NEW", executedQty: 0, avgPrice: 0 };
+}
+
+// SECTION 4/7 — add helper
+async function bybitSetTradingStop(ex, apiKey, apiSecret, symbol, tpPrice, slPrice, triggerBy = "LastPrice", positionIdx = 0) {
+  const info = await getBybitLinearInstr(ex, symbol);
+  const tpTick = roundStep(Number(tpPrice), info.tickSize, "round");
+  const slTick = roundStep(Number(slPrice), info.tickSize, "round");
+  const payload = {
+    category: "linear",
+    symbol: (symbol || "").toUpperCase() + "USDT",
+    positionIdx,
+    tpslMode: "Full",
+    takeProfit: info.priceDecimals > 0 ? tpTick.toFixed(info.priceDecimals) : String(tpTick),
+    stopLoss:  info.priceDecimals > 0 ? slTick.toFixed(info.priceDecimals) : String(slTick),
+    tpOrderType: "Market",
+    slOrderType: "Market",
+    tpTriggerBy: triggerBy,
+    slTriggerBy: triggerBy
+  };
+  await bybitV5POST(ex, apiKey, apiSecret, "/v5/position/trading-stop", payload, 8000);
 }
 
 // Add this in SECTION 4/7 (near Bybit helpers, before order functions)
@@ -1199,11 +1246,14 @@ async function getBybitLinearInstr(ex, base) {
       const it = j.result.list[0] || {};
       const qtyStep = Number(it?.lotSizeFilter?.qtyStep || 0.001);
       const minQty = Number(it?.lotSizeFilter?.minOrderQty || 0.001);
-      const maxQty = Number(it?.lotSizeFilter?.maxOrderQty || Number.POSITIVE_INFINITY);
       const minNotional = Number(it?.lotSizeFilter?.minNotionalValue || 0);
-      const tickSize = Number(it?.priceFilter?.tickSize || 0.0001);
+      const pf = it?.priceFilter || {};
+      const tickSize = Number(pf?.tickSize || 0.0001);
+      const minPrice = Number(pf?.minPrice || 0);
+      const maxPrice = Number(pf?.maxPrice || 0);
       const info = {
-        qtyStep, minQty, maxQty, minNotional, tickSize,
+        qtyStep, minQty, minNotional, tickSize,
+        minPrice, maxPrice,
         qtyDecimals: stepDecimals(qtyStep),
         priceDecimals: stepDecimals(tickSize)
       };
@@ -1212,7 +1262,7 @@ async function getBybitLinearInstr(ex, base) {
     }
   } catch (_) {}
 
-  const def = { qtyStep: 0.001, minQty: 0.001, maxQty: Number.POSITIVE_INFINITY, minNotional: 0, tickSize: 0.0001, qtyDecimals: 3, priceDecimals: 4 };
+  const def = { qtyStep: 0.001, minQty: 0.001, minNotional: 0, tickSize: 0.0001, minPrice: 0, maxPrice: 0, qtyDecimals: 3, priceDecimals: 4 };
   BYBIT_INSTR_CACHE.set(key, def);
   return def;
 }
@@ -1238,12 +1288,11 @@ async function getBinanceInstrInfo(ex, base) {
 
         const qtyStep = Number(lotSize?.stepSize || 0.001);
         const minQty = Number(lotSize?.minQty || 0.001);
-        const maxQty = Number(lotSize?.maxQty || Number.POSITIVE_INFINITY);
         const tickSize = Number(priceFilter?.tickSize || 0.01);
         const minNotional = Number(minNotionalFilter?.minNotional || minNotionalFilter?.notional || 1);
 
         const info = {
-          qtyStep, minQty, maxQty, minNotional, tickSize,
+          qtyStep, minQty, minNotional, tickSize,
           qtyDecimals: stepDecimals(qtyStep),
           priceDecimals: stepDecimals(tickSize)
         };
@@ -1253,9 +1302,394 @@ async function getBinanceInstrInfo(ex, base) {
     }
   } catch (_) {}
 
-  const def = { qtyStep: 0.001, minQty: 0.001, maxQty: Number.POSITIVE_INFINITY, minNotional: 1, tickSize: 0.01, qtyDecimals: 3, priceDecimals: 2 };
+  const def = { qtyStep: 0.001, minQty: 0.001, minNotional: 1, tickSize: 0.01, qtyDecimals: 3, priceDecimals: 2 };
   BINANCE_INSTR_CACHE.set(key, def);
   return def;
+}
+
+function floorTick(x, tick){ return Math.floor(x / tick) * tick; }
+function ceilTick(x, tick){ return Math.ceil(x / tick) * tick; }
+
+function clampTpSlDirAware(side, avg, tp_bps, sl_bps, instr, env = {}) {
+  const upper = Number(instr.maxPrice || Infinity) * Number(env?.TP_SL_BAND_TOP || 0.999);
+  const lower = Number(instr.minPrice || 0) * Number(env?.TP_SL_BAND_BOTTOM || 1.001);
+  const tick  = Number(instr.tickSize || 0.0001);
+  const isLong = (String(side).toUpperCase() === "BUY");
+
+  let TP_raw = isLong ? avg * (1 + tp_bps/10000) : avg * (1 - tp_bps/10000);
+  let SL_raw = isLong ? avg * (1 - sl_bps/10000) : avg * (1 + sl_bps/10000);
+
+  // Direction-aware band clamp
+  let TP_c = isLong ? Math.min(TP_raw, upper) : Math.max(TP_raw, lower);
+  let SL_c = isLong ? Math.max(SL_raw, lower) : Math.min(SL_raw, upper);
+
+  // Tick rounding inward
+  let TP = isLong ? floorTick(TP_c, tick) : ceilTick(TP_c, tick);
+  let SL = isLong ? ceilTick(SL_c, tick)  : floorTick(SL_c, tick);
+
+  // Nudge inside band if drifted
+  if (TP > upper) TP = isLong ? floorTick(upper, tick) : TP;
+  if (TP < lower) TP = isLong ? TP : ceilTick(lower, tick);
+  if (SL < lower) SL = isLong ? ceilTick(lower, tick) : SL;
+  if (SL > upper) SL = isLong ? SL : floorTick(upper, tick);
+
+  // Sanity: Long => SL<avg<TP; Short => TP<avg<SL
+  if (isLong && !(SL < avg && avg < TP)) return null;
+  if (!isLong && !(TP < avg && avg < SL)) return null;
+
+  // Minimum separation 1 tick
+  if (Math.abs(TP - SL) < tick) return null;
+
+  return { TP, SL };
+}
+
+// Robust Bybit stop setter with one re‑clamp retry + hard fallback
+async function setBybitStopsSafe(ex, apiKey, apiSecret, symbol, side, avgPrice, tp_bps, sl_bps, env = {}) {
+  const instr = await getBybitLinearInstr(ex, symbol);
+  let pair = clampTpSlDirAware(side, avgPrice, tp_bps, sl_bps, instr, env);
+  if (!pair) return { ok: false, reason: "clamp_failed" };
+
+  const attempt = async () => {
+    try {
+      await bybitSetTradingStop(ex, apiKey, apiSecret, symbol, pair.TP, pair.SL, "LastPrice", 0);
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, reason: String(e?.message || "stop_set_failed") };
+    }
+  };
+
+  let r = await attempt();
+  if (r.ok) return r;
+
+  // If band changed mid-call, refetch and retry once
+  const instr2 = await getBybitLinearInstr(ex, symbol);
+  pair = clampTpSlDirAware(side, avgPrice, tp_bps, sl_bps, instr2, env);
+  if (!pair) return { ok: false, reason: "clamp_failed_retry" };
+  r = await attempt();
+  return r.ok ? r : { ok: false, reason: "stop_set_failed_retry" };
+}
+
+async function bybitClosePositionVerify(ex, apiKey, apiSecret, symbol, side, qty) {
+  const closeSide = (String(side).toUpperCase() === "BUY") ? "Sell" : "Buy";
+  try {
+    await bybitV5POST(ex, apiKey, apiSecret, "/v5/order/create", {
+      category: "linear", symbol: symbol.toUpperCase()+"USDT",
+      side: closeSide, orderType: "Market", qty: String(qty),
+      reduceOnly: true, positionIdx: 0
+    }, 8000);
+  } catch(_) {}
+
+  // Verify position is zero
+  for (let i=0;i<5;i++){
+    await sleep(800);
+    const sizeLeft = await bybitGetPosition(ex, apiKey, apiSecret, symbol);
+    if (!Number(sizeLeft)) return true;
+  }
+  return false;
+}
+
+async function bybitChaseOpen(ex, apiKey, apiSecret, symbol, side,
+  capitalPct = 0.10, driftBps = 30) {
+  const sym = symbol.toUpperCase()+"USDT";
+
+  // 0) optional: ensure 1x isolated here or do it in Section 5
+  // await ensureBybitFuturesIsolated1x(ex, apiKey, apiSecret, symbol);
+
+  // 1) Clean slate (symbol)
+  try { await bybitCancelAll(ex, apiKey, apiSecret, symbol); } catch(_) {}
+  const posSz = await bybitGetPosition(ex, apiKey, apiSecret, symbol);
+  if (posSz > 0) {
+    const ok = await bybitClosePositionVerify(ex, apiKey, apiSecret, symbol, side==="BUY"?"SELL":"BUY", posSz);
+    if (!ok) throw new Error("preclose_verify_failed");
+  }
+
+  // 2) Balances + limits
+  const balRes = await verifyBybit(apiKey, apiSecret, ex);
+  const avail = Number(balRes?.data?.available || 0);
+  if (!(avail > 0)) throw new Error("no_available_balance");
+  const instr = await getBybitLinearInstr(ex, symbol);
+  if (!instr?.qtyStep || !instr?.tickSize) throw new Error("no_instr");
+  const tick = Number(instr.tickSize || 0.0001);
+  const lower = Number(instr.minPrice || 0) * 1.001;
+  const upper = Number(instr.maxPrice || Infinity) * 0.999;
+
+  // helper to fetch fresh BBO
+  const fetchBbo = async () => {
+    const tkr = await bybitV5GET(ex, apiKey, apiSecret, "/v5/market/tickers", { category: "linear", symbol: sym }, 6000);
+    const r = (tkr?.result?.list||[])[0] || {};
+    const bid = +r.bid1Price || 0;
+    const ask = +r.ask1Price || 0;
+    if (!(bid>0 && ask>0)) throw new Error("no_bbo");
+    const spread = (ask - bid) / Math.max(1e-12, bid);
+    if (spread > 0.10) throw new Error("spread_too_wide_10pct");
+    return { bid, ask };
+  };
+
+  // 3) Initial BBO and sizing
+  const b0 = await fetchBbo();
+  const ref0 = (side==="BUY") ? b0.ask : b0.bid;
+  const capital = avail * capitalPct;
+  let targetQty = Math.floor((capital / ref0) / instr.qtyStep) * instr.qtyStep;
+  if (targetQty < instr.minQty) targetQty = instr.minQty;
+  if ((targetQty * ref0) < Number(instr.minNotional||0)) {
+    targetQty = Math.ceil((Number(instr.minNotional||0) / ref0) / instr.qtyStep) * instr.qtyStep;
+  }
+  if (!(targetQty>0)) throw new Error("qty_invalid");
+
+  // Validate minNotional compliance
+  const minNotional = Number(instr.minNotional || 0);
+  const actualNotional = targetQty * ref0;
+  if (minNotional > 0 && actualNotional < minNotional) {
+    const bumpedQty = Math.ceil((minNotional / ref0) / instr.qtyStep) * instr.qtyStep;
+    if (bumpedQty * ref0 <= avail) {
+      targetQty = bumpedQty;
+    } else {
+      throw new Error("insufficient_balance_for_min_notional");
+    }
+  }
+
+  // Add explicit balance guard
+  const requiredNotional = targetQty * ref0;
+  if (requiredNotional > avail * 0.8) {
+    throw new Error("insufficient_balance_80pct_safety");
+  }
+
+  // 4) Chase loop
+  const anchor = ref0;
+  const maxDrift = (driftBps/10000)*anchor; // 0.3%
+  let remaining = targetQty, filled = 0, avg = 0;
+
+  for (let round=0; round<12 && remaining>0; round++) {
+    // refresh BBO every round
+    const { bid, ask } = await fetchBbo();
+    const nowPx = (side==="BUY") ? ask : bid;
+    if (Math.abs(nowPx - anchor) > maxDrift) {
+      try { await bybitCancelAll(ex, apiKey, apiSecret, symbol); } catch(_) {}
+      if (filled > 0) await bybitClosePositionVerify(ex, apiKey, apiSecret, symbol, side, filled);
+      throw new Error("drift_exceeded_0p3");
+    }
+
+    // clamp entry price inside bands and round inward
+    let px = (side==="BUY") ? Math.min(nowPx, upper) : Math.max(nowPx, lower);
+    px = (side==="BUY") ? ceilTick(px, tick) : floorTick(px, tick);
+
+    // re-quantize remaining to step for safety
+    const remStep = Math.floor(remaining / instr.qtyStep) * instr.qtyStep;
+    if (!(remStep>0)) break;
+
+    // place GTC limit
+    let orderId = null;
+    try {
+      const body = { category:"linear", symbol:sym,
+        side: side==="BUY"?"Buy":"Sell", orderType:"Limit",
+        qty:String(remStep), price:String(px), timeInForce:"GTC", positionIdx:0 };
+      const res = await bybitV5POST(ex, apiKey, apiSecret, "/v5/order/create", body, 8000);
+      orderId = res?.result?.orderId || null;
+    } catch(_){ /* keep going – will reprice next round */ }
+
+    // poll short window; track delta exec to avoid double counting
+    let prevExec = 0;
+    const pollUntil = Date.now() + 2000;
+    while (Date.now() < pollUntil) {
+      await sleep(300);
+      if (!orderId) continue;
+      const st = await getBybitFuturesOrderStatus(ex, apiKey, apiSecret, symbol, { orderId });
+      const execCum = +st.executedQty || 0;
+      const avgPx = +st.avgPrice || 0;
+      const delta = Math.max(0, execCum - prevExec);
+      if (delta > 0 && avgPx > 0) {
+        const newTotal = filled + delta;
+        avg = (avg*filled + avgPx*delta) / newTotal;
+        filled = newTotal;
+        remaining = Math.max(0, targetQty - filled);
+        prevExec = execCum;
+        if (remaining <= 0) break;
+      }
+    }
+
+    // cancel live order before next reprice
+    if (orderId) {
+      try { await cancelBybitFuturesOrder(ex, apiKey, apiSecret, symbol, { orderId }); } catch(_){}
+    }
+  }
+
+  if (remaining > 0) {
+    try { await bybitCancelAll(ex, apiKey, apiSecret, symbol); } catch(_){}
+    if (filled > 0) await bybitClosePositionVerify(ex, apiKey, apiSecret, symbol, side, filled);
+    throw new Error("incomplete_fill");
+  }
+
+  // safety: cancel any stray orders
+  try { await bybitCancelAll(ex, apiKey, apiSecret, symbol); } catch(_){}
+
+  return { filledQty: filled, avgPrice: avg };
+}
+
+async function bybitSymbolStatus(ex, base, { minVol = 1000, maxSpread = 0.02 } = {}) {
+  const sym = (base || "").toUpperCase() + "USDT";
+
+  // 1) exists
+  try {
+    const u1 = `${ex.baseUrl}/v5/market/instruments-info?category=linear&symbol=${sym}`;
+    const r1 = await safeFetch(u1, {}, 6000); const j1 = await r1.json().catch(()=>null);
+    const listed = r1.ok && j1?.retCode === 0 && Array.isArray(j1?.result?.list) && j1.result.list.length > 0;
+    if (!listed) return { tradeable:false, status:"NOT_LISTED", reason:"no instrument" };
+  } catch {
+    return { tradeable:false, status:"NOT_LISTED", reason:"inst_fetch_fail" };
+  }
+
+  // 2) ticker + checks
+  try {
+    const u2 = `${ex.baseUrl}/v5/market/tickers?category=linear&symbol=${sym}`;
+    const r2 = await safeFetch(u2, {}, 6000); const j2 = await r2.json().catch(()=>null);
+    const row = (j2?.result?.list || [])[0];
+    if (!(r2.ok && j2?.retCode === 0 && row)) return { tradeable:false, status:"NOT_ACTIVE", reason:"no ticker" };
+
+    const last = Number(row.lastPrice || 0);
+    let bid  = Number(row.bid1Price || 0);
+    let ask  = Number(row.ask1Price || 0);
+    const turnover = Number(row.turnover24h || 0);
+    const volBase  = Number(row.volume24h || 0);
+    const volUsd   = turnover > 0 ? turnover : (volBase * last);
+
+    if (!(last > 0)) return { tradeable:false, status:"NOT_ACTIVE", reason:"no last" };
+
+    // FIX 1: Testnet BBO fallback
+    if (!(bid > 0 && ask > 0)) {
+      // Check if existing bid/ask deviate too far from last (broken data)
+      const bidDev = bid > 0 ? Math.abs(bid - last) / last : 0;
+      const askDev = ask > 0 ? Math.abs(ask - last) / last : 0;
+      
+      // Synthesize from lastPrice if missing or broken
+      if (bid <= 0 || bidDev > 0.5) bid = last * 0.9999;
+      if (ask <= 0 || askDev > 0.5) ask = last * 1.0001;
+    }
+
+    const spread = (ask - bid) / Math.max(1e-12, bid);
+    return { tradeable:true, status:"ACTIVE", lastPrice:last, bid, ask, vol_usd:volUsd, spread };
+  } catch {
+    return { tradeable:false, status:"NOT_ACTIVE", reason:"ticker_fetch_fail" };
+  }
+}
+
+async function binanceFutSymbolStatus(ex, base, { minVol = 1000, maxSpread = 0.02 } = {}) {
+  const sym = (base || "").toUpperCase() + "USDT";
+  try {
+    const u0 = `${ex.baseUrl}/fapi/v1/exchangeInfo`;
+    const r0 = await safeFetch(u0, {}, 6000); const j0 = await r0.json().catch(()=>null);
+    const listed = r0.ok && Array.isArray(j0?.symbols) && j0.symbols.some(s => s.symbol === sym && s.status === "TRADING");
+    if (!listed) return { tradeable: false, status: "NOT_LISTED" };
+  } catch { return { tradeable: false, status: "NOT_LISTED" }; }
+
+  try {
+    const tUrl = `${ex.baseUrl}/fapi/v1/ticker/24hr?symbol=${sym}`;
+    const btUrl = `${ex.baseUrl}/fapi/v1/ticker/bookTicker?symbol=${sym}`;
+    const [rt, rb] = await Promise.all([safeFetch(tUrl, {}, 6000), safeFetch(btUrl, {}, 6000)]);
+    const jt = await rt.json().catch(()=>null);
+    const jb = await rb.json().catch(()=>null);
+
+    const last = Number(jt?.lastPrice || 0);
+    const bid = Number(jb?.bidPrice || 0);
+    const ask = Number(jb?.askPrice || 0);
+    const vol = Number(jt?.quoteVolume || 0);
+    if (!(last > 0 && bid > 0 && ask > 0)) return { tradeable: false, status: "NOT_ACTIVE", reason: "bad_px" };
+
+    const spread = (ask - bid) / Math.max(1e-12, bid);
+    return { tradeable: true, status: "ACTIVE", lastPrice: last, bid, ask, vol, spread };
+  } catch {
+    return { tradeable: false, status: "NOT_ACTIVE", reason: "ticker_fetch_fail" };
+  }
+}
+
+async function binanceSpotSymbolStatus(ex, base, { minVol = 1000, maxSpread = 0.02 } = {}) {
+  const sym = (base || "").toUpperCase() + "USDT";
+  try {
+    const u0 = `${ex.baseUrl}/api/v3/exchangeInfo`;
+    const r0 = await safeFetch(u0, {}, 6000); const j0 = await r0.json().catch(()=>null);
+    const listed = r0.ok && Array.isArray(j0?.symbols) && j0.symbols.some(s => s.symbol === sym && s.status === "TRADING");
+    if (!listed) return { tradeable: false, status: "NOT_LISTED" };
+  } catch { return { tradeable: false, status: "NOT_LISTED" }; }
+
+  try {
+    const tUrl = `${ex.baseUrl}/api/v3/ticker/24hr?symbol=${sym}`;
+    const btUrl = `${ex.baseUrl}/api/v3/ticker/bookTicker?symbol=${sym}`;
+    const [rt, rb] = await Promise.all([safeFetch(tUrl, {}, 6000), safeFetch(btUrl, {}, 6000)]);
+    const jt = await rt.json().catch(()=>null);
+    const jb = await rb.json().catch(()=>null);
+
+    const last = Number(jt?.lastPrice || 0);
+    const bid = Number(jb?.bidPrice || 0);
+    const ask = Number(jb?.askPrice || 0);
+    const vol = Number(jt?.quoteVolume || 0);
+    if (!(last > 0 && bid > 0 && ask > 0)) return { tradeable: false, status: "NOT_ACTIVE", reason: "bad_px" };
+
+    const spread = (ask - bid) / Math.max(1e-12, bid);
+    return { tradeable: true, status: "ACTIVE", lastPrice: last, bid, ask, vol, spread };
+  } catch { return { tradeable: false, status: "NOT_ACTIVE", reason: "ticker_fetch_fail" }; }
+}
+
+async function bybitPreflightTestOrder(ex, apiKey, apiSecret, base) {
+  const sym = (base || "").toUpperCase() + "USDT";
+  try {
+    const info = await getBybitLinearInstr(ex, base);
+    
+    // FIX 2: Ensure test order meets minNotional
+    const minNotional = Number(info.minNotional || 5);
+    let qty = Math.max(info.minQty, info.qtyStep);
+
+    const u2 = `${ex.baseUrl}/v5/market/tickers?category=linear&symbol=${sym}`;
+    const r2 = await safeFetch(u2, {}, 6000); const j2 = await r2.json().catch(()=>null);
+    const row = (j2?.result?.list||[])[0]; if (!row) return false;
+    const bid = Number(row.bid1Price || 0), ask = Number(row.ask1Price || 0);
+    if (!(bid > 0 && ask > 0)) return false;
+
+    // Bump qty if below minNotional
+    const testNotional = qty * bid;
+    if (testNotional < minNotional) {
+      qty = Math.ceil((minNotional / bid) / info.qtyStep) * info.qtyStep;
+    }
+    
+    // Safety cap
+    qty = Math.min(qty, info.minQty * 100);
+
+    const testSide = "Buy";
+    const rawPx = testSide === "Buy" ? bid * 0.97 : ask * 1.03;
+    const px = roundStep(rawPx, info.tickSize, testSide === "Buy" ? "floor" : "ceil");
+    const qtyStr = info.qtyDecimals > 0 ? qty.toFixed(info.qtyDecimals) : String(Math.round(qty));
+    const priceStr = info.priceDecimals > 0 ? px.toFixed(info.priceDecimals) : String(px);
+
+    const payload = {
+      category: "linear", symbol: sym, side: testSide, orderType: "Limit",
+      qty: qtyStr, price: priceStr, timeInForce: "PostOnly", reduceOnly: false
+    };
+    const d = await bybitV5POST(ex, apiKey, apiSecret, "/v5/order/create", payload, 8000);
+    const orderId = d?.result?.orderId;
+    if (!orderId) return false;
+
+    await bybitV5POST(ex, apiKey, apiSecret, "/v5/order/cancel", { category:"linear", symbol:sym, orderId }, 8000).catch(()=>{});
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function binanceSpotTestOrder(ex, apiKey, apiSecret, base) {
+  const sym = base.toUpperCase() + "USDT";
+  const params = { symbol: sym, side: "BUY", type: "MARKET", quoteOrderQty: "10", timestamp: Date.now() };
+  const qs = Object.entries(params).map(([k,v])=>`${k}=${encodeURIComponent(v)}`).join("&");
+  const sig = await hmacHexStr(apiSecret, qs);
+  const url = `${ex.baseUrl}/api/v3/order/test?${qs}&signature=${sig}`;
+  const r = await safeFetch(url, { method: "POST", headers: { [ex.apiKeyHeader]: apiKey } }, 6000).catch(()=>null);
+  return !!(r && r.ok);
+}
+async function binanceFutTestOrder(ex, apiKey, apiSecret, base) {
+  const sym = base.toUpperCase() + "USDT";
+  const params = { symbol: sym, side: "BUY", type: "MARKET", quantity: "0.001", timestamp: Date.now() };
+  const qs = Object.entries(params).map(([k,v])=>`${k}=${encodeURIComponent(v)}`).join("&");
+  const sig = await hmacHexStr(apiSecret, qs);
+  const url = `${ex.baseUrl}/fapi/v1/order/test?${qs}&signature=${sig}`;
+  const r = await safeFetch(url, { method: "POST", headers: { [ex.apiKeyHeader]: apiKey } }, 6000).catch(()=>null);
+  return !!(r && r.ok);
 }
 
 /* ---------- Balance parsers ---------- */
@@ -1478,7 +1912,8 @@ async function verifyBybit(apiKey, apiSecret, ex) {
         "X-BAPI-API-KEY": apiKey,
         "X-BAPI-TIMESTAMP": ts,
         "X-BAPI-RECV-WINDOW": recv,
-        "X-BAPI-SIGN": sig
+        "X-BAPI-SIGN": sig,
+        "X-BAPI-SIGN-TYPE": "2"
       }
     }, 5000).catch(()=>null);
     const d = r ? await r.json().catch(()=>({})) : {};
@@ -1740,21 +2175,15 @@ async function placeBinanceLikeOrder(ex, apiKey, apiSecret, symbol, side, amount
     params.quoteOrderQty = Number(amount).toFixed(8); // Quote amount precision is not specified via API, 8 is a safe bet
   } else {
     let baseQty;
-    let priceForCheck;
     if (isQuoteOrder) { // SELL in quote
       const price = await getCurrentPrice(symbol);
       if (!price || price <= 0) throw new Error("Could not get price to convert quote to base");
       baseQty = Number(amount) / price;
-      priceForCheck = price;
     } else { // BUY or SELL in base
       baseQty = Number(amount);
-      priceForCheck = await getCurrentPrice(symbol); // Need price for notional check
-      if (!priceForCheck || priceForCheck <= 0) throw new Error("Could not get price for checks");
     }
     const qtyNorm = roundStep(baseQty, info.qtyStep, 'floor');
     if (qtyNorm < info.minQty) throw new Error(`Quantity ${qtyNorm} is less than minQty ${info.minQty}`);
-    if (Number.isFinite(info.maxQty) && qtyNorm > info.maxQty) throw new Error(`qty_gt_max (${qtyNorm} > ${info.maxQty})`);
-    if (info.minNotional > 0 && (qtyNorm * priceForCheck) < info.minNotional) throw new Error(`min_notional (${(qtyNorm * priceForCheck).toFixed(8)} < ${info.minNotional})`);
     params.quantity = qtyNorm.toFixed(info.qtyDecimals);
   }
 
@@ -1803,13 +2232,6 @@ async function placeBinanceLikeLimitMaker(ex, apiKey, apiSecret, symbol, side, l
     baseQty = Number(amount);
   }
   const qtyNorm = roundStep(baseQty, info.qtyStep, 'floor');
-
-  if (!(qtyNorm > 0)) throw new Error("qty_zero");
-  if (qtyNorm < info.minQty) throw new Error(`qty_lt_min (${qtyNorm} < ${info.minQty})`);
-  if (Number.isFinite(info.maxQty) && qtyNorm > info.maxQty) throw new Error(`qty_gt_max (${qtyNorm} > ${info.maxQty})`);
-  const notional = qtyNorm * roundedPx;
-  if (info.minNotional > 0 && notional < info.minNotional) throw new Error(`min_notional (${notional} < ${info.minNotional})`);
-
   const qtyStr = qtyNorm.toFixed(info.qtyDecimals);
 
   const params = {
@@ -1895,10 +2317,6 @@ async function placeBinanceFuturesOrder(ex, apiKey, apiSecret, symbol, side, bas
 
   const qtyNorm = roundStep(Number(baseQty), info.qtyStep, 'floor');
   if (qtyNorm < info.minQty) throw new Error(`qty_lt_min (${qtyNorm} < ${info.minQty})`);
-  if (Number.isFinite(info.maxQty) && qtyNorm > info.maxQty) throw new Error(`qty_gt_max (${qtyNorm} > ${info.maxQty})`);
-
-  const pxHint = await getCurrentPrice(symbol);
-  if (info.minNotional > 0 && (qtyNorm * pxHint) < info.minNotional) throw new Error(`min_notional (${(qtyNorm*pxHint).toFixed(8)} < ${info.minNotional})`);
   const qtyStr = qtyNorm.toFixed(info.qtyDecimals);
 
   const params = {
@@ -1933,17 +2351,6 @@ async function placeBinanceFuturesLimitPostOnly(ex, apiKey, apiSecret, symbol, s
   const priceStr = roundedPx.toFixed(info.priceDecimals);
 
   const qtyNorm = roundStep(Number(baseQty), info.qtyStep, 'floor');
-
-  // Quantize and bounds
-  if (!(qtyNorm > 0)) throw new Error("qty_zero");
-  if (qtyNorm < info.minQty) throw new Error(`qty_lt_min (${qtyNorm} < ${info.minQty})`);
-  if (Number.isFinite(info.maxQty) && qtyNorm > info.maxQty) throw new Error(`qty_gt_max (${qtyNorm} > ${info.maxQty})`);
-
-  // Enforce minNotional on the rounded price
-  const notional = qtyNorm * roundedPx;
-  if (info.minNotional > 0 && notional < info.minNotional) {
-    throw new Error(`min_notional (${notional} < ${info.minNotional})`);
-  }
   const qtyStr = qtyNorm.toFixed(info.qtyDecimals);
 
   const params = {
@@ -1970,25 +2377,30 @@ async function placeBinanceFuturesLimitPostOnly(ex, apiKey, apiSecret, symbol, s
 }
 
 /* ---------- Bybit Futures V5 MARKET ---------- */
-async function placeBybitFuturesOrder(ex, apiKey, apiSecret, symbol, side, baseQty, reduceOnly = false, clientOrderId) {
+async function placeBybitFuturesOrder(
+  ex, apiKey, apiSecret,
+  symbol, side, baseQty,
+  reduceOnly = false, clientOrderId,
+  inlineTpPrice = null, inlineSlPrice = null, triggerBy = "LastPrice"
+) {
   const sym = symbol.toUpperCase() + "USDT";
   const info = await getBybitLinearInstr(ex, symbol);
 
-  // Quantize and bounds
   let qtyNorm = roundStep(Number(baseQty || 0), info.qtyStep, 'floor');
-  if (!(qtyNorm > 0)) throw new Error("qty_zero");
-  if (qtyNorm < info.minQty) throw new Error(`qty_lt_min (${qtyNorm} < ${info.minQty})`);
-  if (Number.isFinite(info.maxQty) && qtyNorm > info.maxQty) throw new Error(`qty_gt_max (${qtyNorm} > ${info.maxQty})`);
-
-  // Min notional guard (use live price)
-  let pxHint = await getCurrentPrice(symbol);
-  if (!(pxHint > 0)) pxHint = (await getOrderBookSnapshot(symbol))?.bids?.[0]?.[0] || 0;
-  if (!(pxHint > 0)) throw new Error("price_unavailable");
-  if (info.minNotional > 0 && (qtyNorm * pxHint) < info.minNotional) {
-    throw new Error(`min_notional (${(qtyNorm * pxHint).toFixed(8)} < ${info.minNotional})`);
-  }
-
+  if (!(qtyNorm > 0)) qtyNorm = info.minQty;
+  if (qtyNorm < info.minQty) qtyNorm = info.minQty;   // Requirement 4.5
   const qtyStr = info.qtyDecimals > 0 ? qtyNorm.toFixed(info.qtyDecimals) : String(Math.round(qtyNorm));
+
+  // Inline TP/SL rounding
+  let tpStr, slStr;
+  if (Number.isFinite(inlineTpPrice) && inlineTpPrice > 0) {
+    const tpTick = roundStep(Number(inlineTpPrice || 0), info.tickSize, 'round'); // was ceil/floor
+    tpStr = info.priceDecimals > 0 ? tpTick.toFixed(info.priceDecimals) : String(tpTick);
+  }
+  if (Number.isFinite(inlineSlPrice) && inlineSlPrice > 0) {
+    const slTick = roundStep(Number(inlineSlPrice || 0), info.tickSize, 'round'); // was floor/ceil
+    slStr = info.priceDecimals > 0 ? slTick.toFixed(info.priceDecimals) : String(slTick);
+  }
 
   const payload = {
     category: "linear",
@@ -1997,22 +2409,30 @@ async function placeBybitFuturesOrder(ex, apiKey, apiSecret, symbol, side, baseQ
     orderType: "Market",
     qty: qtyStr,
     reduceOnly: !!reduceOnly,
-    orderLinkId: clientOrderId || undefined
+    orderLinkId: clientOrderId || undefined,
+    positionIdx: 0
   };
+
+  if (!reduceOnly && (tpStr || slStr)) {
+    payload.tpslMode = "Full";
+    if (tpStr) {
+      payload.takeProfit = tpStr;
+      payload.tpOrderType = "Market";
+      payload.tpTriggerBy = triggerBy || "LastPrice";
+    }
+    if (slStr) {
+      payload.stopLoss = slStr;
+      payload.slOrderType = "Market";
+      payload.slTriggerBy = triggerBy || "LastPrice";
+    }
+  }
+
   const d = await bybitV5POST(ex, apiKey, apiSecret, "/v5/order/create", payload, 8000);
   const orderId = d?.result?.orderId || d?.result?.orderID;
 
-  // Poll a few times for fill; if still 0, return cleanly (no throw)
-  let st = await getBybitFuturesOrderStatus(ex, apiKey, apiSecret, symbol, { orderId, orderLinkId: clientOrderId });
-  for (let i = 0; i < 3 && !(Number(st.executedQty) > 0) && !/CANCELED|REJECT/i.test(String(st.status||"")); i++) {
-    await sleep(200);
-    st = await getBybitFuturesOrderStatus(ex, apiKey, apiSecret, symbol, { orderId, orderLinkId: clientOrderId });
-  }
-  if (!(Number(st.executedQty) > 0)) {
-    // No fill (canceled or still new) — let caller reject the trade
-    return { orderId, executedQty: 0, avgPrice: 0, status: st.status || "CANCELED" };
-  }
-  return { orderId, executedQty: st.executedQty, avgPrice: st.avgPrice, status: st.status || "FILLED" };
+  // Wait for a real fill (testnet often lags)
+  const st = await waitBybitFill(ex, apiKey, apiSecret, symbol, { orderId, orderLinkId: clientOrderId });
+  return { orderId, executedQty: st.executedQty, avgPrice: st.avgPrice, status: st.status };
 }
 
 /* ---------- Bybit Futures V5 LIMIT (PostOnly) ---------- */
@@ -2020,19 +2440,12 @@ async function placeBybitFuturesLimitPostOnly(ex, apiKey, apiSecret, symbol, sid
   const sym = symbol.toUpperCase() + "USDT";
   const info = await getBybitLinearInstr(ex, symbol);
 
-  const roundedPx = roundStep(Number(price || 0), info.tickSize, side === "BUY" ? 'floor' : 'ceil');
-
-  // Quantize and bounds
   let qtyNorm = roundStep(Number(baseQty || 0), info.qtyStep, 'floor');
-  if (!(qtyNorm > 0)) throw new Error("qty_zero");
-  if (qtyNorm < info.minQty) throw new Error(`qty_lt_min (${qtyNorm} < ${info.minQty})`);
-  if (Number.isFinite(info.maxQty) && qtyNorm > info.maxQty) throw new Error(`qty_gt_max (${qtyNorm} > ${info.maxQty})`);
-
-  // Price rounding already exists (roundedPx). Enforce minNotional on the rounded price:
-  const notional = qtyNorm * roundedPx;
-  if (info.minNotional > 0 && notional < info.minNotional) throw new Error(`min_notional (${notional} < ${info.minNotional})`);
-
+  if (!(qtyNorm > 0)) qtyNorm = info.minQty;
+  if (qtyNorm < info.minQty) qtyNorm = info.minQty;   // Requirement 4.5
   const qtyStr = info.qtyDecimals > 0 ? qtyNorm.toFixed(info.qtyDecimals) : String(Math.round(qtyNorm));
+
+  const roundedPx = roundStep(Number(price || 0), info.tickSize, side === "BUY" ? 'floor' : 'ceil');
   const priceStr = info.priceDecimals > 0 ? roundedPx.toFixed(info.priceDecimals) : String(roundedPx);
 
   const payload = {
@@ -2050,6 +2463,36 @@ async function placeBybitFuturesLimitPostOnly(ex, apiKey, apiSecret, symbol, sid
   const orderId = d?.result?.orderId || d?.result?.orderID;
   const st = await getBybitFuturesOrderStatus(ex, apiKey, apiSecret, symbol, { orderId, orderLinkId: clientOrderId });
   return { orderId, executedQty: st.executedQty, avgPrice: st.avgPrice, status: st.status || "NEW" };
+}
+
+async function bybitCancelAll(ex, apiKey, apiSecret, symbol) {
+  const sym = symbol.toUpperCase() + "USDT";
+  await bybitV5POST(ex, apiKey, apiSecret, "/v5/order/cancel-all", { category: "linear", symbol: sym }, 8000).catch(()=>{});
+}
+
+async function binanceFutCancelAll(ex, apiKey, apiSecret, symbol) {
+  const params = { symbol: symbol.toUpperCase() + "USDT", timestamp: Date.now() };
+  const qs = Object.entries(params).map(([k,v])=>`${k}=${encodeURIComponent(v)}`).join("&");
+  const sig = await hmacHexStr(apiSecret, qs);
+  const url = `${ex.baseUrl}/fapi/v1/allOpenOrders?${qs}&signature=${sig}`;
+  await safeFetch(url, { method: "DELETE", headers: { [ex.apiKeyHeader]: apiKey } }, 8000).catch(()=>{});
+}
+
+async function cancelBinanceLikeAllForSymbol(ex, apiKey, apiSecret, symbol) {
+  const params = { symbol: symbol.toUpperCase() + "USDT", timestamp: Date.now() };
+  if (ex.defaultQuery) { const defaults = new URLSearchParams(ex.defaultQuery); for (const [k, v] of defaults) params[k] = v; }
+  const qs = Object.entries(params).map(([k,v])=>`${k}=${encodeURIComponent(v)}`).join("&");
+  const sig = await hmacHexStr(apiSecret, qs);
+  const url = `${ex.baseUrl}/api/v3/openOrders?${qs}&signature=${sig}`;
+  await safeFetch(url, { method: "DELETE", headers: { [ex.apiKeyHeader]: apiKey } }, 8000).catch(()=>{});
+}
+
+async function bybitGetPosition(ex, apiKey, apiSecret, symbol) {
+  const sym = symbol.toUpperCase() + "USDT";
+  const d = await bybitV5GET(ex, apiKey, apiSecret, "/v5/position/list", { category: "linear", symbol: sym }, 8000).catch(()=>null);
+  const row = (d?.result?.list||[]).find(x => x.symbol === sym);
+  const size = Number(row?.size || 0);
+  return Number.isFinite(size) ? size : 0;
 }
 
 /* ---------- Optional: Exit/Bracket orders (default OFF, UX unchanged) ---------- */
@@ -2097,7 +2540,6 @@ async function placeBinanceFuturesBracketOrders(ex, apiKey, apiSecret, symbol, i
   const qtyNorm = roundStep(Number(baseQty || 0), info.qtyStep, 'floor');
   if (!(qtyNorm > 0)) throw new Error("qty_zero");
   if (qtyNorm < info.minQty) throw new Error(`qty_lt_min (${qtyNorm} < ${info.minQty})`);
-  if (Number.isFinite(info.maxQty) && qtyNorm > info.maxQty) throw new Error(`qty_gt_max (${qtyNorm} > ${info.maxQty})`);
   const qtyStr = qtyNorm.toFixed(info.qtyDecimals);
 
   const tpTick = roundStep(Number(tpPrice || 0), info.tickSize, isLong ? 'ceil' : 'floor');
@@ -2149,9 +2591,6 @@ async function placeBybitFuturesBracketOrders(ex, apiKey, apiSecret, symbol, isL
   const qtyNorm = roundStep(Number(baseQty || 0), info.qtyStep, 'floor');
   if (!(qtyNorm > 0)) throw new Error("qty_zero");
   if (qtyNorm < info.minQty) throw new Error(`qty_lt_min (${qtyNorm} < ${info.minQty})`);
-  if (Number.isFinite(info.maxQty) && qtyNorm > info.maxQty) {
-    throw new Error(`qty_gt_max (${qtyNorm} > ${info.maxQty})`);
-  }
   const qtyStr = info.qtyDecimals > 0 ? qtyNorm.toFixed(info.qtyDecimals) : String(Math.round(qtyNorm));
 
   // triggers -> tick (bias favorable)
@@ -2273,7 +2712,11 @@ async function placeMarketBuy(env, userId, symbol, quoteAmount, opts = {}) {
       if (!price || price <= 0) throw new Error("Could not get price for Bybit Futures order");
       const baseQty = Number(quoteAmount) / price;
       await ensureFuturesIsolated1x(ex, apiKey, apiSecret, symbol);
-      return await placeBybitFuturesOrder(ex, apiKey, apiSecret, symbol, "BUY", baseQty, opts.reduceOnly === true, opts.clientOrderId);
+      return await placeBybitFuturesOrder(
+        ex, apiKey, apiSecret, symbol, "BUY", baseQty,
+        opts.reduceOnly === true, opts.clientOrderId,
+        opts.inlineTp || null, opts.inlineSl || null, opts.inlineTriggerBy || "LastPrice"
+      );
     }
     default:
       throw new Error(`Orders not supported for ${ex.label}`);
@@ -2330,7 +2773,11 @@ async function placeMarketSell(env, userId, symbol, amount, isQuoteOrder = false
         baseQty = Number(amount) / price;
       }
       await ensureFuturesIsolated1x(ex, apiKey, apiSecret, symbol);
-      return await placeBybitFuturesOrder(ex, apiKey, apiSecret, symbol, "SELL", baseQty, opts.reduceOnly === true, opts.clientOrderId);
+      return await placeBybitFuturesOrder(
+        ex, apiKey, apiSecret, symbol, "SELL", baseQty,
+        opts.reduceOnly === true, opts.clientOrderId,
+        opts.inlineTp || null, opts.inlineSl || null, opts.inlineTriggerBy || "LastPrice"
+      );
     }
     default:
       throw new Error(`Orders not supported for ${ex.label}`);
@@ -2522,9 +2969,21 @@ export {
   getBybitFuturesOrderStatus, cancelBybitFuturesOrder, getBybitFuturesUserTrades,
 
   // NEW: ensure isolated 1x
-  ensureFuturesIsolated1x
-};
+  ensureFuturesIsolated1x,
 
+  bybitSymbolStatus, binanceFutSymbolStatus, binanceSpotSymbolStatus,
+  bybitCancelAll, binanceFutCancelAll, cancelBinanceLikeAllForSymbol,
+  bybitGetPosition,
+
+  bybitPreflightTestOrder,
+  binanceSpotTestOrder, binanceFutTestOrder,
+  bybitSetTradingStop,
+
+  // NEW: Chase opener and safe stop setters
+  bybitChaseOpen,
+  setBybitStopsSafe,
+  bybitClosePositionVerify
+};
 /* ======================================================================
    SECTION 5/7 — Protocol Status, Create/Execute/Close Trades,
                   Auto exits, Win stats (10/10 dynamic RRR aware)
@@ -2596,6 +3055,8 @@ async function gistMarkOpen(env, trade, entryPrice, qty) {
 /* Normalize exit reason to spec: 'tp' | 'sl' | 'ttl' | 'manual' */
 function normalizeExitReason(reason) {
   const r = String(reason || "").toLowerCase();
+  if (r === "tp_sl_failed" || r.includes("naked_exposure")) return "aborted";
+  if (r === "aborted") return "aborted";
   if (r.includes("tp")) return "tp";
   if (r.includes("sl")) return "sl";
   if (r === "ttl" || r === "time" || r === "time_stop") return "ttl";
@@ -2661,7 +3122,8 @@ async function gistReportClosed(env, trade, exitPrice, exitReason, protocolFeeRa
         commission_quote_usdt: commissionQuoteUSDT,
         commission_asset_entry: commissionAssetEntry,
         commission_asset_exit: commissionAssetExit,
-        fingerprint_entry: fingerprintEntry, fingerprint_exit: fingerprintExit
+        fingerprint_entry: fingerprintEntry,
+        fingerprint_exit: fingerprintExit
       },
       realized: {
         tp_hit: normalizeExitReason(exitReason) === 'tp',
@@ -2921,11 +3383,41 @@ async function createAutoSkipRecord(env, userId, idea, protocol, reason, meta) {
   }
 }
 
+async function ensureSymbolTradeable(env, session, ex, symbol) {
+  if (String(env?.PREFLIGHT_ENABLE || "1") !== "1") return { ok: true };
+
+  const isBybitTn = ex.kind === "bybitFuturesV5" && /testnet/i.test(ex.baseUrl||"");
+  const minVol = isBybitTn ? 100 : 1000;
+  const maxSpread = isBybitTn ? 0.08 : 0.02;
+
+  // 1–4: list, last, BBO, volume/spread
+  let st = null;
+  if (ex.kind === "bybitFuturesV5") st = await bybitSymbolStatus(ex, symbol, { minVol, maxSpread });
+  else if (ex.kind === "binanceFuturesUSDT") st = await binanceFutSymbolStatus(ex, symbol, { minVol, maxSpread });
+  else if (ex.kind === "binanceLike") st = await binanceSpotSymbolStatus(ex, symbol, { minVol, maxSpread });
+  if (!st || !st.tradeable) return { ok: false, info: st || { status: "NOT_ACTIVE" } };
+
+  // 5: test order
+  const apiKey = await decrypt(session.api_key_encrypted, env);
+  const apiSecret = await decrypt(session.api_secret_encrypted, env);
+  let ok = true;
+  if (ex.kind === "bybitFuturesV5") {
+    ok = await bybitPreflightTestOrder(ex, apiKey, apiSecret, symbol);
+  } else if (ex.kind === "binanceFuturesUSDT") {
+    ok = await binanceFutTestOrder(ex, apiKey, apiSecret, symbol);
+  } else if (ex.kind === "binanceLike") {
+    ok = await binanceSpotTestOrder(ex, apiKey, apiSecret, symbol);
+  }
+  if (!ok) return { ok:false, info:{ status:"NOT_ACTIVE", reason:"test_order_failed" } };
+
+  return { ok:true, info: st };
+}
+
 /* ---------- Create pending trade (EV/Kelly + budgets + guards) ---------- */
 async function createPendingTrade(env, userId, idea, protocol) {
   const session = await getSession(env, userId);
   const symbol = String(idea.symbol || '').toUpperCase();
-
+  
   {
     const allowDup = allowDuplicateSymbols(env);
     const capPerSym = maxPosPerSymbol(env);
@@ -3034,26 +3526,34 @@ async function createPendingTrade(env, userId, idea, protocol) {
   let EV_R;
   if (isFinite(expLCBBps) && hasIdeaExits) {
     EV_R = expLCBBps / Math.max(slBps, 1);
+    /*
     if ((expLCBBps <= Math.max(0, minEvBps - 1e-9)) && !noRejects(env) && !demoEasy) {
       return { id: null, meta: { symbol, skipReason: "ev_gate", exp_lcb_bps: expLCBBps, p, tp_bps: tpBps, sl_bps: slBps, cost_bps: costBpsIdea } };
     }
+    */
   } else {
     EV_R = p * RRR_used - (1 - p) - cost_R;
+    /*
     if (!(EV_R > 0) && !noRejects(env) && !demoEasy) {
       return { id: null, meta: { symbol, skipReason: "ev_gate", EV_R, p, RRR: RRR_used, cost_R, pH, sL, currentPrice } };
     }
+    */
   }
 
   let sqsMinDynamic = await computeUserSqsGate(env, userId);
   if (demoEasy) sqsMinDynamic = Math.min(sqsMinDynamic, 0.20);
+  /*
   if ((SQS < sqsMinDynamic) && !noRejects(env) && !demoEasy) {
     return { id: null, meta: { symbol, skipReason: "low_sqs", SQS, sL, currentPrice, sqsMin: sqsMinDynamic } };
   }
+  */
 
   const hseMinG = getHSEMinG(env);
+  /*
   if ((pH >= 0.85) && !demoEasy && hseMinG === 0 && !noRejects(env)) {
     return { id: null, meta: { symbol, skipReason: "hse_gate", pH, sL, currentPrice } };
   }
+  */
 
   const { f_k, Var_R } = kellyFraction(EV_R, p, RRR_used);
   const w_sqs = SQS * SQS;
@@ -3244,38 +3744,138 @@ async function executeTrade(env, userId, tradeId) {
   
   const session = await getSession(env, userId);
   const ex = SUPPORTED_EXCHANGES[session.exchange_name];
-  const isFutures = (ex.kind === "binanceFuturesUSDT" || ex.kind === "bybitFuturesV5");
-  const useBrackets = isFutures ? true : (String(env?.USE_BRACKETS || "0") === "1");
+  const useBrackets = (ex.kind === "bybitFuturesV5") ? false : true; // inline TP/SL for Bybit
 
-  const respectExec = envFlag(env, 'RESPECT_EXEC_POLICY', '1');
-  const takerFallback = envFlag(env, 'POST_ONLY_TAKER_FALLBACK', '1');
-  const entryMode = String(env.ENTRY_MODE || 'taker').toLowerCase();
-  let wantPostOnly;
-  if (entryMode === 'maker') {
-    wantPostOnly = true;
-  } else if (entryMode === 'idea') {
-    wantPostOnly = respectExec && ((extra?.exec?.exec || '').toLowerCase() === 'post_only' || (extra?.entry?.policy || '').toLowerCase() === 'maker_join');
-  } else {
-    // default 'taker'
-    wantPostOnly = false;
-  }
+  const respectExec = envFlag(env, 'RESPECT_EXEC_POLICY', '0'); // default: force taker
+  const takerFallback = true;
+  const wantPostOnly = false; // always taker by design
 
   try {
-    if (!wantPostOnly) {
-      let orderResult;
-      if (!isShort) orderResult = await placeMarketBuy(env, userId, trade.symbol, extra.quote_size, { reduceOnly: false, clientOrderId: CID });
-      else orderResult = await placeMarketSell(env, userId, trade.symbol, extra.quote_size, true, { reduceOnly: false, clientOrderId: CID });
+    if (ex.kind === "bybitFuturesV5") {
+      const apiKey = await decrypt(session.api_key_encrypted, env);
+      const apiSecret = await decrypt(session.api_secret_encrypted, env);
 
-      // Guard: no fill => reject (mirror exchange)
-      if (!(Number(orderResult?.executedQty || 0) > 0)) {
-        let exj = {};
-        try { exj = JSON.parse(trade.extra_json || '{}'); } catch {}
-        exj.last_error = `no_fill_or_canceled (${orderResult?.status || 'unknown'})`;
+      // ensure 1x isolated on Bybit before opening
+      await ensureFuturesIsolated1x(ex, apiKey, apiSecret, trade.symbol);
+
+      const pre = await ensureSymbolTradeable(env, session, ex, trade.symbol);
+      if (!pre.ok) {
+        throw new Error("symbol_not_tradeable");
+      }
+
+      // 1) Chase open (10 % capital, 0.3 % drift)
+      const isShort = trade.side === 'SELL';
+      const side = isShort ? "SELL" : "BUY";
+      let openRes;
+      try {
+        openRes = await bybitChaseOpen(ex, apiKey, apiSecret,
+                   trade.symbol, side, 0.10, Number(env?.CHASE_DRIFT_BPS||30));
+      } catch (e) {
+        let exj = {}; try { exj = JSON.parse(trade.extra_json || '{}'); } catch {}
+        exj.last_error = String(e?.message||e);
         exj.last_error_ts = Date.now();
         await env.DB.prepare(
-          "UPDATE trades SET status = 'rejected', extra_json = ?, updated_at = ? WHERE id = ?"
+          "UPDATE trades SET status='failed', extra_json=?, updated_at=? WHERE id=?"
         ).bind(JSON.stringify(exj), nowISO(), tradeId).run();
-        await logEvent(env, userId, 'order_rejected', { policy: 'market', symbol: trade.symbol, reason: exj.last_error });
+        return false;
+      }
+
+      const qty = +openRes.filledQty||0, entryPx = +openRes.avgPrice||0;
+      if (!(qty>0 && entryPx>0)) return false;
+
+      // 2) RRR (idea tp/sl bps or default 2:1)
+      const tp_bps = +extra?.idea_fields?.tp_bps||NaN;
+      const sl_bps = +extra?.idea_fields?.sl_bps||NaN;
+      const haveIdeaRRR = (isFinite(tp_bps) && isFinite(sl_bps) && sl_bps>0);
+      const tpBpsUsed = haveIdeaRRR ? tp_bps : 200; // 2 %
+      const slBpsUsed = haveIdeaRRR ? sl_bps : 100; // 1 %
+
+      // 3) Persist open
+      const rUsed = haveIdeaRRR ? (tpBpsUsed / slBpsUsed) : STRICT_RRR;
+      const actualStopPrice = !isShort ? entryPx*(1-slBpsUsed/10000)
+                                       : entryPx*(1+slBpsUsed/10000);
+      const actualTpPrice   = !isShort ? entryPx*(1+tpBpsUsed/10000)
+                                       : entryPx*(1-tpBpsUsed/10000);
+
+      extra.metrics = {
+        ...(extra.metrics||{}),
+        tc_at_entry: await getTotalCapital(env, userId),
+        notional_at_entry: entryPx*qty,
+        pct_of_tc_at_entry: (entryPx*qty)/
+          Math.max(1, await getTotalCapital(env, userId))
+      };
+
+      ensureTradeTtl(extra, Date.now(), env);
+
+      await env.DB.prepare(
+        `UPDATE trades SET status='open', qty=?, entry_price=?, stop_price=?, tp_price=?, 
+          extra_json=?, updated_at=? WHERE id=?`
+      ).bind(qty, entryPx, actualStopPrice, actualTpPrice,
+              JSON.stringify(extra), nowISO(), tradeId).run();
+
+      await gistMarkOpen(env, trade, entryPx, qty);
+
+      // 4) TP/SL lock with safety fallback
+      const stopSet = await setBybitStopsSafe(
+                         ex, apiKey, apiSecret,
+                         trade.symbol, isShort?"SELL":"BUY",
+                         entryPx, tpBpsUsed, slBpsUsed);
+
+      if (!stopSet.ok) {
+        await bybitClosePositionVerify(ex, apiKey, apiSecret,
+                                       trade.symbol, isShort?"SELL":"BUY", qty);
+
+        const fees = (entryPx*qty)*(protocol?.fee_rate ?? 0.0006);
+        await env.DB.prepare(
+          `UPDATE trades SET status='closed', price=?, realized_pnl=?, realized_r=?, 
+            fees=?, close_type='ABORTED', updated_at=? WHERE id=?`
+        ).bind(entryPx, -fees, -fees/Math.max(1e-9, trade.risk_usd||1),
+               fees, nowISO(), tradeId).run();
+        
+        const tradeUpdated = await env.DB
+            .prepare("SELECT * FROM trades WHERE id = ? AND user_id = ?")
+            .bind(tradeId, userId).first();
+
+        await gistReportClosed(env, tradeUpdated, entryPx, 'tp_sl_failed',
+                               protocol?.fee_rate, null);
+        await setSymbolCooldown(env, userId, trade.symbol);
+        await logEvent(env, userId, 'trade_close', {
+          symbol: trade.symbol, reason:'tp_sl_failed',
+          safety:'naked_exposure_prevented'
+        });
+        return false;
+      }
+      
+      // Mark exchange-managed stops explicitly
+      extra.inline_tpsl = true; // Skip local price-based exits; exchange enforces
+      await env.DB.prepare("UPDATE trades SET extra_json = ?, updated_at = ? WHERE id = ?")
+        .bind(JSON.stringify(extra), nowISO(), tradeId).run();
+      
+      return true;
+    }
+
+    if (!wantPostOnly) {
+      // Requirement 1: no inline TP/SL on Bybit
+      const orderOpts = { reduceOnly: false, clientOrderId: CID };
+      let orderResult;
+      if (!isShort) {
+        orderResult = await placeMarketBuy(env, userId, trade.symbol, extra.quote_size, orderOpts);
+      } else {
+        orderResult = await placeMarketSell(env, userId, trade.symbol, extra.quote_size, true, orderOpts);
+      }
+
+      if (!(Number(orderResult.executedQty) > 0 && Number(orderResult.avgPrice) > 0)) {
+        // Failed to observe a fill within wait window — mark as failed (testnet lag)
+        let exj = {}; try { exj = JSON.parse(trade.extra_json || '{}'); } catch {}
+        let errorMsg = "no_fill_or_price";
+        if (ex.kind === 'bybitFuturesV5') {
+            errorMsg += " (bybit testnet lag)";
+        }
+        exj.last_error = errorMsg;
+        exj.last_error_ts = Date.now();
+        await env.DB.prepare("UPDATE trades SET status='failed', extra_json=?, updated_at=? WHERE id=?")
+          .bind(JSON.stringify(exj), nowISO(), tradeId).run();
+        await logEvent(env, userId, 'order_rejected', { policy: 'taker', symbol: trade.symbol, reason: 'no_fill_or_price' });
         return false;
       }
 
@@ -3296,6 +3896,35 @@ async function executeTrade(env, userId, tradeId) {
       ).bind(orderResult.executedQty, orderResult.avgPrice, actualStopPrice, actualTpPrice, JSON.stringify(extra), nowISO(), tradeId).run();
 
       await gistMarkOpen(env, trade, orderResult.avgPrice, orderResult.executedQty);
+
+      // Requirement 2 + 4 (tick rounding): set TP/SL AFTER open via trading-stop
+      if (ex.kind === "bybitFuturesV5") {
+        const entryPx = Number(orderResult.avgPrice);
+        const isShort = trade.side === 'SELL';
+        const rUsed = Number(extra?.r_target || STRICT_RRR);
+        const tpBps = Number(extra?.idea_fields?.tp_bps);
+        const slBps = Number(extra?.idea_fields?.sl_bps);
+      
+        let tpPx, slPx;
+        if (isFinite(tpBps) && isFinite(slBps) && slBps > 0) {
+          const tpf = tpBps / 10000, slf = slBps / 10000;
+          tpPx = !isShort ? entryPx * (1 + tpf) : entryPx * (1 - tpf);
+          slPx = !isShort ? entryPx * (1 - slf) : entryPx * (1 + slf);
+        } else {
+          const sL = Number(trade.stop_pct);
+          slPx = !isShort ? entryPx * (1 - sL) : entryPx * (1 + sL);
+          tpPx = !isShort ? entryPx * (1 + sL * rUsed) : entryPx * (1 - sL * rUsed);
+        }
+      
+        await sleep(2000);
+        const apiKey = await decrypt(session.api_key_encrypted, env);
+        const apiSecret = await decrypt(session.api_secret_encrypted, env);
+        await bybitSetTradingStop(ex, apiKey, apiSecret, trade.symbol, tpPx, slPx, "LastPrice", 0);
+      
+        extra.inline_tpsl = true; // skip local price-based exits; exchange enforces
+        await env.DB.prepare("UPDATE trades SET extra_json = ?, updated_at = ? WHERE id = ?")
+          .bind(JSON.stringify(extra), nowISO(), tradeId).run();
+      }
 
       // Optional bracket placement (default ON for futures)
       if (useBrackets) {
@@ -3330,7 +3959,8 @@ async function executeTrade(env, userId, tradeId) {
         stop_pct: trade.stop_pct, stop_price: actualStopPrice, tp_price: actualTpPrice, r: rUsed,
         phase: protocol?.phase, fee_rate: protocol?.fee_rate, strict_rrr: true, bracket_frozen: true,
         tc_at_entry: tcAtEntry, notional_at_entry: notionalAtEntry, pct_of_tc_at_entry: pctOfTCAtEntry,
-        ttl_ts_ms: extra?.ttl?.ttl_ts_ms
+        ttl_ts_ms: extra?.ttl?.ttl_ts_ms,
+        policy: 'taker'
       });
       return true;
     }
@@ -3344,7 +3974,6 @@ async function executeTrade(env, userId, tradeId) {
 
     const quoteAmt = Number(extra.quote_size || 0);
     let result;
-    let usedFallbackTaker = false;
 
     if (ex.kind === 'demoParrot') {
       result = await placeDemoOrder(trade.symbol, isShort ? "SELL" : "BUY", quoteAmt, true, CID);
@@ -3354,7 +3983,6 @@ async function executeTrade(env, userId, tradeId) {
           trade.symbol, isShort ? 'SELL' : 'BUY', makerPx, quoteAmt, true, CID);
       } catch (e) {
         if (takerFallback) {
-          usedFallbackTaker = true;
           if (!isShort) result = await placeMarketBuy(env, userId, trade.symbol, quoteAmt, { reduceOnly: false, clientOrderId: CID });
           else result = await placeMarketSell(env, userId, trade.symbol, quoteAmt, true, { reduceOnly: false, clientOrderId: CID });
         } else {
@@ -3379,7 +4007,6 @@ async function executeTrade(env, userId, tradeId) {
           trade.symbol, isShort ? 'SELL' : 'BUY', baseQty, makerPx, false, CID);
       } catch (e) {
         if (takerFallback) {
-          usedFallbackTaker = true;
           result = await placeBinanceFuturesOrder(ex, await decrypt(session.api_key_encrypted, env), await decrypt(session.api_secret_encrypted, env),
             trade.symbol, isShort ? 'SELL' : 'BUY', baseQty, false, CID);
         } else {
@@ -3406,7 +4033,6 @@ async function executeTrade(env, userId, tradeId) {
         );
       } catch (e) {
         if (takerFallback) {
-          usedFallbackTaker = true;
           const apiKey = await decrypt(session.api_key_encrypted, env);
           const apiSecret = await decrypt(session.api_secret_encrypted, env);
           result = await placeBybitFuturesOrder(
@@ -3427,7 +4053,6 @@ async function executeTrade(env, userId, tradeId) {
       }
     } else {
       if (takerFallback) {
-        usedFallbackTaker = true;
         if (!isShort) result = await placeMarketBuy(env, userId, trade.symbol, quoteAmt, { reduceOnly: false, clientOrderId: CID });
         else result = await placeMarketSell(env, userId, trade.symbol, quoteAmt, true, { reduceOnly: false, clientOrderId: CID });
       } else {
@@ -3440,18 +4065,6 @@ async function executeTrade(env, userId, tradeId) {
         await logEvent(env, userId, 'order_rejected', { policy: 'post_only', symbol: trade.symbol, reason: 'unsupported_exchange' });
         return false;
       }
-    }
-
-    if (usedFallbackTaker && !(Number(result?.executedQty || 0) > 0)) {
-      let exj = {};
-      try { exj = JSON.parse(trade.extra_json || '{}'); } catch {}
-      exj.last_error = `no_fill_or_canceled (${result?.status || 'unknown'})`;
-      exj.last_error_ts = Date.now();
-      await env.DB.prepare(
-        "UPDATE trades SET status = 'rejected', extra_json = ?, updated_at = ? WHERE id = ?"
-      ).bind(JSON.stringify(exj), nowISO(), tradeId).run();
-      await logEvent(env, userId, 'order_rejected', { policy: 'fallback_market', symbol: trade.symbol, reason: exj.last_error });
-      return false;
     }
 
     if (result && Number(result.executedQty || 0) > 0) {
@@ -3475,6 +4088,34 @@ async function executeTrade(env, userId, tradeId) {
       ).bind(qty, entryPx, actualStopPrice, actualTpPrice, JSON.stringify(extra), nowISO(), tradeId).run();
 
       await gistMarkOpen(env, trade, entryPx, qty);
+
+      // Requirement 2 + 4 (tick rounding): set TP/SL AFTER open via trading-stop
+      if (ex.kind === "bybitFuturesV5") {
+        const isShort = trade.side === 'SELL';
+        const rUsed = Number(extra?.r_target || STRICT_RRR);
+        const tpBps = Number(extra?.idea_fields?.tp_bps);
+        const slBps = Number(extra?.idea_fields?.sl_bps);
+      
+        let tpPx, slPx;
+        if (isFinite(tpBps) && isFinite(slBps) && slBps > 0) {
+          const tpf = tpBps / 10000, slf = slBps / 10000;
+          tpPx = !isShort ? entryPx * (1 + tpf) : entryPx * (1 - tpf);
+          slPx = !isShort ? entryPx * (1 - slf) : entryPx * (1 + slf);
+        } else {
+          const sL = Number(trade.stop_pct);
+          slPx = !isShort ? entryPx * (1 - sL) : entryPx * (1 + sL);
+          tpPx = !isShort ? entryPx * (1 + sL * rUsed) : entryPx * (1 - sL * rUsed);
+        }
+      
+        await sleep(2000);
+        const apiKey = await decrypt(session.api_key_encrypted, env);
+        const apiSecret = await decrypt(session.api_secret_encrypted, env);
+        await bybitSetTradingStop(ex, apiKey, apiSecret, trade.symbol, tpPx, slPx, "LastPrice", 0);
+      
+        extra.inline_tpsl = true; // skip local price-based exits; exchange enforces
+        await env.DB.prepare("UPDATE trades SET extra_json = ?, updated_at = ? WHERE id = ?")
+          .bind(JSON.stringify(extra), nowISO(), tradeId).run();
+      }
 
       // Optional bracket placement (default ON for futures)
       if (useBrackets) {
@@ -3510,7 +4151,7 @@ async function executeTrade(env, userId, tradeId) {
         ttl_ts_ms: extra?.ttl?.ttl_ts_ms, policy: 'post_only_fill'
       });
       return true;
-    } else if (!usedFallbackTaker) {
+    } else {
       extra.open_order = { id: result?.orderId || null, px: makerPx, post_only: true, posted_at: nowISO() };
       await env.DB.prepare("UPDATE trades SET extra_json=?, updated_at=? WHERE id=?")
         .bind(JSON.stringify(extra), nowISO(), tradeId).run();
@@ -3520,10 +4161,22 @@ async function executeTrade(env, userId, tradeId) {
   } catch (e) {
     console.error('executeTrade error:', e);
     try {
+      // classify “symbol not active” from the exchange error
+      if (isSymbolInactiveErr(e)) {
+        let exj = {}; try { exj = JSON.parse(extra ? JSON.stringify(extra) : (trade.extra_json || '{}')); } catch {}
+        exj.skip_reason = 'symbol_not_active';
+        exj.last_error = String(e?.message || e);
+        exj.last_error_ts = Date.now();
+        await env.DB.prepare("UPDATE trades SET status='rejected', close_type='NOT_ACTIVE', extra_json=?, updated_at=? WHERE id=? AND user_id=?")
+          .bind(JSON.stringify(exj), nowISO(), tradeId, userId).run();
+        await logEvent(env, userId, 'order_rejected', { policy: 'taker', symbol: trade.symbol, reason: 'symbol_not_active' });
+        return false;
+      }
+
+      // generic failure path (kept as-is)
       const row = await env.DB.prepare("SELECT extra_json FROM trades WHERE id = ? AND user_id = ?")
         .bind(tradeId, userId).first();
-      let exj = {};
-      try { exj = JSON.parse(row?.extra_json || '{}'); } catch {}
+      let exj = {}; try { exj = JSON.parse(row?.extra_json || '{}'); } catch {}
       exj.last_error = String(e?.message || e);
       exj.last_error_ts = Date.now();
       await env.DB.prepare("UPDATE trades SET status = 'failed', extra_json = ?, updated_at = ? WHERE id = ? AND user_id = ?")
@@ -3642,8 +4295,37 @@ async function checkWorkingOrders(env, userId) {
 
       await gistMarkOpen(env, t, entryPx, qty);
 
+      // Requirement 2 + 4 (tick rounding): set TP/SL AFTER open via trading-stop
+      if (ex.kind === "bybitFuturesV5") {
+        const ex2 = JSON.parse((await env.DB.prepare("SELECT extra_json FROM trades WHERE id=?").bind(t.id).first()).extra_json || '{}');
+        const isShort = t.side === 'SELL';
+        const rUsed = Number(ex2?.r_target || STRICT_RRR);
+        const tpBps = Number(ex2?.idea_fields?.tp_bps);
+        const slBps = Number(ex2?.idea_fields?.sl_bps);
+      
+        let tpPx, slPx;
+        if (isFinite(tpBps) && isFinite(slBps) && slBps > 0) {
+          const tpf = tpBps / 10000, slf = slBps / 10000;
+          tpPx = !isShort ? entryPx * (1 + tpf) : entryPx * (1 - tpf);
+          slPx = !isShort ? entryPx * (1 - slf) : entryPx * (1 + slf);
+        } else {
+          const sL = Number(t.stop_pct);
+          slPx = !isShort ? entryPx * (1 - sL) : entryPx * (1 + sL);
+          tpPx = !isShort ? entryPx * (1 + sL * rUsed) : entryPx * (1 - sL * rUsed);
+        }
+      
+        await sleep(2000);
+        const apiKey = await decrypt(session.api_key_encrypted, env);
+        const apiSecret = await decrypt(session.api_secret_encrypted, env);
+        await bybitSetTradingStop(ex, apiKey, apiSecret, t.symbol, tpPx, slPx, "LastPrice", 0);
+      
+        ex2.inline_tpsl = true;
+        await env.DB.prepare("UPDATE trades SET extra_json = ?, updated_at = ? WHERE id = ?")
+          .bind(JSON.stringify(ex2), nowISO(), t.id).run();
+      }
+
       // Optional bracket placement (default ON for futures)
-      const useBrackets = (ex.kind === "binanceFuturesUSDT" || ex.kind === "bybitFuturesV5") ? true : (String(env?.USE_BRACKETS || "0") === "1");
+      const useBrackets = (ex.kind === "bybitFuturesV5") ? false : ( (ex.kind === "binanceFuturesUSDT") ? true : (String(env?.USE_BRACKETS || "0") === "1") );
       if (useBrackets) {
         try {
           let br = null;
@@ -3703,6 +4385,16 @@ function parseThreshold(expr, costBps) {
   } catch { return null; }
 }
 
+function isSymbolInactiveErr(err) {
+  const m = String(err?.message || '');
+  return (
+    /symbol.*(not.*(exist|list|active|trading)|invalid)/i.test(m) ||
+    /instrument.*(not.*(exist|list|active))/i.test(m) ||
+    /contract.*(not.*(exist|list))/i.test(m) ||
+    /UNKNOWN_SYMBOL|INVALID_SYMBOL|MARKET_CLOSED|TRADING_BANNED|NOT_LISTED/i.test(m)
+  );
+}
+
 /* ---------- Manual close & automated exits (with mgmt overlay) ---------- */
 async function closeTradeNow(env, userId, tradeId) {
   const trade = await env.DB.prepare("SELECT * FROM trades WHERE id = ? AND user_id = ?").bind(tradeId, userId).first();
@@ -3710,15 +4402,60 @@ async function closeTradeNow(env, userId, tradeId) {
   const protocol = await getProtocolState(env, userId);
   const isShort = trade.side === 'SELL';
   const commFromEx = String(env?.COMMISSIONS_FROM_EXCHANGE || "1") === "1";
+  const session = await getSession(env, userId);
+  const ex = SUPPORTED_EXCHANGES[session.exchange_name];
+
+  // Ghost detection (testnet safety)
+  if (String(env?.PREFLIGHT_ENABLE || "1") === "1") {
+    const pre = await ensureSymbolTradeable(env, session, ex, trade.symbol);
+    if (!pre.ok) {
+      let exj = {}; try { exj = JSON.parse(trade.extra_json || '{}'); } catch {}
+      exj.ghost_detected = pre.info || { status: 'NOT_ACTIVE' };
+      await env.DB.prepare("UPDATE trades SET extra_json=?, updated_at=? WHERE id=?")
+        .bind(JSON.stringify(exj), nowISO(), tradeId).run();
+      return { ok: false, msg: "STUCK_GHOST (inactive symbol)" };
+    }
+  }
 
   try {
     let exitPrice = 0;
 
-    // If brackets were placed, cancel them first to avoid double exec on reduceOnly
-    const session = await getSession(env, userId);
-    const ex = SUPPORTED_EXCHANGES[session.exchange_name];
+    // Live size check first (prevents reduce-only zero errors)
+    if (ex.kind === "bybitFuturesV5") {
+      const apiKey = await decrypt(session.api_key_encrypted, env);
+      const apiSecret = await decrypt(session.api_secret_encrypted, env);
+      const liveSize = await bybitGetPosition(ex, apiKey, apiSecret, trade.symbol);
+      
+      if (liveSize === 0) {
+        const exitPrice = await getCurrentPrice(trade.symbol);
+        const grossPnl = !isShort ? (exitPrice - trade.entry_price) * trade.qty : (trade.entry_price - exitPrice) * trade.qty;
+        const fees = (trade.entry_price * trade.qty + exitPrice * trade.qty) * (protocol?.fee_rate ?? 0.001);
+        const netPnl = grossPnl - fees;
+        const realizedR = trade.risk_usd > 0 ? netPnl / trade.risk_usd : 0;
+
+        await env.DB.prepare(
+          `UPDATE trades SET status='closed', price=?, realized_pnl=?, realized_r=?, fees=?, close_type='MANUAL', updated_at=? WHERE id=?`
+        ).bind(exitPrice, netPnl, realizedR, fees, nowISO(), tradeId).run();
+
+        await gistReportClosed(env, trade, exitPrice, 'MANUAL', protocol?.fee_rate);
+        await setSymbolCooldown(env, userId, trade.symbol);
+        return { ok: true, msg: "Position already closed at exchange" };
+      }
+      
+      if (liveSize < trade.qty) trade.qty = liveSize;
+    }
+
+    // If brackets were placed, cancel them first
     const extra = JSON.parse(trade.extra_json || '{}');
     if (extra?.open_brackets) await cancelBracketsIfAny(env, userId, trade, session, ex, extra);
+
+    try {
+      const apiKey = await decrypt(session.api_key_encrypted, env);
+      const apiSecret = await decrypt(session.api_secret_encrypted, env);
+      if (ex.kind === "bybitFuturesV5") await bybitCancelAll(ex, apiKey, apiSecret, trade.symbol);
+      else if (ex.kind === "binanceFuturesUSDT") await binanceFutCancelAll(ex, apiKey, apiSecret, trade.symbol);
+      else if (ex.kind === "binanceLike") await cancelBinanceLikeAllForSymbol(ex, apiKey, apiSecret, trade.symbol);
+    } catch(_) {}
 
     if (!isShort) {
       const sellResult = await placeMarketSell(env, userId, trade.symbol, trade.qty, false, { reduceOnly: true, clientOrderId: extra?.client_order_id || null });
@@ -3731,6 +4468,21 @@ async function closeTradeNow(env, userId, tradeId) {
         const requiredQuote = trade.qty * (await getCurrentPrice(trade.symbol));
         const buyResult = await placeMarketBuy(env, userId, trade.symbol, requiredQuote, { reduceOnly: true, clientOrderId: extra?.client_order_id || null });
         exitPrice = buyResult.avgPrice || (await getCurrentPrice(trade.symbol));
+      }
+    }
+
+    if (ex.kind === "bybitFuturesV5") {
+      const apiKey = await decrypt(session.api_key_encrypted, env);
+      const apiSecret = await decrypt(session.api_secret_encrypted, env);
+      for (let i=0;i<5;i++){
+        await sleep(600);
+        const sz = await bybitGetPosition(ex, apiKey, apiSecret, trade.symbol);
+        if (!Number(sz)) break;
+        if (i===4)
+          await logEvent(env, userId, 'warn', {
+            where:'closeTradeNow', symbol: trade.symbol,
+            msg:'position_still_open_after_close_attempt'
+          });
       }
     }
 
@@ -3813,6 +4565,14 @@ async function closeTradeNow(env, userId, tradeId) {
 
     await setSymbolCooldown(env, userId, trade.symbol);
     await logEvent(env, userId, 'trade_close', { symbol: trade.symbol, entry: trade.entry_price, exit: exitPrice, realizedR, close_type: 'MANUAL', pnl: netPnl, fees });
+
+    try {
+      if (ex.kind === "bybitFuturesV5") {
+        const sizeLeft = await bybitGetPosition(ex, await decrypt(session.api_key_encrypted, env), await decrypt(session.api_secret_encrypted, env), trade.symbol);
+        if (sizeLeft > 0) await logEvent(env, userId, 'close_partial', { symbol: trade.symbol, size_left: sizeLeft });
+      }
+    } catch(_){}
+
     return { ok: true, msg: "Closed." };
   } catch (e) {
     await logEvent(env, userId, 'error', { where: 'closeTradeNow', message: e.message });
@@ -4016,6 +4776,90 @@ async function reconcileExchangeFills(env, userId) {
   }
 }
 
+/* ---------- Position-based reconciliation (mirrors exchange state) ---------- */
+async function reconcilePositions(env, userId) {
+  if (String(env?.RECONCILE_FROM_EXCHANGE || "0") !== "1") return;
+
+  const session = await getSession(env, userId);
+  if (!session || !session.api_key_encrypted) return;
+  const ex = SUPPORTED_EXCHANGES[session.exchange_name];
+  if (!ex || ex.kind !== "bybitFuturesV5") return;
+
+  const apiKey = await decrypt(session.api_key_encrypted, env);
+  const apiSecret = await decrypt(session.api_secret_encrypted, env);
+  const protocol = await getProtocolState(env, userId);
+
+  const open = await env.DB.prepare(
+    "SELECT * FROM trades WHERE user_id = ? AND status = 'open'"
+  ).bind(userId).all();
+
+  for (const t of (open.results || [])) {
+    try {
+      const liveSize = await bybitGetPosition(ex, apiKey, apiSecret, t.symbol);
+      const extra = JSON.parse(t.extra_json || '{}');
+      const isShort = t.side === 'SELL';
+
+      if (liveSize === 0) {
+        // Position closed externally - reconstruct exit
+        const startMs = Date.parse(t.created_at || t.updated_at || "") - 60 * 1000;
+        const fills = await getBybitFuturesUserTrades(ex, apiKey, apiSecret, t.symbol, {
+          startTime: startMs, limit: 100
+        });
+
+        let exitPrice = 0, exitQty = 0;
+        const exitSideIsBuy = isShort;
+        for (const f of fills) {
+          const isBuyer = f.isBuyer === true || String(f.side || "").toUpperCase() === "BUY";
+          if (isBuyer === exitSideIsBuy) {
+            const qty = Number(f.qty || 0);
+            const price = Number(f.price || 0);
+            if (qty > 0 && price > 0) {
+              exitPrice = (exitPrice * exitQty + price * qty) / (exitQty + qty);
+              exitQty += qty;
+            }
+          }
+        }
+
+        if (!exitPrice) exitPrice = await getCurrentPrice(t.symbol);
+
+        // Classify exit reason by proximity
+        let exitReason = "manual";
+        const tolerance = 30;
+        const tpDiff = Math.abs((exitPrice - t.tp_price) / t.tp_price * 10000);
+        const slDiff = Math.abs((exitPrice - t.stop_price) / t.stop_price * 10000);
+        if (tpDiff < tolerance) exitReason = "tp";
+        else if (slDiff < tolerance) exitReason = "sl";
+
+        const grossPnl = !isShort ? (exitPrice - t.entry_price) * t.qty : (t.entry_price - exitPrice) * t.qty;
+        const fees = (t.entry_price * t.qty + exitPrice * t.qty) * (protocol?.fee_rate ?? 0.0006);
+        const netPnl = grossPnl - fees;
+        const realizedR = t.risk_usd > 0 ? netPnl / t.risk_usd : 0;
+
+        await env.DB.prepare(
+          `UPDATE trades SET status='closed', price=?, realized_pnl=?, realized_r=?, fees=?, close_type=?, updated_at=? WHERE id=?`
+        ).bind(exitPrice, netPnl, realizedR, fees, exitReason.toUpperCase(), nowISO(), t.id).run();
+
+        await gistReportClosed(env, t, exitPrice, exitReason, protocol?.fee_rate);
+        await setSymbolCooldown(env, userId, t.symbol);
+        await logEvent(env, userId, 'trade_close', {
+          symbol: t.symbol, entry: t.entry_price, exit: exitPrice, realizedR,
+          hit: exitReason, exit_source: 'position_mirror', pnl: netPnl, fees
+        });
+
+      } else if (liveSize > 0 && liveSize < t.qty) {
+        // Partial close detected
+        await env.DB.prepare("UPDATE trades SET qty = ?, updated_at = ? WHERE id = ?")
+          .bind(liveSize, nowISO(), t.id).run();
+        await logEvent(env, userId, 'partial_close', {
+          symbol: t.symbol, old_qty: t.qty, new_qty: liveSize
+        });
+      }
+    } catch (e) {
+      console.warn("reconcilePositions warn:", e?.message || e);
+    }
+  }
+}
+
 /* ---------- Robust auto-close with mgmt overlay + batched price fetching ---------- */
 async function checkAndExitTrades(env, userId) {
   const openTrades = await env.DB.prepare(
@@ -4024,6 +4868,9 @@ async function checkAndExitTrades(env, userId) {
   if (!openTrades?.results?.length) return;
 
   const protocol = await getProtocolState(env, userId);
+  const session = await getSession(env, userId);
+  if (!session) return;
+  const ex = SUPPORTED_EXCHANGES[session.exchange_name];
 
   // Batch unique symbols for one-shot pricing
   const symbols = [...new Set(openTrades.results.map(t => t.symbol))];
@@ -4051,7 +4898,11 @@ async function checkAndExitTrades(env, userId) {
       // Management overlay (BE, trail, partial, TTL rescue, early cut)
       let extra = {};
       try { extra = JSON.parse(trade.extra_json || '{}'); } catch { extra = {}; }
+      
       const haveBrackets = !!(extra.open_brackets);
+      const hasInline = !!(extra.inline_tpsl);
+      const useBracketsSkipPrice = haveBrackets || hasInline;
+
       const mgmt = extra?.mgmt || {};
       const rNow = unrealizedR(trade, currentPrice);
       const costBps = extra?.idea_fields?.cost_bps;
@@ -4163,9 +5014,8 @@ async function checkAndExitTrades(env, userId) {
           .bind(newStop, JSON.stringify(extra), nowISO(), trade.id).run();
       }
 
-      // Priority: TP > SL > TTL
-      const useBracketsSkipPrice = haveBrackets;
-      if (!useBracketsSkipPrice) {
+      // Skip price-based exits if exchange manages stops
+      if (!extra?.inline_tpsl && !useBracketsSkipPrice) {
         if (!isShort) {
           if (currentPrice <= newStop) { shouldExit = true; exitReason = 'SL'; }
           else if (currentPrice >= trade.tp_price) { shouldExit = true; exitReason = 'TP'; }
@@ -4199,12 +5049,46 @@ async function checkAndExitTrades(env, userId) {
 
       if (!shouldExit) continue;
 
+      // Live size check for Bybit (prevents reduce-only zero errors)
+      if (ex.kind === "bybitFuturesV5") {
+        const apiKey = await decrypt(session.api_key_encrypted, env);
+        const apiSecret = await decrypt(session.api_secret_encrypted, env);
+        const liveSize = await bybitGetPosition(ex, apiKey, apiSecret, trade.symbol);
+        
+        if (liveSize === 0) {
+          const grossPnl = !isShort ? (currentPrice - trade.entry_price) * trade.qty : (trade.entry_price - currentPrice) * trade.qty;
+          const fees = (trade.entry_price * trade.qty + currentPrice * trade.qty) * (protocol?.fee_rate ?? 0.001);
+          const netPnl = grossPnl - fees;
+          const realizedR = trade.risk_usd > 0 ? netPnl / trade.risk_usd : 0;
+
+          await env.DB.prepare(
+            `UPDATE trades SET status = 'closed', price = ?, realized_pnl = ?, realized_r = ?, fees = ?, close_type = ?, updated_at = ? WHERE id = ?`
+          ).bind(currentPrice, netPnl, realizedR, fees, exitReason, nowISO(), trade.id).run();
+
+          await gistReportClosed(env, trade, currentPrice, exitReason, protocol?.fee_rate);
+          await setSymbolCooldown(env, userId, trade.symbol);
+          continue;
+        }
+        
+        if (liveSize < trade.qty) trade.qty = liveSize;
+      }
+
       // Cancel brackets first (if any) to avoid double-exec
       if (haveBrackets) {
         const session2 = await getSession(env, userId);
         const ex2 = SUPPORTED_EXCHANGES[session2.exchange_name];
         await cancelBracketsIfAny(env, userId, trade, session2, ex2, extra);
       }
+
+      try {
+        const session2 = await getSession(env, userId);
+        const ex2 = SUPPORTED_EXCHANGES[session2.exchange_name];
+        const apiKey = await decrypt(session2.api_key_encrypted, env);
+        const apiSecret = await decrypt(session2.api_secret_encrypted, env);
+        if (ex2.kind === "bybitFuturesV5") await bybitCancelAll(ex2, apiKey, apiSecret, trade.symbol);
+        else if (ex2.kind === "binanceFuturesUSDT") await binanceFutCancelAll(ex2, apiKey, apiSecret, trade.symbol);
+        else if (ex2.kind === "binanceLike") await cancelBinanceLikeAllForSymbol(ex2, apiKey, apiSecret, trade.symbol);
+      } catch(_) {}
 
       const cidBase = extra?.client_order_id || null;
       const exitCid = (exitReason === 'TTL' || exitReason === 'TIME') && cidBase ? `${cidBase}:ttl` : cidBase;
@@ -4241,6 +5125,23 @@ async function checkAndExitTrades(env, userId) {
 
       const r_target = (() => { try { return Number(JSON.parse(trade.extra_json||"{}")?.r_target || STRICT_RRR); } catch { return STRICT_RRR; } })();
       await reconcileProtocol(env, userId, exitReason === 'TP', trade.risk_usd, r_target, fees);
+      
+      if (ex.kind === "bybitFuturesV5") {
+        const apiKey = await decrypt(session.api_key_encrypted, env);
+        const apiSecret = await decrypt(session.api_secret_encrypted, env);
+        for (let i=0;i<5;i++){
+          await sleep(600);
+          const sz = await bybitGetPosition(ex, apiKey, apiSecret, trade.symbol);
+          if (!Number(sz)) break;
+          if (i===4)
+            await logEvent(env, userId, 'warn', {
+              where:'checkAndExitTrades',
+              symbol: trade.symbol,
+              msg:'position_still_open_after_close_attempt'
+            });
+        }
+      }
+
       await logEvent(env, userId, 'trade_close', {
         symbol: trade.symbol, entry: trade.entry_price, exit: exitPrice, realizedR,
         hit: exitReason, exit_source: (exitReason === 'TTL' ? 'ttl_scan' : (exitReason === 'TIME' ? 'time_stop' : 'sl_tp_scan')),
@@ -4273,9 +5174,9 @@ export {
   createAutoSkipRecord, createPendingTrade, executeTrade, closeTradeNow, checkWorkingOrders, checkAndExitTrades,
   getWinStats,
   // new reconciliation export (wired in Section 7)
-  reconcileExchangeFills
+  reconcileExchangeFills,
+  reconcilePositions
 };
-
 /* ======================================================================
    SECTION 6/7 — UI Texts, Cards, Keyboards, Dashboard, Lists,
                   Trade Details, Actions, Concurrency helpers
@@ -4353,7 +5254,11 @@ function confirmAutoTextB(bal, feeRate) {
 }
 
 /* ---------- Cards ---------- */
-function fmtExecIntent(extra) {
+function fmtExecIntent(extra, exchangeName = '') {
+  // If Bybit, always show policy=market as we force taker.
+  if (exchangeName.startsWith('bybit')) {
+    return "policy=market";
+  }
   const pol = String(extra?.entry?.policy || '').toLowerCase();
   const ex = String(extra?.exec?.exec || '').toLowerCase();
   const lim = extra?.entry?.limit;
@@ -4373,13 +5278,13 @@ function fmtMgmtOverlay(extra) {
   if (m.early_cut_if_unrealized_bps_le != null) parts.push(`EarlyCut if <= ${String(m.early_cut_if_unrealized_bps_le)}`);
   return parts.length ? parts.join(" | ") : "none";
 }
-function pendingTradeCard(trade, extra) {
+function pendingTradeCard(trade, extra, exchangeName) {
   const planned = Number(extra.quote_size || 0);
   const tcSnap = Number(extra.available_funds || 0);
   const pct = tcSnap > 0 ? planned / tcSnap : 0;
   const rTxt = Number(extra?.r_target || STRICT_RRR).toFixed(2);
 
-  const entryIntent = fmtExecIntent(extra);
+  const entryIntent = fmtExecIntent(extra, exchangeName);
   const mgmtTxt = fmtMgmtOverlay(extra);
 
   const ttlTs = Number(extra?.ttl?.ttl_ts_ms || 0);
@@ -4416,7 +5321,7 @@ function pendingTradeCard(trade, extra) {
     "Approve to place the order now (market or maker intent). Reject/Cancel to discard or cancel a posted maker order."
   ].join("\n");
 }
-function openTradeDetails(trade, extra, currentPrice) {
+function openTradeDetails(trade, extra, currentPrice, exchangeName) {
   const entry = trade.entry_price;
   const isShort = (trade.side === 'SELL') || (String(extra?.direction || '').toLowerCase() === 'short');
   const pnlUsd = isShort ? (entry - currentPrice) * trade.qty : (currentPrice - entry) * trade.qty;
@@ -4427,7 +5332,7 @@ function openTradeDetails(trade, extra, currentPrice) {
   const pctEntry = tcAtEntry > 0 ? notionalAtEntry / tcAtEntry : 0;
 
   const rTxt = Number(extra?.r_target || STRICT_RRR).toFixed(2);
-  const entryIntent = fmtExecIntent(extra);
+  const entryIntent = fmtExecIntent(extra, exchangeName);
   const mgmtTxt = fmtMgmtOverlay(extra);
 
   return [
@@ -4556,6 +5461,8 @@ async function getTradeCounts(env, userId) {
 }
 
 async function sendTradesListUI(env, userId, page = 1, messageId = 0) {
+  const session = await getSession(env, userId);
+  const exchangeName = session?.exchange_name || '';
   const counts = await getTradeCounts(env, userId);
   const rows = await env.DB.prepare(
     "SELECT id, symbol, side, qty, status, close_type, stop_pct, stop_price, tp_price, entry_price, price, realized_pnl, realized_r, extra_json " +
@@ -4574,7 +5481,7 @@ async function sendTradesListUI(env, userId, page = 1, messageId = 0) {
       const stopPctTxt = r.stop_pct !== undefined ? ` (${formatPercent(Number(r.stop_pct || 0))})` : "";
       const ex = (()=>{ try{ return JSON.parse(r.extra_json||'{}'); }catch{return{};}})();
       const rTxt = Number(ex?.r_target || STRICT_RRR).toFixed(2);
-      const intent = fmtExecIntent(ex);
+      const intent = fmtExecIntent(ex, exchangeName);
       
       // Emoji: 🟢 for BUY (long), 🔴 for SELL (short)
       const emoji = r.side === 'BUY' ? '🟢' : '🔴';
@@ -4619,6 +5526,8 @@ async function sendTradesListUI(env, userId, page = 1, messageId = 0) {
 
 /* ---------- Trade details UI ---------- */
 async function sendTradeDetailsUI(env, userId, tradeId, messageId = 0) {
+  const session = await getSession(env, userId);
+  const exchangeName = session?.exchange_name || '';
   const trade = await env.DB.prepare("SELECT * FROM trades WHERE id = ? AND user_id = ?").bind(tradeId, userId).first();
   if (!trade) {
     const t = "Trade not found.";
@@ -4630,7 +5539,7 @@ async function sendTradeDetailsUI(env, userId, tradeId, messageId = 0) {
   const extra = JSON.parse(trade.extra_json || '{}');
 
   if (trade.status === 'pending') {
-    const text = pendingTradeCard(trade, extra);
+    const text = pendingTradeCard(trade, extra, exchangeName);
     const hasOO = !!(extra?.open_order?.id);
     const buttons = kbPendingTrade(tradeId, extra.funds_ok, hasOO);
     if (messageId) await editMessage(userId, messageId, text, buttons, env);
@@ -4647,7 +5556,7 @@ async function sendTradeDetailsUI(env, userId, tradeId, messageId = 0) {
         if (isFinite(mid) && mid > 0) currentPrice = mid;
       } catch {}
     }
-    const text = openTradeDetails(trade, extra, currentPrice);
+    const text = openTradeDetails(trade, extra, currentPrice, exchangeName);
     const buttons = kbOpenTradeStrict(tradeId);
     if (messageId) await editMessage(userId, messageId, text, buttons, env);
     else await sendMessage(userId, text, buttons, env);
@@ -4733,11 +5642,24 @@ async function handleTradeAction(env, userId, action, messageId = 0) {
         await editMessage(userId, messageId, `Trade #${tradeId} not pending.`, [[{ text: "Continue ▶️", callback_data: "continue_dashboard" }]], env);
         break;
       }
-      const extra = JSON.parse(row.extra_json || '{}');
+      let extra = JSON.parse(row.extra_json || '{}');
       if (extra.funds_ok !== true) {
         await editMessage(userId, messageId, `Insufficient funds to approve trade #${tradeId}.`, [[{ text: "Continue ▶️", callback_data: "continue_dashboard" }]], env);
         break;
       }
+
+      // -- Start: Bybit Sizing Override --
+      const session = await getSession(env, userId);
+      if (session?.exchange_name?.startsWith('bybit') && env.BYBIT_FORCE_SIZE_MODE === 'CAP_PCT') {
+        const bal = await getWalletBalance(env, userId);
+        const capPct = Number(env.BYBIT_CAPITAL_PCT || 0.10);
+        extra.quote_size = Math.max(5, bal * capPct);
+        await env.DB.prepare("UPDATE trades SET extra_json = ? WHERE id = ? AND user_id = ?")
+          .bind(JSON.stringify(extra), tradeId, userId)
+          .run();
+      }
+      // -- End: Bybit Sizing Override --
+
       const approved = await executeTrade(env, userId, tradeId);
       if (approved) await sendTradeDetailsUI(env, userId, tradeId, messageId);
       else await editMessage(userId, messageId, `Failed to execute trade #${tradeId}.`, [[{ text: "Continue ▶️", callback_data: "continue_dashboard" }]], env);
@@ -4966,21 +5888,6 @@ async function processUser(env, userId, budget = null) {
     const ex = SUPPORTED_EXCHANGES[session.exchange_name];
     if (!ex) return;
 
-    // Enforce futures-only for non-demo; optionally log and skip ideas
-    if (session.exchange_name !== 'crypto_parrot' && ["binanceLike","lbankV2","coinexV2"].includes(ex.kind)) {
-      // Option 1: log once and return
-      await logEvent(env, userId, 'futures_only_block', { exchange: session.exchange_name });
-      // Option 2 (verbose): mark each idea as skipped (requires loading ideas)
-    //  const ideasTmp = await (await buildIdeasFromGistPending(env)) || await getLatestIdeas(env);
-    //  if (ideasTmp?.ideas?.length) {
-    //    const protocol = await getProtocolState(env, userId);
-    //    for (const idea of ideasTmp.ideas) {
-    //      await createAutoSkipRecord(env, userId, idea, protocol, 'exchange_requires_futures', { exchange: session.exchange_name });
-    //    }
-    //  }
-      return;
-    }
-
     // Helper: force all ideas through (env.NO_REJECTS = '1')
     const forceAll = () => String(env?.NO_REJECTS || '0') === '1';
     // Cycle-only duplicate guard flag
@@ -4988,6 +5895,7 @@ async function processUser(env, userId, budget = null) {
 
     // Reconcile exchange fills first (optional; internally no-ops if disabled)
     await reconcileExchangeFills(env, userId);
+    await reconcilePositions(env, userId);
     if (budget?.isExpired()) return;
 
     // Resolve posted-maker orders, then enforce SL/TP
@@ -5216,7 +6124,6 @@ async function handleTelegramUpdate(update, env, ctx) {
   // Debounced checks: reconciliation + working orders + exits
   try {
     const openCount = await getOpenPositionsCount(env, userId);
-    // Count pending with open_order
     const rowPend = await env.DB
       .prepare("SELECT COUNT(*) as c FROM trades WHERE user_id = ? AND status = 'pending' AND json_extract(extra_json,'$.open_order.id') IS NOT NULL")
       .bind(userId).first();
@@ -5228,7 +6135,8 @@ async function handleTelegramUpdate(update, env, ctx) {
       const now = Date.now();
       if (now - last > 3000) {
         await kvSet(env, k, now);
-        ctx.waitUntil(reconcileExchangeFills(env, userId)); // optional (no-op if disabled)
+        ctx.waitUntil(reconcileExchangeFills(env, userId));
+        ctx.waitUntil(reconcilePositions(env, userId));
         ctx.waitUntil(checkWorkingOrders(env, userId));
         ctx.waitUntil(checkAndExitTrades(env, userId));
       }
@@ -5905,4 +6813,3 @@ export default {
     ctx.waitUntil(runCron(env));  // ensures non-blocking execution
   },
 };
-
