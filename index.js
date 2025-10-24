@@ -9,16 +9,16 @@ const SUPPORTED_EXCHANGES = {
   crypto_parrot: { label: "Crypto Parrot (Demo)", kind: "demoParrot", hasOrders: true },
 
   // Spot
-  mexc: { label: "MEXC", kind: "binanceLike", baseUrl: "https://api.mexc.com", accountPath: "/api/v3/account", apiKeyHeader: "X-MEXC-APIKEY", defaultQuery: "recvWindow=5000", hasOrders: true },
+  mexc:   { label: "MEXC",   kind: "binanceLike", baseUrl: "https://api.mexc.com",    accountPath: "/api/v3/account", apiKeyHeader: "X-MEXC-APIKEY", defaultQuery: "",          hasOrders: true },
   binance:{ label: "Binance",kind: "binanceLike", baseUrl: "https://api.binance.com", accountPath: "/api/v3/account", apiKeyHeader: "X-MBX-APIKEY",  defaultQuery: "recvWindow=5000", hasOrders: true },
   lbank:  { label: "LBank",  kind: "lbankV2",     baseUrl: "https://api.lbkex.com",   hasOrders: true },
   coinex: { label: "CoinEx",  kind: "coinexV2",   baseUrl: "https://api.coinex.com",  hasOrders: true },
 
   // Futures / Margin (USDT-M)
-  binance_futures: { label: "Binance Futures (USDT-M)", kind: "binanceFuturesUSDT", baseUrl: "https://railway-2z9h.onrender.com", apiKeyHeader: "X-MBX-APIKEY", hasOrders: true },
+  binance_futures: { label: "Binance Futures (USDT-M)", kind: "binanceFuturesUSDT", baseUrl: "https://fapi.binance.com", apiKeyHeader: "X-MBX-APIKEY", hasOrders: true },
 
   // Bybit Futures (NEW — trading enabled)
-  bybit_futures_testnet: { label: "Bybit Futures (Demo-Testnet)", kind: "bybitFuturesV5", baseUrl: "https://api-testnet.bybit.com", hasOrders: true },
+  bybit_futures_testnet: { label: "Bybit Futures (Demo-Testnet)", kind: "bybitFuturesV5", baseUrl: "https://api-demo-testnet.bybit.com", hasOrders: true },
   bybit_futures:         { label: "Bybit Futures",           kind: "bybitFuturesV5", baseUrl: "https://api.bybit.com",        hasOrders: true },
 
   // Read-only in this worker
@@ -31,8 +31,8 @@ const SUPPORTED_EXCHANGES = {
 /* ---------- Brain & Risk Parameters (original behavior) ---------- */
 const STRICT_RRR = 2.0;          // default 2:1 (used when idea exits are not provided)
 const ACP_FRAC = 0.80;           // keep constant to avoid Demo bank_closed
-const PER_TRADE_CAP_FRAC = 1.0;
-const DAILY_OPEN_RISK_CAP_FRAC = 1.0;
+const PER_TRADE_CAP_FRAC = 0.10;
+const DAILY_OPEN_RISK_CAP_FRAC = 0.30;
 
 /* HSE config */
 const HSE_CFG = {
@@ -52,7 +52,6 @@ const SQS_MIN_DEFAULT = 0.30;
 const CRON_LOCK_KEY = "cron_running";
 const CRON_LOCK_TTL = 55; // seconds
 const AUTO_NO_FUNDS_THRESHOLD = 0.000001;
-const DUST_AVAIL_THRESHOLD_DEFAULT = 0.000001; // NEW: prevent 0 balance display
 
 const DEFAULT_MAX_CONCURRENT_POS = 3;
 const DEFAULT_MAX_NEW_POSITIONS_PER_CYCLE = 3;
@@ -95,10 +94,6 @@ const bpsToFrac = (bps) => Number(bps || 0) / 10000;
 /* Env helpers (used later to respect exec.post_only and mgmt overlays) */
 function envFlag(env, key, def = "0") { return String(env?.[key] ?? def) === "1"; }
 function envNum(env, key, def) { const v = Number(env?.[key]); return Number.isFinite(v) ? v : def; }
-function envPct(env, key, def = 0) {
-  const v = Number(env?.[key]);
-  return Number.isFinite(v) && v > 0 ? Math.min(Math.max(v, 0.0001), 1) : def;
-}
 
 /* UI helpers */
 function formatMoney(amount) { return `$${Number(amount || 0).toFixed(8)}`; }
@@ -329,7 +324,7 @@ async function gistGetState(env) {
   }
 
   // TEMP DEBUG: remove after confirming
-  console.log(`[Gist Debug] Status: ${r.size} ${r.statusText}, Headers:`, {
+  console.log(`[Gist Debug] Status: ${r.status} ${r.statusText}, Headers:`, {
     "content-type": r.headers.get("content-type"),
     "x-ratelimit-remaining": r.headers.get("x-ratelimit-remaining"),
     "x-ratelimit-reset": r.headers.get("x-ratelimit-reset")
@@ -428,6 +423,7 @@ function gistFindPendingIdxByCID(state, cid) {
 
 /* Exports (optional) */
 export { gistOn, gistGetState, gistPatchState, gistFindPendingIdxByCID };
+
 /* ======================================================================
    SECTION 2/7 — Market Data, Orderbook, and Ideas selection
    (Prefer latest GitHub snapshot; origin 'gha' or 'github_actions')
@@ -658,429 +654,421 @@ export {
   fetchKlines, seriesReturnsFromKlines, pearsonCorr,
   getLatestIdeas
 };
+
 /* ======================================================================
-SECTION 3/7 — Wallet/Equity, Cooldowns, HSE/Kelly, Exposure,
-Logging, TCR pacing (flat CPU via KV counters)
-====================================================================== */
+   SECTION 3/7 — Wallet/Equity, Cooldowns, HSE/Kelly, Exposure,
+                  Logging, TCR pacing (flat CPU via KV counters)
+   ====================================================================== */
 
 /* ---------- Wallet & Equity ---------- */
 async function getWalletBalance(env, userId) {
-const session = await getSession(env, userId);
-if (!session) return 0;
+  const session = await getSession(env, userId);
+  if (!session) return 0;
 
-// DEMO equity from PnL (original behavior)
-if (session.exchange_name === 'crypto_parrot') {
-let currentEquity = 10000; // demo starting equity
+  // DEMO equity from PnL (original behavior)
+  if (session.exchange_name === 'crypto_parrot') {
+    let currentEquity = 10000; // demo starting equity
 
-text
+    // Aggregate closed PnL
+    const sumClosed = await env.DB
+      .prepare("SELECT COALESCE(SUM(realized_pnl),0) AS s FROM trades WHERE user_id = ? AND status = 'closed'")
+      .bind(userId).first();
+    currentEquity += Number(sumClosed?.s || 0);
 
-// Aggregate closed PnL
-const sumClosed = await env.DB
-  .prepare("SELECT COALESCE(SUM(realized_pnl),0) AS s FROM trades WHERE user_id = ? AND status = 'closed'")
-  .bind(userId).first();
-currentEquity += Number(sumClosed?.s || 0);
+    // Open trades PnL using cached prices
+    const openTrades = await env.DB
+      .prepare("SELECT symbol, side, entry_price, qty FROM trades WHERE user_id = ? AND status = 'open'")
+      .bind(userId).all();
 
-// Open trades PnL using cached prices
-const openTrades = await env.DB
-  .prepare("SELECT symbol, side, entry_price, qty FROM trades WHERE user_id = ? AND status = 'open'")
-  .bind(userId).all();
+    for (const t of (openTrades.results || [])) {
+      let p = await getCurrentPrice(t.symbol);
+      if (!isFinite(p) || p <= 0) {
+        try {
+          const ob = await getOrderBookSnapshot(t.symbol);
+          const { mid } = computeSpreadDepth(ob);
+          if (isFinite(mid) && mid > 0) p = mid;
+        } catch {}
+      }
+      if (!isFinite(p) || p <= 0) continue;
 
-for (const t of (openTrades.results || [])) {
-  let p = await getCurrentPrice(t.symbol);
-  if (!isFinite(p) || p <= 0) {
-    try {
-      const ob = await getOrderBookSnapshot(t.symbol);
-      const { mid } = computeSpreadDepth(ob);
-      if (isFinite(mid) && mid > 0) p = mid;
-    } catch {}
+      const pnl = (t.side === 'SELL')
+        ? (t.entry_price - p) * t.qty  // short
+        : (p - t.entry_price) * t.qty; // long
+      currentEquity += pnl;
+    }
+    return currentEquity;
   }
-  if (!isFinite(p) || p <= 0) continue;
 
-  const pnl = (t.side === 'SELL')
-    ? (t.entry_price - p) * t.qty  // short
-    : (p - t.entry_price) * t.qty; // long
-  currentEquity += pnl;
-}
-return currentEquity;
-}
+  // Real exchanges
+  if (!session.api_key_encrypted) return 0;
 
-// Real exchanges
-if (!session.api_key_encrypted) return 0;
+  let apiKey, apiSecret;
+  try {
+    apiKey = await decrypt(session.api_key_encrypted, env);
+    apiSecret = await decrypt(session.api_secret_encrypted, env);
+  } catch (e) {
+    console.error("getWalletBalance decrypt error:", e?.message || e);
+    await saveSession(env, userId, { last_balance_err: "decrypt_failed" }).catch(()=>{});
+    return 0;
+  }
 
-let apiKey, apiSecret;
-try {
-apiKey = await decrypt(session.api_key_encrypted, env);
-apiSecret = await decrypt(session.api_secret_encrypted, env);
-} catch (e) {
-console.error("getWalletBalance decrypt error:", e?.message || e);
-await saveSession(env, userId, { last_balance_err: "decrypt_failed" }).catch(()=>{});
-return 0;
-}
+  try {
+    const result = await verifyApiKeys(apiKey, apiSecret, session.exchange_name);
 
-try {
-const result = await verifyApiKeys(apiKey, apiSecret, session.exchange_name);
+    if (!result?.success) {
+      console.warn("getWalletBalance verify fail:", result?.reason);
+      await saveSession(env, userId, { last_balance_err: String(result?.reason || "verify_failed") }).catch(()=>{});
+      return 0;
+    }
 
-text
+    // Success: clear any stale error flag
+    if (session.last_balance_err) {
+      await saveSession(env, userId, { last_balance_err: null }).catch(()=>{});
+    }
 
-if (!result?.success) {
-  console.warn("getWalletBalance verify fail:", result?.reason);
-  await saveSession(env, userId, { last_balance_err: String(result?.reason || "verify_failed") }).catch(()=>{});
-  const cached = (()=>{ try{ return Number(JSON.parse(session.pending_action_data||'{}').bal)||0; }catch{return 0;} })();
-  return cached;
-}
-
-// Success: clear any stale error flag
-if (session.last_balance_err) {
-  await saveSession(env, userId, { last_balance_err: null }).catch(()=>{});
-}
-
-const a = Number(result?.data?.available);
-const e = Number(result?.data?.equity);
-const asStr = Number(String(result?.data?.balance || "0").replace(/[^\d.]/g, ""));
-const best = Math.max(
-  Number.isFinite(a) ? a : 0,
-  Number.isFinite(e) ? e : 0,
-  Number.isFinite(asStr) ? asStr : 0
-);
-const cached = (()=>{ try{ return Number(JSON.parse(session.pending_action_data||'{}').bal)||0; }catch{return 0;} })();
-return best > 0 ? best : cached;
-
-} catch (e) {
-  console.error("getWalletBalance error:", e?.message || e);
-  await saveSession(env, userId, { last_balance_err: "network_or_parse" }).catch(()=>{});
-  const cached = (()=>{ try{ return Number(JSON.parse(session.pending_action_data||'{}').bal)||0; }catch{return 0;} })();
-  return cached;
-}
+    const thr = Number(env.DUST_AVAIL_THRESHOLD ?? 1e-6); // e.g., 1e-6 or 1e-5
+    const a = Number(result?.data?.available);
+    if (Number.isFinite(a) && a > thr) return a; // real available
+    const e = Number(result?.data?.equity);
+    if (Number.isFinite(e) && e > 0) return e; // fallback to equity (Bybit/MEXC)
+    if (result.data?.balance) {
+      const n = Number(String(result.data.balance).replace(/[^\d.]/g, ""));
+      if (Number.isFinite(n)) return n; // legacy fallback
+      await saveSession(env, userId, { last_balance_err: "bad_balance_format" }).catch(()=>{});
+    }
+  } catch (e) {
+    console.error("getWalletBalance error:", e?.message || e);
+    await saveSession(env, userId, { last_balance_err: "network_or_parse" }).catch(()=>{});
+  }
+  return 0;
 }
 
 async function getTotalCapital(env, userId) {
-const tc = await getWalletBalance(env, userId);
-const key = `peak_equity_user_${userId}`;
-const prev = Number(await kvGet(env, key) || 0);
-if (!prev || tc > prev) await kvSet(env, key, tc);
-return tc;
+  const tc = await getWalletBalance(env, userId);
+  const key = `peak_equity_user_${userId}`;
+  const prev = Number(await kvGet(env, key) || 0);
+  if (!prev || tc > prev) await kvSet(env, key, tc);
+  return tc;
 }
 async function getPeakEquity(env, userId) {
-const key = `peak_equity_user_${userId}`;
-const val = Number(await kvGet(env, key) || 0);
-return val > 0 ? val : null;
+  const key = `peak_equity_user_${userId}`;
+  const val = Number(await kvGet(env, key) || 0);
+  return val > 0 ? val : null;
 }
 async function getDrawdown(env, userId, tc) {
-const peak = (await getPeakEquity(env, userId)) ?? tc;
-return clamp(peak > 0 ? (peak - tc) / peak : 0, 0, 1);
+  const peak = (await getPeakEquity(env, userId)) ?? tc;
+  return clamp(peak > 0 ? (peak - tc) / peak : 0, 0, 1);
 }
 async function getOpenPortfolioRisk(env, userId) {
-const row = await env.DB
-.prepare("SELECT SUM(risk_usd) as s FROM trades WHERE user_id = ? AND status = 'open'")
-.bind(userId).first();
-return Number(row?.s || 0);
+  const row = await env.DB
+    .prepare("SELECT SUM(risk_usd) as s FROM trades WHERE user_id = ? AND status = 'open'")
+    .bind(userId).first();
+  return Number(row?.s || 0);
 }
 async function getOpenPositionsCount(env, userId) {
-const row = await env.DB
-.prepare("SELECT COUNT(*) as c FROM trades WHERE user_id = ? AND status = 'open'")
-.bind(userId).first();
-return Number(row?.c || 0);
+  const row = await env.DB
+    .prepare("SELECT COUNT(*) as c FROM trades WHERE user_id = ? AND status = 'open'")
+    .bind(userId).first();
+  return Number(row?.c || 0);
 }
 
 /* ---------- Notional tracking ---------- */
 async function getOpenNotional(env, userId) {
-const open = await env.DB.prepare(
-"SELECT qty, entry_price FROM trades WHERE user_id = ? AND status = 'open'"
-).bind(userId).all();
+  const open = await env.DB.prepare(
+    "SELECT qty, entry_price FROM trades WHERE user_id = ? AND status = 'open'"
+  ).bind(userId).all();
 
-let total = 0;
-for (const r of (open.results || [])) {
-const qty = Number(r.qty || 0);
-const entry = Number(r.entry_price || 0);
-if (isFinite(qty) && isFinite(entry)) total += qty * entry;
-}
+  let total = 0;
+  for (const r of (open.results || [])) {
+    const qty = Number(r.qty || 0);
+    const entry = Number(r.entry_price || 0);
+    if (isFinite(qty) && isFinite(entry)) total += qty * entry;
+  }
 
-// include pending quotes
-const pend = await env.DB.prepare(
-"SELECT extra_json FROM trades WHERE user_id = ? AND status = 'pending'"
-).bind(userId).all();
+  // include pending quotes
+  const pend = await env.DB.prepare(
+    "SELECT extra_json FROM trades WHERE user_id = ? AND status = 'pending'"
+  ).bind(userId).all();
 
-for (const r of (pend.results || [])) {
-try {
-const ex = JSON.parse(r.extra_json || "{}");
-const q = Number(ex.quote_size || 0);
-if (isFinite(q)) total += q;
-} catch (_) {}
-}
-return total;
+  for (const r of (pend.results || [])) {
+    try {
+      const ex = JSON.parse(r.extra_json || "{}");
+      const q = Number(ex.quote_size || 0);
+      if (isFinite(q)) total += q;
+    } catch (_) {}
+  }
+  return total;
 }
 
 /* ---------- Active exposure helpers ---------- */
 async function hasActiveExposure(env, userId, symbol) {
-const row = await env.DB
-.prepare("SELECT COUNT(*) AS c FROM trades WHERE user_id = ? AND symbol = ? AND status IN ('open','pending')")
-.bind(userId, String(symbol || '').toUpperCase())
-.first();
-return Number(row?.c || 0) > 0;
+  const row = await env.DB
+    .prepare("SELECT COUNT(*) AS c FROM trades WHERE user_id = ? AND symbol = ? AND status IN ('open','pending')")
+    .bind(userId, String(symbol || '').toUpperCase())
+    .first();
+  return Number(row?.c || 0) > 0;
 }
 async function getActiveExposureSymbols(env, userId) {
-const rows = await env.DB
-.prepare("SELECT DISTINCT symbol FROM trades WHERE user_id = ? AND status IN ('open','pending')")
-.bind(userId)
-.all();
-const set = new Set();
-for (const r of (rows.results || [])) {
-const s = String(r.symbol || '').toUpperCase();
-if (s) set.add(s);
-}
-return set;
+  const rows = await env.DB
+    .prepare("SELECT DISTINCT symbol FROM trades WHERE user_id = ? AND status IN ('open','pending')")
+    .bind(userId)
+    .all();
+  const set = new Set();
+  for (const r of (rows.results || [])) {
+    const s = String(r.symbol || '').toUpperCase();
+    if (s) set.add(s);
+  }
+  return set;
 }
 
 /* ---------- Cooldown (default from env.COOLDOWN_HOURS, fallback 3h) ---------- */
 function defaultCooldownMs(env) {
-return Math.max(30 * 60 * 1000, Number(env.COOLDOWN_HOURS || 3) * 60 * 60 * 1000);
+  return Math.max(30 * 60 * 1000, Number(env.COOLDOWN_HOURS || 3) * 60 * 60 * 1000);
 }
 async function setSymbolCooldown(env, userId, symbol, ms) {
-const key = `cooldown_${userId}_${String(symbol || '').toUpperCase()}`;
-const until = Date.now() + Math.max(0, isFinite(ms) ? ms : defaultCooldownMs(env));
-await kvSet(env, key, until);
+  const key = `cooldown_${userId}_${String(symbol || '').toUpperCase()}`;
+  const until = Date.now() + Math.max(0, isFinite(ms) ? ms : defaultCooldownMs(env));
+  await kvSet(env, key, until);
 }
 async function getSymbolCooldownRemainingMs(env, userId, symbol) {
-const key = `cooldown_${userId}_${String(symbol || '').toUpperCase()}`;
-const v = Number(await kvGet(env, key) || 0);
-const left = v - Date.now();
-return left > 0 ? left : 0;
+  const key = `cooldown_${userId}_${String(symbol || '').toUpperCase()}`;
+  const v = Number(await kvGet(env, key) || 0);
+  const left = v - Date.now();
+  return left > 0 ? left : 0;
 }
 async function isSymbolOnCooldown(env, userId, symbol) {
-return (await getSymbolCooldownRemainingMs(env, userId, symbol)) > 0;
+  return (await getSymbolCooldownRemainingMs(env, userId, symbol)) > 0;
 }
 
 /* ---------- ACP V20 Brain helpers ---------- */
 function pLCBFromSQS(SQS) {
-const p = 0.25 + 0.5 * clamp(SQS, 0, 1);
-return clamp(p, 0.0, 1.0);
+  const p = 0.25 + 0.5 * clamp(SQS, 0, 1);
+  return clamp(p, 0.0, 1.0);
 }
 function ddScaler(dd) {
-if (dd < 0.02) return 1.0;
-if (dd < 0.06) return 0.7;
-return 0.4;
+  if (dd < 0.02) return 1.0;
+  if (dd < 0.06) return 0.7;
+  return 0.4;
 }
 async function maxCorrelationWithOpen(env, userId, candidateSymbol) {
-const rows = await env.DB
-.prepare("SELECT symbol FROM trades WHERE user_id = ? AND status = 'open'")
-.bind(userId).all();
+  const rows = await env.DB
+    .prepare("SELECT symbol FROM trades WHERE user_id = ? AND status = 'open'")
+    .bind(userId).all();
 
-const maxCompare = Number(env?.MAX_CORR_COMPARE || 3);
-if (!(maxCompare > 0)) return 0.0;
+  const maxCompare = Number(env?.MAX_CORR_COMPARE || 3);
+  if (!(maxCompare > 0)) return 0.0;
 
-const openSymsAll = (rows?.results || []).map(r => (r.symbol || "").toUpperCase());
-const openSyms = openSymsAll.slice(0, Math.max(0, maxCompare));
-if (!openSyms.length) return 0.0;
+  const openSymsAll = (rows?.results || []).map(r => (r.symbol || "").toUpperCase());
+  const openSyms = openSymsAll.slice(0, Math.max(0, maxCompare));
+  if (!openSyms.length) return 0.0;
 
-const kA = await fetchKlines(candidateSymbol, "1h", 120);
-const a = seriesReturnsFromKlines(kA);
-if (a.length < 10) return 0.0;
+  const kA = await fetchKlines(candidateSymbol, "1h", 120);
+  const a = seriesReturnsFromKlines(kA);
+  if (a.length < 10) return 0.0;
 
-let rho_max = 0.0;
-for (const s of openSyms) {
-const kB = await fetchKlines(s, "1h", 120);
-const b = seriesReturnsFromKlines(kB);
-if (b.length < 10) continue;
-const rho = pearsonCorr(a, b);
-rho_max = Math.max(rho_max, rho);
-}
-return clamp(rho_max, -1, 1);
+  let rho_max = 0.0;
+  for (const s of openSyms) {
+    const kB = await fetchKlines(s, "1h", 120);
+    const b = seriesReturnsFromKlines(kB);
+    if (b.length < 10) continue;
+    const rho = pearsonCorr(a, b);
+    rho_max = Math.max(rho_max, rho);
+  }
+  return clamp(rho_max, -1, 1);
 }
 async function computeHSEAndCosts(symbol, sL, feeRatePerSide) {
-const book = await getOrderBookSnapshot(symbol);
-const { BAS, OBD } = computeSpreadDepth(book);
-const MV = sL, RS = 1.0, ES = 1.0;
+  const book = await getOrderBookSnapshot(symbol);
+  const { BAS, OBD } = computeSpreadDepth(book);
+  const MV = sL, RS = 1.0, ES = 1.0;
 
-const HSE_raw =
-HSE_CFG.AF *
-Math.pow(1.0, HSE_CFG.gamma) *
-Math.pow((BAS / (HSE_CFG.BAS_avg || 1)) * ((HSE_CFG.OBD_avg || 1) / Math.max(OBD, 1)), HSE_CFG.w_cost) *
-Math.pow((MV / (HSE_CFG.MV_avg || 1)), HSE_CFG.w_vol) *
-Math.pow((RS / (HSE_CFG.RS_avg || 1)), HSE_CFG.w_rs) *
-Math.pow((ES / (HSE_CFG.ES_avg || 1)), HSE_CFG.w_es);
+  const HSE_raw =
+    HSE_CFG.AF *
+    Math.pow(1.0, HSE_CFG.gamma) *
+    Math.pow((BAS / (HSE_CFG.BAS_avg || 1)) * ((HSE_CFG.OBD_avg || 1) / Math.max(OBD, 1)), HSE_CFG.w_cost) *
+    Math.pow((MV / (HSE_CFG.MV_avg || 1)), HSE_CFG.w_vol) *
+    Math.pow((RS / (HSE_CFG.RS_avg || 1)), HSE_CFG.w_rs) *
+    Math.pow((ES / (HSE_CFG.ES_avg || 1)), HSE_CFG.w_es);
 
-const pH = sigmoid(HSE_CFG.alpha0 + HSE_CFG.alpha1 * Math.log(Math.max(HSE_raw, 1e-12)));
+  const pH = sigmoid(HSE_CFG.alpha0 + HSE_CFG.alpha1 * Math.log(Math.max(HSE_raw, 1e-12)));
 
-const stop_bps = sL * 10000.0;
-const slip_R = (HSE_CFG.sSlipStarBps * pH) / Math.max(stop_bps, 1e-6);
-const spread_R = BAS / Math.max(sL, 1e-9);
-const fee_R = (2 * feeRatePerSide) / Math.max(sL, 1e-9);
-const borrow_funding_R = 0.0;
-const cost_R = slip_R + spread_R + fee_R + borrow_funding_R;
+  const stop_bps = sL * 10000.0;
+  const slip_R = (HSE_CFG.sSlipStarBps * pH) / Math.max(stop_bps, 1e-6);
+  const spread_R = BAS / Math.max(sL, 1e-9);
+  const fee_R = (2 * feeRatePerSide) / Math.max(sL, 1e-9);
+  const borrow_funding_R = 0.0;
+  const cost_R = slip_R + spread_R + fee_R + borrow_funding_R;
 
-return { HSE_raw, pH, slip_R, spread_R, fee_R, borrow_funding_R, cost_R, BAS, OBD, MV, RS, ES };
+  return { HSE_raw, pH, slip_R, spread_R, fee_R, borrow_funding_R, cost_R, BAS, OBD, MV, RS, ES };
 }
 function kellyFraction(EV_R, p, RRR) {
-const Var_R = p * Math.pow(RRR - EV_R, 2) + (1 - p) * Math.pow(-1 - EV_R, 2);
-const f_k = clamp(EV_R / Math.max(Var_R, EPS_VARIANCE), 0, 1);
-return { f_k, Var_R };
+  const Var_R = p * Math.pow(RRR - EV_R, 2) + (1 - p) * Math.pow(-1 - EV_R, 2);
+  const f_k = clamp(EV_R / Math.max(Var_R, EPS_VARIANCE), 0, 1);
+  return { f_k, Var_R };
 }
 function SQSfromScore(score) {
-return clamp(Math.sqrt(clamp((Number(score) || 0) / 100, 0, 1)), 0, 1);
+  return clamp(Math.sqrt(clamp((Number(score) || 0) / 100, 0, 1)), 0, 1);
 }
 
 /* ---------- Logging ---------- */
 async function logEvent(env, userId, eventType, payload) {
-const body = JSON.stringify({ ts: nowISO(), event: eventType, user_id: userId, ...payload });
-try {
-await env.DB
-.prepare("INSERT INTO events_log (user_id, event_type, payload) VALUES (?, ?, ?)")
-.bind(userId, eventType, body)
-.run();
-} catch (e) {
-console.error("logEvent DB error:", e);
-}
+  const body = JSON.stringify({ ts: nowISO(), event: eventType, user_id: userId, ...payload });
+  try {
+    await env.DB
+      .prepare("INSERT INTO events_log (user_id, event_type, payload) VALUES (?, ?, ?)")
+      .bind(userId, eventType, body)
+      .run();
+  } catch (e) {
+    console.error("logEvent DB error:", e);
+  }
 
-if (env.SHEETS_WEBHOOK_URL) {
-try {
-await safeFetch(env.SHEETS_WEBHOOK_URL, {
-method: "POST",
-headers: { "Content-Type": "application/json", "Authorization": `Bearer ${env.SHEETS_WEBHOOK_TOKEN || ''}` },
-body
-}, 6000);
-} catch (e) {
-console.error("Sheets webhook error:", e);
-}
-}
+  if (env.SHEETS_WEBHOOK_URL) {
+    try {
+      await safeFetch(env.SHEETS_WEBHOOK_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${env.SHEETS_WEBHOOK_TOKEN || ''}` },
+        body
+      }, 6000);
+    } catch (e) {
+      console.error("Sheets webhook error:", e);
+    }
+  }
 }
 
 /* ---------- Flat-CPU TCR pacing counters (KV) ---------- */
 /* UTC day key helper */
 function utcDayKey(d = new Date()) {
-return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}-${String(d.getUTCDate()).padStart(2,'0')}`;
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}-${String(d.getUTCDate()).padStart(2,'0')}`;
 }
 
 /* Ensure day roll: move yesterday's todayCount into rolling, reset todayCount on UTC midnight */
 async function ensureDayRoll(env, userId) {
-const today = utcDayKey();
-const kDate = `tcr_today_date_${userId}`;
-const kCount = `tcr_today_count_${userId}`;
-const kRoll = `tcr_7d_roll_${userId}`;
+  const today = utcDayKey();
+  const kDate = `tcr_today_date_${userId}`;
+  const kCount = `tcr_today_count_${userId}`;
+  const kRoll = `tcr_7d_roll_${userId}`;
 
-let curDate = await kvGet(env, kDate);
-if (!curDate) {
-await kvSet(env, kDate, today);
-await kvSet(env, kCount, 0);
-await kvSet(env, kRoll, JSON.stringify({ last7: [] }));
-return;
-}
-if (curDate !== today) {
-const yCount = Number(await kvGet(env, kCount) || 0);
-let roll;
-try { roll = JSON.parse((await kvGet(env, kRoll)) || '{"last7":[]}'); } catch { roll = { last7: [] }; }
-// Append yesterday with its date (curDate)
-roll.last7.push({ d: curDate, c: yCount });
-// Keep only last 7 days (completed days). We will still compute average with today later.
-if (roll.last7.length > 7) roll.last7 = roll.last7.slice(-7);
+  let curDate = await kvGet(env, kDate);
+  if (!curDate) {
+    await kvSet(env, kDate, today);
+    await kvSet(env, kCount, 0);
+    await kvSet(env, kRoll, JSON.stringify({ last7: [] }));
+    return;
+  }
+  if (curDate !== today) {
+    const yCount = Number(await kvGet(env, kCount) || 0);
+    let roll;
+    try { roll = JSON.parse((await kvGet(env, kRoll)) || '{"last7":[]}'); } catch { roll = { last7: [] }; }
+    // Append yesterday with its date (curDate)
+    roll.last7.push({ d: curDate, c: yCount });
+    // Keep only last 7 days (completed days). We will still compute average with today later.
+    if (roll.last7.length > 7) roll.last7 = roll.last7.slice(-7);
 
-text
-
-await kvSet(env, kRoll, JSON.stringify(roll));
-await kvSet(env, kDate, today);
-await kvSet(env, kCount, 0);
-}
+    await kvSet(env, kRoll, JSON.stringify(roll));
+    await kvSet(env, kDate, today);
+    await kvSet(env, kCount, 0);
+  }
 }
 
 /* Increment today's trade count (called on each INSERT into trades) */
 async function bumpTradeCounters(env, userId, delta = 1) {
-await ensureDayRoll(env, userId);
-const kCount = `tcr_today_count_${userId}`;
-const cur = Number(await kvGet(env, kCount) || 0);
-await kvSet(env, kCount, cur + (isFinite(delta) ? delta : 1));
+  await ensureDayRoll(env, userId);
+  const kCount = `tcr_today_count_${userId}`;
+  const cur = Number(await kvGet(env, kCount) || 0);
+  await kvSet(env, kCount, cur + (isFinite(delta) ? delta : 1));
 }
 
 /* Read pacing counters (today + last7 completed days) */
 async function getPacingCounters(env, userId) {
-await ensureDayRoll(env, userId);
-const kCount = `tcr_today_count_${userId}`;
-const kRoll = `tcr_7d_roll_${userId}`;
-const todayCount = Number(await kvGet(env, kCount) || 0);
-let roll;
-try { roll = JSON.parse((await kvGet(env, kRoll)) || '{"last7":[]}'); } catch { roll = { last7: [] }; }
-const last7 = Array.isArray(roll.last7) ? roll.last7 : [];
-// Normalize to only keep last 6 previous days (optional), but we'll compute avg with 7 slots including today.
-const last7Counts = last7.slice(-6).map(x => Number(x?.c || 0));
-return { todayCount, last7Counts };
+  await ensureDayRoll(env, userId);
+  const kCount = `tcr_today_count_${userId}`;
+  const kRoll = `tcr_7d_roll_${userId}`;
+  const todayCount = Number(await kvGet(env, kCount) || 0);
+  let roll;
+  try { roll = JSON.parse((await kvGet(env, kRoll)) || '{"last7":[]}'); } catch { roll = { last7: [] }; }
+  const last7 = Array.isArray(roll.last7) ? roll.last7 : [];
+  // Normalize to only keep last 6 previous days (optional), but we'll compute avg with 7 slots including today.
+  const last7Counts = last7.slice(-6).map(x => Number(x?.c || 0));
+  return { todayCount, last7Counts };
 }
 
 /* Optional DB resync for pacing counters (used after bulk deletes like Clean 🧹) */
 async function resyncPacingFromDB(env, userId) {
-const today = utcDayKey();
-const kDate = `tcr_today_date_${userId}`;
-const kCount = `tcr_today_count_${userId}`;
-const kRoll = `tcr_7d_roll_${userId}`;
+  const today = utcDayKey();
+  const kDate = `tcr_today_date_${userId}`;
+  const kCount = `tcr_today_count_${userId}`;
+  const kRoll = `tcr_7d_roll_${userId}`;
 
-// Fetch per-day counts for the last 7 days including today
-const rows = await env.DB.prepare(
-"SELECT DATE(created_at) AS d, COUNT(*) AS c FROM trades WHERE user_id = ? AND DATE(created_at) >= DATE('now', '-6 days') GROUP BY DATE(created_at) ORDER BY DATE(created_at)"
-).bind(userId).all();
+  // Fetch per-day counts for the last 7 days including today
+  const rows = await env.DB.prepare(
+    "SELECT DATE(created_at) AS d, COUNT(*) AS c FROM trades WHERE user_id = ? AND DATE(created_at) >= DATE('now', '-6 days') GROUP BY DATE(created_at) ORDER BY DATE(created_at)"
+  ).bind(userId).all();
 
-const map = new Map();
-for (const r of (rows.results || [])) {
-const d = String(r.d || '');
-const c = Number(r.c || 0);
-if (d) map.set(d, c);
-}
+  const map = new Map();
+  for (const r of (rows.results || [])) {
+    const d = String(r.d || '');
+    const c = Number(r.c || 0);
+    if (d) map.set(d, c);
+  }
 
-const todayCount = Number(map.get(today) || 0);
-// Build last7 for the previous 6 days (oldest->newest)
-const last7 = [];
-for (let i = 6; i >= 1; i--) {
-const d = new Date();
-d.setUTCDate(d.getUTCDate() - i);
-const dk = utcDayKey(d);
-last7.push({ d: dk, c: Number(map.get(dk) || 0) });
-}
+  const todayCount = Number(map.get(today) || 0);
+  // Build last7 for the previous 6 days (oldest->newest)
+  const last7 = [];
+  for (let i = 6; i >= 1; i--) {
+    const d = new Date();
+    d.setUTCDate(d.getUTCDate() - i);
+    const dk = utcDayKey(d);
+    last7.push({ d: dk, c: Number(map.get(dk) || 0) });
+  }
 
-await kvSet(env, kDate, today);
-await kvSet(env, kCount, todayCount);
-await kvSet(env, kRoll, JSON.stringify({ last7 }));
-return { todayCount, last7 };
+  await kvSet(env, kDate, today);
+  await kvSet(env, kCount, todayCount);
+  await kvSet(env, kRoll, JSON.stringify({ last7 }));
+  return { todayCount, last7 };
 }
 
 /* ---------- TCR gate per user (pacing — flat CPU) ---------- */
 function dayProgressUTC() {
-const now = new Date();
-const utc = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours(), now.getUTCMinutes(), now.getUTCSeconds());
-const start = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0);
-return Math.min(1, Math.max(0, (utc - start) / 86400000));
+  const now = new Date();
+  const utc = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours(), now.getUTCMinutes(), now.getUTCSeconds());
+  const start = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0);
+  return Math.min(1, Math.max(0, (utc - start) / 86400000));
 }
 function computeDynamicSqsGate(baseGate, targetDaily, openedSoFar) {
-const p = dayProgressUTC();
-const expected = targetDaily * p;
-const diff = openedSoFar - expected;
-let adj = 0;
-if (diff > 1) adj = +0.05;
-else if (diff < -1) adj = -0.05;
-return clampRange((Number(baseGate) || 0.30) + adj, 0.25, 0.50);
+  const p = dayProgressUTC();
+  const expected = targetDaily * p;
+  const diff = openedSoFar - expected;
+  let adj = 0;
+  if (diff > 1) adj = +0.05;
+  else if (diff < -1) adj = -0.05;
+  return clampRange((Number(baseGate) || 0.30) + adj, 0.25, 0.50);
 }
 
 /* Flat-CPU version: no history scans per cycle; exact same pacing behavior */
 async function computeUserSqsGate(env, userId) {
-const baseGate = Number(env?.SQS_MIN_GATE ?? SQS_MIN_DEFAULT);
-const explicitTarget = Number(env?.TCR_TARGET_TRADES || 0);
+  const baseGate = Number(env?.SQS_MIN_GATE ?? SQS_MIN_DEFAULT);
+  const explicitTarget = Number(env?.TCR_TARGET_TRADES || 0);
 
-const { todayCount, last7Counts } = await getPacingCounters(env, userId);
-// Original average used last 7 days inclusive of today; replicate: divide by 7 always
-const sum7 = todayCount + last7Counts.reduce((a, b) => a + b, 0);
-const avg7 = sum7 / 7;
-const target = explicitTarget > 0 ? explicitTarget : Math.max(1, Math.round(avg7));
+  const { todayCount, last7Counts } = await getPacingCounters(env, userId);
+  // Original average used last 7 days inclusive of today; replicate: divide by 7 always
+  const sum7 = todayCount + last7Counts.reduce((a, b) => a + b, 0);
+  const avg7 = sum7 / 7;
+  const target = explicitTarget > 0 ? explicitTarget : Math.max(1, Math.round(avg7));
 
-const openedSoFar = todayCount; // same as DATE(created_at)=today in original
-return computeDynamicSqsGate(baseGate, target, openedSoFar);
+  const openedSoFar = todayCount; // same as DATE(created_at)=today in original
+  return computeDynamicSqsGate(baseGate, target, openedSoFar);
 }
 
 /* ---------- Exports ---------- */
 export {
-getWalletBalance, getTotalCapital, getPeakEquity, getDrawdown,
-getOpenPortfolioRisk, getOpenPositionsCount, getOpenNotional,
-hasActiveExposure, getActiveExposureSymbols,
-defaultCooldownMs, setSymbolCooldown, getSymbolCooldownRemainingMs, isSymbolOnCooldown,
-pLCBFromSQS, ddScaler, maxCorrelationWithOpen, computeHSEAndCosts, kellyFraction, SQSfromScore,
-logEvent,
-// pacing (flat-CPU)
-utcDayKey, ensureDayRoll, bumpTradeCounters, getPacingCounters, resyncPacingFromDB,
-dayProgressUTC, computeDynamicSqsGate, computeUserSqsGate
+  getWalletBalance, getTotalCapital, getPeakEquity, getDrawdown,
+  getOpenPortfolioRisk, getOpenPositionsCount, getOpenNotional,
+  hasActiveExposure, getActiveExposureSymbols,
+  defaultCooldownMs, setSymbolCooldown, getSymbolCooldownRemainingMs, isSymbolOnCooldown,
+  pLCBFromSQS, ddScaler, maxCorrelationWithOpen, computeHSEAndCosts, kellyFraction, SQSfromScore,
+  logEvent,
+  // pacing (flat-CPU)
+  utcDayKey, ensureDayRoll, bumpTradeCounters, getPacingCounters, resyncPacingFromDB,
+  dayProgressUTC, computeDynamicSqsGate, computeUserSqsGate
 };
 /* ======================================================================
    SECTION 4/7 — Exchange verification, signing helpers, orders & routing
@@ -1768,7 +1756,7 @@ async function placeLBankOrder(ex, apiKey, apiSecret, symbol, type, amount) {
 async function placeCoinExOrder(ex, apiKey, apiSecret, symbol, side, amount) {
   const path = "/v2/order/market";
   const ts = Date.now().toString();
-  const body = { market: symbol.toUpperCase() + "USDT", side: side.toLowerCase(), amount: Number(amount).toFixed(6) };
+  const body = { market: symbol.toUpperCase() + "USDT", side, amount: Number(amount).toFixed(6) };
   const bodyStr = JSON.stringify(body);
   const signStr = ts + "POST" + path + bodyStr;
   const sign = await hmacHexStr(apiSecret, signStr);
@@ -2032,46 +2020,6 @@ async function ensureBybitFuturesIsolated1x(ex, apiKey, apiSecret, symbol) {
     }, 6000);
   } catch(_) {}
 }
-
-async function ensureBinanceFuturesIsolatedLev(ex, apiKey, apiSecret, symbol, lev) {
-  const sym = symbol.toUpperCase() + "USDT";
-  // 1) isolated (ignore errors if already isolated)
-  try {
-    const p1 = { symbol: sym, marginType: "ISOLATED", timestamp: Date.now() };
-    const qs1 = Object.entries(p1).map(([k,v])=>`${k}=${encodeURIComponent(v)}`).join("&");
-    const sig1 = await hmacHexStr(apiSecret, qs1);
-    await safeFetch(`${ex.baseUrl}/fapi/v1/marginType?${qs1}&signature=${sig1}`, { method: "POST", headers: { [ex.apiKeyHeader]: apiKey } }, 6000);
-  } catch {}
-  // 2) leverage = lev
-  try {
-    const p2 = { symbol: sym, leverage: Math.max(1, Math.floor(lev)), timestamp: Date.now() };
-    const qs2 = Object.entries(p2).map(([k,v])=>`${k}=${encodeURIComponent(v)}`).join("&");
-    const sig2 = await hmacHexStr(apiSecret, qs2);
-    await safeFetch(`${ex.baseUrl}/fapi/v1/leverage?${qs2}&signature=${sig2}`, { method: "POST", headers: { [ex.apiKeyHeader]: apiKey } }, 6000);
-  } catch {}
-}
-
-async function ensureBybitFuturesIsolatedLev(ex, apiKey, apiSecret, symbol, lev) {
-  const sym = symbol.toUpperCase() + "USDT";
-  try {
-    await bybitV5POST(ex, apiKey, apiSecret, "/v5/position/switch-isolated", {
-      category: "linear", symbol: sym, tradeMode: 1
-    }, 6000);
-  } catch {}
-  try {
-    const L = String(Math.max(1, Math.floor(lev)));
-    await bybitV5POST(ex, apiKey, apiSecret, "/v5/position/set-leverage", {
-      category: "linear", symbol: sym, buyLeverage: L, sellLeverage: L
-    }, 6000);
-  } catch {}
-}
-
-async function ensureFuturesIsolatedWithLev(env, ex, apiKey, apiSecret, symbol) {
-  const lev = Math.max(1, Math.floor(Number(env?.LEVERAGE || 1)));
-  if (ex.kind === "binanceFuturesUSDT") return ensureBinanceFuturesIsolatedLev(ex, apiKey, apiSecret, symbol, lev);
-  if (ex.kind === "bybitFuturesV5") return ensureBybitFuturesIsolatedLev(ex, apiKey, apiSecret, symbol, lev);
-}
-
 async function ensureFuturesIsolated1x(ex, apiKey, apiSecret, symbol) {
   if (ex.kind === "binanceFuturesUSDT") return ensureBinanceFuturesIsolated1x(ex, apiKey, apiSecret, symbol);
   if (ex.kind === "bybitFuturesV5")     return ensureBybitFuturesIsolated1x(ex, apiKey, apiSecret, symbol);
@@ -2120,16 +2068,14 @@ async function placeMarketBuy(env, userId, symbol, quoteAmount, opts = {}) {
   switch (ex.kind) {
     case "binanceFuturesUSDT": {
       const price = await getCurrentPrice(symbol);
-      if (!(price > 0)) throw new Error(`Failed to fetch a valid price for ${symbol} to compute order size.`);
       const baseQty = Number(quoteAmount) / price;
-      await ensureFuturesIsolatedWithLev(env, ex, apiKey, apiSecret, symbol);
+      await ensureFuturesIsolated1x(ex, apiKey, apiSecret, symbol);
       return await placeBinanceFuturesOrder(ex, apiKey, apiSecret, symbol, "BUY", baseQty, opts.reduceOnly === true, opts.clientOrderId);
     }
     case "bybitFuturesV5": {
       const price = await getCurrentPrice(symbol);
-      if (!(price > 0)) throw new Error(`Failed to fetch a valid price for ${symbol} to compute order size.`);
       const baseQty = Number(quoteAmount) / price;
-      await ensureFuturesIsolatedWithLev(env, ex, apiKey, apiSecret, symbol);
+      await ensureFuturesIsolated1x(ex, apiKey, apiSecret, symbol);
       return await placeBybitFuturesOrder(ex, apiKey, apiSecret, symbol, "BUY", baseQty, opts.reduceOnly === true, opts.clientOrderId);
     }
     default:
@@ -2158,20 +2104,18 @@ async function placeMarketSell(env, userId, symbol, amount, isQuoteOrder = false
       let baseQty = Number(amount);
       if (isQuoteOrder) {
         const price = await getCurrentPrice(symbol);
-        if (!(price > 0)) throw new Error(`Failed to fetch a valid price for ${symbol} to compute order size.`);
         baseQty = Number(amount) / price;
       }
-      await ensureFuturesIsolatedWithLev(env, ex, apiKey, apiSecret, symbol);
+      await ensureFuturesIsolated1x(ex, apiKey, apiSecret, symbol);
       return await placeBinanceFuturesOrder(ex, apiKey, apiSecret, symbol, "SELL", baseQty, opts.reduceOnly === true, opts.clientOrderId);
     }
     case "bybitFuturesV5": {
       let baseQty = Number(amount);
       if (isQuoteOrder) {
         const price = await getCurrentPrice(symbol);
-        if (!(price > 0)) throw new Error(`Failed to fetch a valid price for ${symbol} to compute order size.`);
         baseQty = Number(amount) / price;
       }
-      await ensureFuturesIsolatedWithLev(env, ex, apiKey, apiSecret, symbol);
+      await ensureFuturesIsolated1x(ex, apiKey, apiSecret, symbol);
       return await placeBybitFuturesOrder(ex, apiKey, apiSecret, symbol, "SELL", baseQty, opts.reduceOnly === true, opts.clientOrderId);
     }
     default:
@@ -2180,28 +2124,6 @@ async function placeMarketSell(env, userId, symbol, amount, isQuoteOrder = false
 }
 
 /* ---------- Order status/cancel helpers (used by reconciliation/mgmt) ---------- */
-async function getLiveFuturesPositionSize(ex, apiKey, apiSecret, symbol) {
-  const sym = symbol.toUpperCase() + "USDT";
-  if (ex.kind === "binanceFuturesUSDT") {
-    const ts = Date.now();
-    const query = `timestamp=${ts}`;
-    const sig = await hmacHexStr(apiSecret, query, "SHA-256");
-    const url = `${ex.baseUrl}/fapi/v2/positionRisk?${query}&signature=${sig}`;
-    const r = await safeFetch(url, { headers: { [ex.apiKeyHeader]: apiKey } }, 6000).catch(()=>null);
-    const d = r ? await r.json().catch(()=>[]) : [];
-    const row = Array.isArray(d) ? d.find(x => (x.symbol || "") === sym) : null;
-    const amt = row ? Number(row.positionAmt || 0) : 0;
-    return { size: Math.abs(amt), side: amt > 0 ? "BUY" : (amt < 0 ? "SELL" : "FLAT") };
-  }
-  if (ex.kind === "bybitFuturesV5") {
-    const d = await bybitV5GET(ex, apiKey, apiSecret, "/v5/position/list", { category: "linear", symbol: sym }, 8000).catch(()=>null);
-    const row = d?.result?.list?.[0];
-    const size = row ? Math.abs(Number(row.size || 0)) : 0;
-    const side = row ? (String(row.side || "").toUpperCase() === "BUY" ? "BUY" : (String(row.side || "").toUpperCase() === "SELL" ? "SELL" : "FLAT")) : "FLAT";
-    return { size, side };
-  }
-  return { size: 0, side: "FLAT" };
-}
 async function getBinanceLikeOrderStatus(ex, apiKey, apiSecret, symbol, orderId) {
   const endpoint = "/api/v3/order";
   const params = { symbol: symbol.toUpperCase() + "USDT", orderId: String(orderId), timestamp: Date.now() };
@@ -2356,49 +2278,6 @@ async function getBybitFuturesUserTrades(ex, apiKey, apiSecret, symbol, { startT
   }));
 }
 
-/* Close all open positions (PowerShell methodology for all non-demo exchanges) */
-async function closeAllOpenPositions(env, userId) {
-  const session = await getSession(env, userId);
-  const ex = SUPPORTED_EXCHANGES[session.exchange_name];
-  
-  // Cancel all open orders first
-  if (session.exchange_name !== 'crypto_parrot' && session.api_key_encrypted) {
-    try {
-      const apiKey = await decrypt(session.api_key_encrypted, env);
-      const apiSecret = await decrypt(session.api_secret_encrypted, env);
-      
-      const openTrades = await env.DB.prepare(
-        "SELECT DISTINCT symbol FROM trades WHERE user_id = ? AND status = 'open'"
-      ).bind(userId).all();
-      
-      for (const t of (openTrades.results || [])) {
-        try {
-          if (ex.kind === 'binanceFuturesUSDT') {
-            await cancelBinanceFuturesOrder(ex, apiKey, apiSecret, t.symbol, {});
-          } else if (ex.kind === 'bybitFuturesV5') {
-            await cancelBybitFuturesOrder(ex, apiKey, apiSecret, t.symbol, {});
-          }
-        } catch {}
-      }
-    } catch {}
-  }
-  
-  // Close all positions
-  const openTrades = await env.DB.prepare(
-    "SELECT id FROM trades WHERE user_id = ? AND status = 'open'"
-  ).bind(userId).all();
-  
-  let closed = 0;
-  for (const t of (openTrades.results || [])) {
-    try {
-      const res = await closeTradeNow(env, userId, t.id);
-      if (res.ok) closed++;
-    } catch {}
-  }
-  
-  return closed;
-}
-
 /* Exports */
 export {
   hmacHexStr, hmacB64Str, hmacB64Bytes, sha256Bytes, md5Hex,
@@ -2429,14 +2308,9 @@ export {
   getBybitFuturesOrderStatus, cancelBybitFuturesOrder, getBybitFuturesUserTrades,
 
   // NEW: ensure isolated 1x
-  ensureFuturesIsolated1x,
-
-  // NEW: Leverage + position helpers
-  ensureFuturesIsolatedWithLev, getLiveFuturesPositionSize,
-  
-  // NEW: Close all positions
-  closeAllOpenPositions
+  ensureFuturesIsolated1x
 };
+
 /* ======================================================================
    SECTION 5/7 — Protocol Status, Create/Execute/Close Trades,
                   Auto exits, Win stats (10/10 dynamic RRR aware)
@@ -2573,8 +2447,7 @@ async function gistReportClosed(env, trade, exitPrice, exitReason, protocolFeeRa
         commission_quote_usdt: commissionQuoteUSDT,
         commission_asset_entry: commissionAssetEntry,
         commission_asset_exit: commissionAssetExit,
-        fingerprint_entry: fingerprintEntry,
-        fingerprint_exit: fingerprintExit
+        fingerprint_entry: fingerprintEntry, fingerprint_exit: fingerprintExit
       },
       realized: {
         tp_hit: normalizeExitReason(exitReason) === 'tp',
@@ -2650,6 +2523,16 @@ function noRejects(env) {
 }
 
 /* ---------- Fixed per-trade notional (env-driven) ---------- */
+function getFixedTradeNotional(env, TC) {
+  // Precedence: USD > fraction * TC
+  const usd = Number(env?.FIXED_TRADE_NOTIONAL_USD);
+  if (isFinite(usd) && usd > 0) return usd;
+
+  const frac = Number(env?.FIXED_TRADE_NOTIONAL_FRAC);
+  if (isFinite(frac) && frac > 0) return Math.max(0, frac) * TC;
+
+  return null;
+}
 function fixedStrict(env) {
   // If '1', ignore notional caps (still bounded by funds)
   return String(env?.FIXED_TRADE_STRICT || '0') === '1';
@@ -2975,20 +2858,11 @@ async function createPendingTrade(env, userId, idea, protocol) {
 
   const Desired_Risk_USD = B_eff * k_dd * f_raw * c_corr * g;
 
-  const fixedPct = Number(env.FIXED_TRADE_PERCENT || 0);
-  const useIdeaN = String(env.USE_IDEA_NOTIONAL || "0") === "1";
-  let notionalDesired;
-
-  if (fixedPct > 0 && !useIdeaN) {
-    // community mode: % of total capital
-    notionalDesired = TC * Math.min(Math.max(fixedPct, 0.0001), 1);
-  } else if (useIdeaN && isFinite(Number(idea?.notional_usd)) && Number(idea?.notional_usd) > 0) {
-    // idea notional
-    notionalDesired = Number(idea.notional_usd);
-  } else {
-    // fallback: 10% of TC
-    notionalDesired = TC * 0.10;
-  }
+  const fixedNotional = getFixedTradeNotional(env, TC);
+  const planNotional = Number(idea?.notional_usd);
+  let notionalDesired = (isFinite(planNotional) && planNotional > 0)
+    ? planNotional
+    : (fixedNotional != null ? fixedNotional : (Desired_Risk_USD / sL));
 
   const capPerTrade  = fixedStrict(env) ? Number.POSITIVE_INFINITY : perTradeNotionalCap;
   const capDailyLeft = fixedStrict(env) ? Number.POSITIVE_INFINITY : dailyNotionalLeft;
@@ -3134,7 +3008,6 @@ async function cancelBracketsIfAny(env, userId, trade, session, ex, extra) {
 
     // remove from extra and persist
     delete extra.open_brackets;
-    extra.inline_tpsl = false; // Unset flag
     await env.DB.prepare("UPDATE trades SET extra_json = ?, updated_at = ? WHERE id = ?")
       .bind(JSON.stringify(extra), nowISO(), trade.id).run();
   } catch (e) {
@@ -3208,7 +3081,6 @@ async function executeTrade(env, userId, tradeId) {
           }
           if (br) {
             extra.open_brackets = { tp: br.tp ? { orderId: br.tp.orderId } : null, sl: br.sl ? { orderId: br.sl.orderId } : null };
-            extra.inline_tpsl = true; // flag that TP/SL are on-exchange
             await env.DB.prepare("UPDATE trades SET extra_json = ?, updated_at = ? WHERE id = ?")
               .bind(JSON.stringify(extra), nowISO(), tradeId).run();
           }
@@ -3258,7 +3130,7 @@ async function executeTrade(env, userId, tradeId) {
       try {
         const apiKey = await decrypt(session.api_key_encrypted, env);
         const apiSecret = await decrypt(session.api_secret_encrypted, env);
-        await ensureFuturesIsolatedWithLev(env, ex, apiKey, apiSecret, trade.symbol);
+        await ensureFuturesIsolated1x(ex, apiKey, apiSecret, trade.symbol);
         result = await placeBinanceFuturesLimitPostOnly(ex, apiKey, apiSecret,
           trade.symbol, isShort ? 'SELL' : 'BUY', baseQty, makerPx, false, CID);
       } catch (e) {
@@ -3276,7 +3148,7 @@ async function executeTrade(env, userId, tradeId) {
       try {
         const apiKey = await decrypt(session.api_key_encrypted, env);
         const apiSecret = await decrypt(session.api_secret_encrypted, env);
-        await ensureFuturesIsolatedWithLev(env, ex, apiKey, apiSecret, trade.symbol);
+        await ensureFuturesIsolated1x(ex, apiKey, apiSecret, trade.symbol);
         result = await placeBybitFuturesLimitPostOnly(
           ex, apiKey, apiSecret, trade.symbol,
           isShort ? 'SELL' : 'BUY', baseQty, makerPx, false, CID
@@ -3349,7 +3221,6 @@ async function executeTrade(env, userId, tradeId) {
           }
           if (br) {
             extra.open_brackets = { tp: br.tp ? { orderId: br.tp.orderId } : null, sl: br.sl ? { orderId: br.sl.orderId } : null };
-            extra.inline_tpsl = true; // flag that TP/SL are on-exchange
             await env.DB.prepare("UPDATE trades SET extra_json = ?, updated_at = ? WHERE id = ?")
               .bind(JSON.stringify(extra), nowISO(), tradeId).run();
           }
@@ -3508,7 +3379,6 @@ async function checkWorkingOrders(env, userId) {
           if (br) {
             const ex2 = JSON.parse((await env.DB.prepare("SELECT extra_json FROM trades WHERE id=?").bind(t.id).first()).extra_json || '{}');
             ex2.open_brackets = { tp: br.tp ? { orderId: br.tp.orderId } : null, sl: br.sl ? { orderId: br.sl.orderId } : null };
-            ex2.inline_tpsl = true; // flag that TP/SL are on-exchange
             await env.DB.prepare("UPDATE trades SET extra_json = ?, updated_at = ? WHERE id = ?")
               .bind(JSON.stringify(ex2), nowISO(), t.id).run();
           }
@@ -3559,33 +3429,11 @@ async function closeTradeNow(env, userId, tradeId) {
   try {
     let exitPrice = 0;
 
+    // If brackets were placed, cancel them first to avoid double exec on reduceOnly
     const session = await getSession(env, userId);
     const ex = SUPPORTED_EXCHANGES[session.exchange_name];
     const extra = JSON.parse(trade.extra_json || '{}');
     if (extra?.open_brackets) await cancelBracketsIfAny(env, userId, trade, session, ex, extra);
-
-    // Live-size guard before reduce-only
-    if (session.exchange_name !== 'crypto_parrot') {
-      if (ex && (ex.kind === "binanceFuturesUSDT" || ex.kind === "bybitFuturesV5")) {
-        const apiKey = await decrypt(session.api_key_encrypted, env);
-        const apiSecret = await decrypt(session.api_secret_encrypted, env);
-        const live = await getLiveFuturesPositionSize(ex, apiKey, apiSecret, trade.symbol);
-        if (!live || live.size <= 0) {
-          // Already closed at exchange — close locally as manual
-          const exitPx = await robustPriceFor(trade.symbol);
-          const gross = (trade.side === 'SELL') ? (trade.entry_price - exitPx) * trade.qty : (exitPx - trade.entry_price) * trade.qty;
-          const fees = (trade.entry_price * trade.qty + exitPx * trade.qty) * (protocol?.fee_rate ?? 0.001);
-          const net = gross - fees;
-          const r = trade.risk_usd > 0 ? net / trade.risk_usd : 0;
-          await env.DB.prepare(
-            `UPDATE trades SET status='closed', price=?, realized_pnl=?, realized_r=?, fees=?, close_type='MANUAL', updated_at=? WHERE id=?`
-          ).bind(exitPx, net, r, fees, nowISO(), tradeId).run();
-          await gistReportClosed(env, trade, exitPx, 'MANUAL', protocol?.fee_rate);
-          await setSymbolCooldown(env, userId, trade.symbol);
-          return { ok: true, msg: "Closed (already flat at exchange)." };
-        }
-      }
-    }
 
     if (!isShort) {
       const sellResult = await placeMarketSell(env, userId, trade.symbol, trade.qty, false, { reduceOnly: true, clientOrderId: extra?.client_order_id || null });
@@ -3605,7 +3453,7 @@ async function closeTradeNow(env, userId, tradeId) {
 
     // Try to fetch true commissions + maker/taker + fingerprints
     let details = null;
-    if (commFromEx && session.exchange_name !== 'crypto_parrot') {
+    if (commFromEx) {
       try {
         const session2 = await getSession(env, userId);
         const ex2 = SUPPORTED_EXCHANGES[session2.exchange_name];
@@ -3732,75 +3580,27 @@ async function reconcileExchangeFills(env, userId) {
   if (String(env?.RECONCILE_FROM_EXCHANGE || "0") !== "1") return;
 
   const session = await getSession(env, userId);
-  if (!session || session.exchange_name === 'crypto_parrot' || !session.api_key_encrypted || !session.api_secret_encrypted) return;
-  
+  if (!session || !session.api_key_encrypted || !session.api_secret_encrypted) return;
   const ex = SUPPORTED_EXCHANGES[session.exchange_name];
   if (!ex || !ex.hasOrders) return;
 
   const apiKey = await decrypt(session.api_key_encrypted, env);
   const apiSecret = await decrypt(session.api_secret_encrypted, env);
 
+  // Fetch open trades (only these need reconciliation for bracket exits)
   const open = await env.DB.prepare(
-    "SELECT id, symbol, side, qty, entry_price, stop_price, tp_price, risk_usd, extra_json, created_at, updated_at FROM trades WHERE user_id = ? AND status = 'open'"
+    "SELECT id, symbol, side, qty, entry_price, risk_usd, extra_json, created_at, updated_at FROM trades WHERE user_id = ? AND status = 'open'"
   ).bind(userId).all();
 
-  const protocol = await getProtocolState(env, userId);
   const commFromEx = String(env?.COMMISSIONS_FROM_EXCHANGE || "1") === "1";
 
   for (const t of (open.results || [])) {
     try {
-      const isShort = t.side === 'SELL';
-      
-      // Fetch fills once per trade at the top of the loop
-      const startMs = Date.parse(t.created_at || t.updated_at || "") - 30 * 60 * 1000;
-      const fills = (ex.kind === "binanceLike")
-          ? await getBinanceLikeMyTrades(ex, apiKey, apiSecret, t.symbol, { startTime: startMs, limit: 1000 })
-          : (ex.kind === "binanceFuturesUSDT")
-          ? await getBinanceFuturesUserTrades(ex, apiKey, apiSecret, t.symbol, { startTime: startMs, limit: 1000 })
-          : (ex.kind === "bybitFuturesV5")
-          ? await getBybitFuturesUserTrades(ex, apiKey, apiSecret, t.symbol, { startTime: startMs, limit: 1000 })
-          : [];
-
-      // 1. Mirror check: Position is flat on exchange?
-      if (ex.kind === "binanceFuturesUSDT" || ex.kind === "bybitFuturesV5") {
-        const live = await getLiveFuturesPositionSize(ex, apiKey, apiSecret, t.symbol);
-        if (live && live.size === 0) {
-          const exitSideIsBuy = isShort;
-          const exitFills = (fills || []).filter(f => {
-            const isBuyer = f.isBuyer === true || String(f.side || "").toUpperCase() === "BUY";
-            return (isBuyer && exitSideIsBuy) || (!isBuyer && !exitSideIsBuy);
-          });
-          
-          let exitPx = (exitFills.length > 0) ? Number(exitFills[0].price) : 0;
-          if (exitPx <= 0) exitPx = await robustPriceFor(t.symbol);
-          if (exitPx <= 0) continue;
-
-          const reason = (Math.abs((exitPx - t.tp_price)/t.tp_price) < 0.0015) ? 'tp' :
-                         (Math.abs((exitPx - t.stop_price)/t.stop_price) < 0.0015) ? 'sl' : 'manual';
-
-          const grossPnl = !isShort ? (exitPx - t.entry_price) * t.qty : (t.entry_price - exitPx) * t.qty;
-          const fees = (t.entry_price * t.qty + exitPx * t.qty) * (protocol?.fee_rate ?? 0.001);
-          const netPnl = grossPnl - fees;
-          const realizedR = t.risk_usd > 0 ? netPnl / t.risk_usd : 0;
-          
-          await env.DB.prepare(
-            `UPDATE trades SET status='closed', price=?, realized_pnl=?, realized_r=?, fees=?, close_type=?, updated_at=? WHERE id=?`
-          ).bind(exitPx, netPnl, realizedR, fees, reason.toUpperCase(), nowISO(), t.id).run();
-      
-          await gistReportClosed(env, t, exitPx, reason, protocol?.fee_rate);
-          await setSymbolCooldown(env, userId, t.symbol);
-          await logEvent(env, userId, 'trade_close', {
-            symbol: t.symbol, entry: t.entry_price, exit: exitPx, realizedR,
-            hit: reason, exit_source: 'reconcile_mirror', pnl: netPnl, fees
-          });
-          continue;
-        }
-      }
-
       const extra = JSON.parse(t.extra_json || '{}');
-      if (!extra?.open_brackets) continue;
+      if (!extra?.open_brackets) continue; // only reconcile bracket-driven
 
-      // 2. Bracket fill check
+      const isShort = t.side === 'SELL';
+      // Check bracket order statuses
       let tpFill = null, slFill = null;
       if (ex.kind === "binanceLike") {
         const s = await getBinanceLikeOrderStatus(ex, apiKey, apiSecret, t.symbol, extra.open_brackets?.tp?.orderId);
@@ -3821,7 +3621,7 @@ async function reconcileExchangeFills(env, userId) {
         continue;
       }
 
-      if (!tpFill && !slFill) continue;
+      if (!tpFill && !slFill) continue; // nothing to close
 
       const exitReason = tpFill ? "tp" : "sl";
       const st = tpFill || slFill;
@@ -3829,58 +3629,94 @@ async function reconcileExchangeFills(env, userId) {
       const exitPrice = Number(st.avgPrice || 0);
       if (!(exitQty > 0 && exitPrice > 0)) continue;
 
-      // Use pre-fetched fills for commission details
-      let details = null;
-      if (commFromEx) {
-        try {
-          const entrySideIsBuy = !isShort;
-          const exitSideIsBuy = isShort;
-          let commissionEntryUSDT = 0, entryMakerVotes = 0, entryTakerVotes = 0;
-          let commissionExitUSDT = 0, exitMakerVotes = 0, exitTakerVotes = 0;
-          let fp_entry = null, fp_exit = null;
-  
-          for (const f of (fills || [])) {
-            const isBuyer = f.isBuyer === true || String(f.side||"").toUpperCase() === "BUY";
-            const qty = Number(f.qty || f.qty_filled || f.baseQty || 0);
-            const price = Number(f.price || f.avgPrice || 0);
-            const isEntry = (isBuyer && entrySideIsBuy) || (!isBuyer && !entrySideIsBuy);
-            const isExit = (isBuyer && exitSideIsBuy) || (!isBuyer && !exitSideIsBuy);
-  
-            if (isEntry && qty > 0 && price > 0) {
-              if (f.isMaker === true) entryMakerVotes++; else entryTakerVotes++;
-              const cu = await convertCommissionToUSDT((f.commissionAsset || "").toUpperCase(), Number(f.commission || 0));
-              commissionEntryUSDT += cu;
-              if (!fp_entry) fp_entry = fillFingerprint(t.symbol, f);
-            } else if (isExit && qty > 0 && price > 0) {
-              if (f.isMaker === true) exitMakerVotes++; else exitTakerVotes++;
-              const cu = await convertCommissionToUSDT((f.commissionAsset || "").toUpperCase(), Number(f.commission || 0));
-              commissionExitUSDT += cu;
-              if (!fp_exit) fp_exit = fillFingerprint(t.symbol, f);
-            }
-          }
-  
-          const commissionQuoteUSDT = commissionEntryUSDT + commissionExitUSDT;
-          const commissionBps = (t.entry_price > 0 && t.qty > 0) ? (commissionQuoteUSDT / (t.entry_price * t.qty)) * 10000 : 0;
-          details = {
-            fromExchange: true,
-            commission_quote_usdt: commissionQuoteUSDT,
-            commission_bps: commissionBps,
-            maker_taker_entry: entryMakerVotes >= entryTakerVotes ? "M" : "T",
-            maker_taker_exit: exitMakerVotes >= exitTakerVotes ? "M" : "T",
-            commission_asset_entry: "USDT", commission_asset_exit: "USDT",
-            fingerprint_entry: fp_entry, fingerprint_exit: fp_exit
-          };
-        } catch {}
-      }
+      // Commission and maker/taker from userTrades (best-effort)
+      let commissionQuoteUSDT = null;
+      let commissionBps = null;
+      let maker_taker_entry = null;
+      let maker_taker_exit = null;
+      let fp_entry = null;
+      let fp_exit = null;
+      try {
+        // fetch fills in recent window
+        const startMs = Date.parse(t.created_at || t.updated_at || "") - 30 * 60 * 1000;
+        const fills = ex.kind === "binanceLike"
+          ? await getBinanceLikeMyTrades(ex, apiKey, apiSecret, t.symbol, { startTime: startMs, limit: 1000 })
+          : ex.kind === "binanceFuturesUSDT"
+          ? await getBinanceFuturesUserTrades(ex, apiKey, apiSecret, t.symbol, { startTime: startMs, limit: 1000 })
+          : ex.kind === "bybitFuturesV5"
+          ? await getBybitFuturesUserTrades(ex, apiKey, apiSecret, t.symbol, { startTime: startMs, limit: 1000 })
+          : [];
 
+        // Separate entry vs exit by side
+        // For long (BUY entry), exit is SELL; for short (SELL entry), exit is BUY
+        const entrySideIsBuy = !isShort;
+        const exitSideIsBuy = isShort;
+
+        let commissionEntryUSDT = 0, entryMakerVotes = 0, entryTakerVotes = 0;
+        let commissionExitUSDT = 0, exitMakerVotes = 0, exitTakerVotes = 0;
+
+        for (const f of (fills || [])) {
+          const isBuyer = f.isBuyer === true || String(f.side||"").toUpperCase() === "BUY";
+          const qty = Number(f.qty || f.qty_filled || f.baseQty || 0);
+          const price = Number(f.price || f.avgPrice || 0);
+
+          // Derive entry/exit group
+          const isEntry = (isBuyer && entrySideIsBuy) || (!isBuyer && !entrySideIsBuy);
+          const isExit = (isBuyer && exitSideIsBuy) || (!isBuyer && !exitSideIsBuy);
+
+          if (isEntry && qty > 0 && price > 0) {
+            if (f.isMaker === true) entryMakerVotes++; else entryTakerVotes++;
+            if (commFromEx && f.commission != null) {
+              const ca = (f.commissionAsset || "").toUpperCase();
+              const cu = await convertCommissionToUSDT(ca, Number(f.commission || 0));
+              commissionEntryUSDT += cu;
+            }
+            if (!fp_entry) fp_entry = fillFingerprint(t.symbol, f);
+          } else if (isExit && qty > 0 && price > 0) {
+            if (f.isMaker === true) exitMakerVotes++; else exitTakerVotes++;
+            if (commFromEx && f.commission != null) {
+              const ca = (f.commissionAsset || "").toUpperCase();
+              const cu = await convertCommissionToUSDT(ca, Number(f.commission || 0));
+              commissionExitUSDT += cu;
+            }
+            if (!fp_exit) fp_exit = fillFingerprint(t.symbol, f);
+          }
+        }
+
+        if (commFromEx) {
+          commissionQuoteUSDT = commissionEntryUSDT + commissionExitUSDT;
+          if (t.entry_price > 0 && t.qty > 0) {
+            commissionBps = (commissionQuoteUSDT / (t.entry_price * t.qty)) * 10000;
+          }
+        }
+        maker_taker_entry = entryMakerVotes >= entryTakerVotes ? "M" : "T";
+        maker_taker_exit = exitMakerVotes >= exitTakerVotes ? "M" : "T";
+      } catch {}
+
+      // Close trade in DB
+      const protocol = await getProtocolState(env, userId);
       const grossPnl = !isShort ? (exitPrice - t.entry_price) * t.qty : (t.entry_price - exitPrice) * t.qty;
-      const fees = details?.commission_quote_usdt ?? (t.entry_price * t.qty + exitPrice * t.qty) * (protocol?.fee_rate ?? 0.001);
+      const feesEst = (t.entry_price * t.qty + exitPrice * t.qty) * (protocol?.fee_rate ?? 0.001);
+      const fees = commFromEx && Number.isFinite(commissionQuoteUSDT) ? commissionQuoteUSDT : feesEst;
       const netPnl = grossPnl - fees;
       const realizedR = t.risk_usd > 0 ? netPnl / t.risk_usd : 0;
 
       await env.DB.prepare(
         `UPDATE trades SET status='closed', price=?, realized_pnl=?, realized_r=?, fees=?, close_type=?, updated_at=? WHERE id=?`
       ).bind(exitPrice, netPnl, realizedR, fees, exitReason.toUpperCase(), nowISO(), t.id).run();
+
+      // Prepare details for gistReportClosed
+      const details = {
+        fromExchange: true,
+        commission_quote_usdt: commissionQuoteUSDT ?? fees,
+        commission_bps: commissionBps ?? ((fees / Math.max(1e-9, t.entry_price * t.qty)) * 10000),
+        maker_taker_entry: maker_taker_entry,
+        maker_taker_exit: maker_taker_exit,
+        commission_asset_entry: "USDT",
+        commission_asset_exit: "USDT",
+        fingerprint_entry: fp_entry,
+        fingerprint_exit: fp_exit
+      };
 
       await gistReportClosed(env, t, exitPrice, exitReason, protocol?.fee_rate, details);
       await setSymbolCooldown(env, userId, t.symbol);
@@ -3930,7 +3766,7 @@ async function checkAndExitTrades(env, userId) {
       // Management overlay (BE, trail, partial, TTL rescue, early cut)
       let extra = {};
       try { extra = JSON.parse(trade.extra_json || '{}'); } catch { extra = {}; }
-      const haveBrackets = !!(extra.open_brackets || extra.inline_tpsl);
+      const haveBrackets = !!(extra.open_brackets);
       const mgmt = extra?.mgmt || {};
       const rNow = unrealizedR(trade, currentPrice);
       const costBps = extra?.idea_fields?.cost_bps;
@@ -3969,12 +3805,46 @@ async function checkAndExitTrades(env, userId) {
         }
 
         // 4) Early cut (soft SL)
-        if (!shouldExit && mgmt.early_cut_if_unrealized_bps_le != null) {
+        if (mgmt.early_cut_if_unrealized_bps_le != null) {
           const thrLe = parseThreshold(mgmt.early_cut_if_unrealized_bps_le, costBps);
           const bpsUnreal = ((currentPrice / trade.entry_price - 1) * (isShort ? -1 : 1)) * 10000;
           if (thrLe != null && bpsUnreal <= thrLe) {
-            shouldExit = true;
-            exitReason = 'MGMT_EARLY_CUT';
+            // Cancel brackets first (if any)
+            if (haveBrackets) {
+              const session2 = await getSession(env, userId);
+              const ex2 = SUPPORTED_EXCHANGES[session2.exchange_name];
+              await cancelBracketsIfAny(env, userId, trade, session2, ex2, extra);
+            }
+
+            // Immediate close
+            let exitPrice = currentPrice;
+            if (!isShort) {
+              const sellResult = await placeMarketSell(env, userId, trade.symbol, trade.qty, false, { reduceOnly: true });
+              exitPrice = sellResult.avgPrice || currentPrice;
+            } else {
+              const session = await getSession(env, userId);
+              if (session.exchange_name === 'crypto_parrot') {
+                const buyResult = await placeDemoOrder(trade.symbol, "BUY", trade.qty, false);
+                exitPrice = buyResult.avgPrice || currentPrice;
+              } else {
+                const buyResult = await placeMarketBuy(env, userId, trade.symbol, trade.qty * currentPrice, { reduceOnly: true });
+                exitPrice = buyResult.avgPrice || currentPrice;
+              }
+            }
+
+            const grossPnl = !isShort ? (exitPrice - trade.entry_price) * trade.qty
+                                      : (trade.entry_price - exitPrice) * trade.qty;
+            const fees = (trade.entry_price * trade.qty + exitPrice * trade.qty) * (protocol?.fee_rate ?? 0.001);
+            const netPnl = grossPnl - fees;
+            const realizedR = trade.risk_usd > 0 ? netPnl / trade.risk_usd : 0;
+
+            await env.DB.prepare(
+              `UPDATE trades SET status='closed', price=?, realized_pnl=?, realized_r=?, fees=?, close_type='MGMT_EARLY_CUT', updated_at=? WHERE id=?`
+            ).bind(exitPrice, netPnl, realizedR, fees, nowISO(), trade.id).run();
+            await gistReportClosed(env, trade, exitPrice, 'MGMT_EARLY_CUT', protocol?.fee_rate);
+            await setSymbolCooldown(env, userId, trade.symbol);
+            await logEvent(env, userId, 'trade_close', { symbol: trade.symbol, entry: trade.entry_price, exit: exitPrice, realizedR, close_type: 'MGMT_EARLY_CUT', pnl: netPnl, fees });
+            continue; // proceed next trade
           }
         }
 
@@ -3985,6 +3855,7 @@ async function checkAndExitTrades(env, userId) {
           try {
             if (trade.side === 'SELL') {
               const buy = await placeMarketBuy(env, userId, trade.symbol, qtyPart * currentPrice, { reduceOnly: true });
+              // adjust remaining qty
               const newQty = Math.max(0, trade.qty - (buy.executedQty || qtyPart));
               await env.DB.prepare("UPDATE trades SET qty = ?, updated_at = ? WHERE id = ?")
                 .bind(newQty, nowISO(), trade.id).run();
@@ -4008,7 +3879,8 @@ async function checkAndExitTrades(env, userId) {
       }
 
       // Priority: TP > SL > TTL
-      if (!shouldExit && !haveBrackets) {
+      const useBracketsSkipPrice = haveBrackets;
+      if (!useBracketsSkipPrice) {
         if (!isShort) {
           if (currentPrice <= newStop) { shouldExit = true; exitReason = 'SL'; }
           else if (currentPrice >= trade.tp_price) { shouldExit = true; exitReason = 'TP'; }
@@ -4020,7 +3892,8 @@ async function checkAndExitTrades(env, userId) {
 
       // TTL enforcement (per-trade)
       if (!shouldExit) {
-        let ttlTs = extra?.ttl?.ttl_ts_ms ?? null;
+        let ttlTs = null;
+        try { ttlTs = Number(JSON.parse(trade.extra_json || '{}')?.ttl?.ttl_ts_ms ?? null); } catch {}
         if (isFinite(ttlTs) && ttlTs > 0 && Date.now() >= ttlTs) {
           shouldExit = true;
           exitReason = 'TTL';
@@ -4028,60 +3901,40 @@ async function checkAndExitTrades(env, userId) {
       }
 
       // Fallback global TIME stop (only if no per-trade TTL stored)
-      if (!shouldExit && !(extra?.ttl?.ttl_ts_ms > 0)) {
-        const openedAtMs = Date.parse(trade.updated_at || trade.created_at || "");
-        if (isFinite(openedAtMs) && (Date.now() - openedAtMs >= AGE_MS_FALLBACK)) {
-          shouldExit = true;
-          exitReason = 'TIME';
+      if (!shouldExit) {
+        let ttlTs = null; try { ttlTs = Number(JSON.parse(trade.extra_json || '{}')?.ttl?.ttl_ts_ms ?? null); } catch {}
+        if (!(isFinite(ttlTs) && ttlTs > 0)) {
+          const openedAtMs = Date.parse(trade.updated_at || trade.created_at || "");
+          if (isFinite(openedAtMs) && (Date.now() - openedAtMs >= AGE_MS_FALLBACK)) {
+            shouldExit = true;
+            exitReason = 'TIME';
+          }
         }
       }
 
       if (!shouldExit) continue;
 
+      // Cancel brackets first (if any) to avoid double-exec
       if (haveBrackets) {
         const session2 = await getSession(env, userId);
         const ex2 = SUPPORTED_EXCHANGES[session2.exchange_name];
         await cancelBracketsIfAny(env, userId, trade, session2, ex2, extra);
       }
 
-      let qtyToClose = trade.qty;
-      const session = await getSession(env, userId);
-      const ex = SUPPORTED_EXCHANGES[session.exchange_name];
-      if (session.exchange_name !== 'crypto_parrot' && ex && (ex.kind === "binanceFuturesUSDT" || ex.kind === "bybitFuturesV5")) {
-        const apiKey = await decrypt(session.api_key_encrypted, env);
-        const apiSecret = await decrypt(session.api_secret_encrypted, env);
-        const live = await getLiveFuturesPositionSize(ex, apiKey, apiSecret, trade.symbol);
-        if (!live || live.size <= 0) {
-          const exitPrice = currentPrice;
-          const grossPnl = !isShort ? (exitPrice - trade.entry_price) * trade.qty : (trade.entry_price - exitPrice) * trade.qty;
-          const fees = (trade.entry_price * trade.qty + exitPrice * trade.qty) * (protocol?.fee_rate ?? 0.001);
-          const netPnl = grossPnl - fees;
-          const realizedR = trade.risk_usd > 0 ? netPnl / trade.risk_usd : 0;
-          await env.DB.prepare(
-            `UPDATE trades SET status = 'closed', price = ?, realized_pnl = ?, realized_r = ?, fees = ?, close_type = ?, updated_at = ? WHERE id = ?`
-          ).bind(exitPrice, netPnl, realizedR, fees, exitReason, nowISO(), trade.id).run();
-          await gistReportClosed(env, trade, exitPrice, exitReason, protocol?.fee_rate);
-          await setSymbolCooldown(env, userId, trade.symbol);
-          await logEvent(env, userId, 'trade_close', { symbol: trade.symbol, realizedR, hit: exitReason, exit_source: 'mirror_guard' });
-          continue;
-        } else {
-          qtyToClose = live.size;
-        }
-      }
-      
       const cidBase = extra?.client_order_id || null;
       const exitCid = (exitReason === 'TTL' || exitReason === 'TIME') && cidBase ? `${cidBase}:ttl` : cidBase;
 
       let exitPrice = currentPrice;
       if (!isShort) {
-        const sellResult = await placeMarketSell(env, userId, trade.symbol, qtyToClose, false, { reduceOnly: true, clientOrderId: exitCid });
+        const sellResult = await placeMarketSell(env, userId, trade.symbol, trade.qty, false, { reduceOnly: true, clientOrderId: exitCid });
         exitPrice = sellResult.avgPrice || currentPrice;
       } else {
+        const session = await getSession(env, userId);
         if (session.exchange_name === 'crypto_parrot') {
-          const buyResult = await placeDemoOrder(trade.symbol, "BUY", qtyToClose, false, exitCid);
+          const buyResult = await placeDemoOrder(trade.symbol, "BUY", trade.qty, false, exitCid);
           exitPrice = buyResult.avgPrice || currentPrice;
         } else {
-          const requiredQuote = qtyToClose * currentPrice;
+          const requiredQuote = trade.qty * currentPrice;
           const buyResult = await placeMarketBuy(env, userId, trade.symbol, requiredQuote, { reduceOnly: true, clientOrderId: exitCid });
           exitPrice = buyResult.avgPrice || currentPrice;
         }
@@ -4137,6 +3990,7 @@ export {
   // new reconciliation export (wired in Section 7)
   reconcileExchangeFills
 };
+
 /* ======================================================================
    SECTION 6/7 — UI Texts, Cards, Keyboards, Dashboard, Lists,
                   Trade Details, Actions, Concurrency helpers
@@ -4716,7 +4570,6 @@ export {
   handleStopRequest, restartWizardAtExchange, showWelcomeStep,
   getMaxConcurrent, getMaxNewPerCycle
 };
-
 /* ======================================================================
    SECTION 7/7 — processUser, Telegram handler, HTTP endpoints,
                   Cron with fan-out fallback, Worker export
@@ -4805,66 +4658,6 @@ async function processUser(env, userId, budget = null) {
     const ex = SUPPORTED_EXCHANGES[session.exchange_name];
     if (!ex) return;
 
-    // Strict compatibility branch for Crypto Parrot to bypass new gating logic
-    if (session.exchange_name === 'crypto_parrot' && String(env?.PARROT_STRICT_COMPAT || '1') === '1') {
-      // 1) Housekeeping (mirroring, working orders, exits)
-      await reconcileExchangeFills(env, userId);
-      await checkWorkingOrders(env, userId);
-      await checkAndExitTrades(env, userId);
-      if (budget?.isExpired()) return;
-
-      // 2) Load latest ideas
-      let ideas = await buildIdeasFromGistPending(env);
-      if (ideas === null) {
-        ideas = await getLatestIdeas(env);
-      }
-      if (!ideas || !ideas.ideas || !ideas.ideas.length) {
-        return;
-      }
-      
-      // 3) Open up to N ideas immediately, bypassing all new gates
-      const maxNew = Number(env.PARROT_MAX_NEW_PER_CYCLE || 3);
-      let opened = 0;
-      const protocol = await getProtocolState(env, userId);
-      if (!protocol) return;
-
-      for (const idea of ideas.ideas) {
-        if (budget?.isExpired() || opened >= maxNew) break;
-
-        // Create pending trade. This bypasses all pre-check gates (dups, concurrency, budgets).
-        const { id } = await createPendingTrade(env, userId, idea, protocol);
-        if (!id) {
-          continue;
-        }
-
-        // Execute the trade
-        const executed = await executeTrade(env, userId, id);
-        if (executed) {
-          opened++;
-        } else {
-          // Mark as failed if execution fails so it's not retried
-          await env.DB.prepare("UPDATE trades SET status = 'failed', updated_at = ? WHERE id = ?").bind(nowISO(), id).run();
-        }
-      }
-      return; // Exit processUser to prevent running the standard logic.
-    }
-
-    // PowerShell methodology: Close all first (all non-demo exchanges)
-    const closeAllFirst = String(env?.CLOSE_ALL_FIRST || '1') === '1'; // DEFAULT ON
-    if (closeAllFirst && session.exchange_name !== 'crypto_parrot') {
-      const openCount = await getOpenPositionsCount(env, userId);
-      if (openCount > 0) {
-        console.log(`[${userId}] Closing ${openCount} existing positions...`);
-        const closed = await closeAllOpenPositions(env, userId);
-        await logEvent(env, userId, 'close_all_first', { closed, total: openCount });
-        
-        // Wait for exchange to settle (PowerShell delay equivalent)
-        await sleep(3000);
-        
-        if (budget?.isExpired()) return;
-      }
-    }
-
     // Enforce futures-only for non-demo; optionally log and skip ideas
     if (session.exchange_name !== 'crypto_parrot' && ["binanceLike","lbankV2","coinexV2"].includes(ex.kind)) {
       // Option 1: log once and return
@@ -4934,7 +4727,7 @@ async function processUser(env, userId, budget = null) {
     // Freshness guard
     try {
       const ts = new Date(ideas.ts || 0).getTime();
-      const maxAgeMs = Number(env.IDEAS_MAX_AGE_MS || 180000);
+      const maxAgeMs = Number(env.IDEAS_MAX_AGE_MS || 20 * 60 * 1000);
       if (!ts || (Date.now() - ts) > maxAgeMs) return;
     } catch (_) {}
 
