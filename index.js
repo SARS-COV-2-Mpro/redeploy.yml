@@ -15,10 +15,10 @@ const SUPPORTED_EXCHANGES = {
   coinex: { label: "CoinEx",  kind: "coinexV2",   baseUrl: "https://api.coinex.com",  hasOrders: true },
 
   // Futures / Margin (USDT-M)
-  binance_futures: { label: "Binance Futures (USDT-M)", kind: "binanceFuturesUSDT", baseUrl: "https://fapi.binance.com", apiKeyHeader: "X-MBX-APIKEY", hasOrders: true },
+  binance_futures: { label: "Binance Futures (USDT-M)", kind: "binanceFuturesUSDT", baseUrl: "https://railway-2z9h.onrender.com", apiKeyHeader: "X-MBX-APIKEY", hasOrders: true },
 
   // Bybit Futures (NEW — trading enabled)
-  bybit_futures_testnet: { label: "Bybit Futures (Demo-Testnet)", kind: "bybitFuturesV5", baseUrl: "https://api-demo-testnet.bybit.com", hasOrders: true },
+  bybit_futures_testnet: { label: "Bybit Futures (Demo-Testnet)", kind: "bybitFuturesV5", baseUrl: "https://api-testnet.bybit.com", hasOrders: true },
   bybit_futures:         { label: "Bybit Futures",           kind: "bybitFuturesV5", baseUrl: "https://api.bybit.com",        hasOrders: true },
 
   // Read-only in this worker
@@ -423,7 +423,6 @@ function gistFindPendingIdxByCID(state, cid) {
 
 /* Exports (optional) */
 export { gistOn, gistGetState, gistPatchState, gistFindPendingIdxByCID };
-
 /* ======================================================================
    SECTION 2/7 — Market Data, Orderbook, and Ideas selection
    (Prefer latest GitHub snapshot; origin 'gha' or 'github_actions')
@@ -2447,7 +2446,8 @@ async function gistReportClosed(env, trade, exitPrice, exitReason, protocolFeeRa
         commission_quote_usdt: commissionQuoteUSDT,
         commission_asset_entry: commissionAssetEntry,
         commission_asset_exit: commissionAssetExit,
-        fingerprint_entry: fingerprintEntry, fingerprint_exit: fingerprintExit
+        fingerprint_entry: fingerprintEntry,
+        fingerprint_exit: fingerprintExit
       },
       realized: {
         tp_hit: normalizeExitReason(exitReason) === 'tp',
@@ -2536,6 +2536,10 @@ function getFixedTradeNotional(env, TC) {
 function fixedStrict(env) {
   // If '1', ignore notional caps (still bounded by funds)
   return String(env?.FIXED_TRADE_STRICT || '0') === '1';
+}
+
+function useIdeaNotional(env) {
+  return String(env?.USE_IDEA_NOTIONAL || '1') === '1'; // keep legacy behavior unless you set it to "0"
 }
 
 /* ---------- Duplicate symbols policy (env-driven) ---------- */
@@ -2859,10 +2863,14 @@ async function createPendingTrade(env, userId, idea, protocol) {
   const Desired_Risk_USD = B_eff * k_dd * f_raw * c_corr * g;
 
   const fixedNotional = getFixedTradeNotional(env, TC);
-  const planNotional = Number(idea?.notional_usd);
-  let notionalDesired = (isFinite(planNotional) && planNotional > 0)
-    ? planNotional
-    : (fixedNotional != null ? fixedNotional : (Desired_Risk_USD / sL));
+  const planNotionalRaw = Number(idea?.notional_usd);
+  const planNotional = (useIdeaNotional(env) && isFinite(planNotionalRaw) && planNotionalRaw > 0) ? planNotionalRaw : null;
+
+  let notionalDesired =
+    (fixedNotional != null)
+    ? fixedNotional // your FIXED_TRADE_NOTIONAL_* wins
+    : (planNotional != null ? planNotional // otherwise honor idea.notional_usd
+    : (Desired_Risk_USD / sL)); // else risk-based
 
   const capPerTrade  = fixedStrict(env) ? Number.POSITIVE_INFINITY : perTradeNotionalCap;
   const capDailyLeft = fixedStrict(env) ? Number.POSITIVE_INFINITY : dailyNotionalLeft;
@@ -3990,7 +3998,6 @@ export {
   // new reconciliation export (wired in Section 7)
   reconcileExchangeFills
 };
-
 /* ======================================================================
    SECTION 6/7 — UI Texts, Cards, Keyboards, Dashboard, Lists,
                   Trade Details, Actions, Concurrency helpers
@@ -5597,3 +5604,5 @@ export default {
     ctx.waitUntil(runCron(env));  // ensures non-blocking execution
   },
 };
+
+
