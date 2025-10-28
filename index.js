@@ -1,7 +1,7 @@
 /* ======================================================================
    Exchange Server Worker — External Ideas Only + Fan-out Fallback
    (10/10 suggester compatible: dynamic RRR, prob/EV via env flags)
-   SECTION 1/7 — Constants, Utils, Crypto, DB, Telegram
+   SECTION 1/7 — Constants, Utils, Crypto, DB, Telegram, Logging
    ====================================================================== */
 
 /* ---------- Constants (Exchanges) ---------- */
@@ -17,20 +17,20 @@ const SUPPORTED_EXCHANGES = {
   // Futures / Margin (USDT-M)
   binance_futures: { label: "Binance Futures (USDT-M)", kind: "binanceFuturesUSDT", baseUrl: "https://railway-2z9h.onrender.com", apiKeyHeader: "X-MBX-APIKEY", hasOrders: true },
 
-  // Bybit Futures (NEW — trading enabled)
+  // Bybit Futures
   bybit_futures_testnet: { label: "Bybit Futures (Demo-Testnet)", kind: "bybitFuturesV5", baseUrl: "https://api-testnet.bybit.com", hasOrders: true },
   bybit_futures:         { label: "Bybit Futures",           kind: "bybitFuturesV5", baseUrl: "https://api.bybit.com",        hasOrders: true },
 
-  // Read-only in this worker
+  // Read-only
   bybit:  { label: "Bybit (Wallet)", kind: "bybitV5", baseUrl: "https://api.bybit.com", hasOrders: false },
   kraken: { label: "Kraken", kind: "krakenV0", baseUrl: "https://api.kraken.com", hasOrders: false },
   gate:   { label: "Gate",   kind: "gateV4",   baseUrl: "https://api.gateio.ws",   hasOrders: false },
   huobi:  { label: "Huobi",  kind: "huobiV1",  baseHost: "api.huobi.pro", scheme: "https", hasOrders: false }
 };
 
-/* ---------- Brain & Risk Parameters (original behavior) ---------- */
-const STRICT_RRR = 2.0;          // default 2:1 (used when idea exits are not provided)
-const ACP_FRAC = 0.80;           // keep constant to avoid Demo bank_closed
+/* ---------- Brain & Risk Parameters ---------- */
+const STRICT_RRR = 2.0;
+const ACP_FRAC = 0.80;
 const PER_TRADE_CAP_FRAC = 0.10;
 const DAILY_OPEN_RISK_CAP_FRAC = 0.30;
 
@@ -45,7 +45,7 @@ const HSE_CFG = {
 /* Kelly blend and numerics */
 const LAMBDA_BLEND = 0.5;
 const EPS_VARIANCE = 1e-9;
-const MIN_STOP_PCT = 0.0025;     // floor used when idea exits absent
+const MIN_STOP_PCT = 0.0025;
 const SQS_MIN_DEFAULT = 0.30;
 
 /* ---------- System-level ---------- */
@@ -57,9 +57,9 @@ const DEFAULT_MAX_CONCURRENT_POS = 3;
 const DEFAULT_MAX_NEW_POSITIONS_PER_CYCLE = 3;
 
 const CRON_LAST_RUN_KEY = "cron_last_run_ts";
-function cronIntervalMs(env) { return Math.max(60000, Number(env.CRON_INTERVAL_MS || 60000)); } // default 60s
-function cronCatchupMax(env) { return Math.max(0, Math.floor(Number(env.CRON_CATCHUP_MAX_CYCLES || 3))); } // cap catch-up passes
-function cronGapAlertMs(env) { return Math.max(0, Number(env.CRON_GAP_ALERT_MS || 300000)); } // alert if >5m gap
+function cronIntervalMs(env) { return Math.max(60000, Number(env.CRON_INTERVAL_MS || 60000)); }
+function cronCatchupMax(env) { return Math.max(0, Math.floor(Number(env.CRON_CATCHUP_MAX_CYCLES || 3))); }
+function cronGapAlertMs(env) { return Math.max(0, Number(env.CRON_GAP_ALERT_MS || 300000)); }
 
 /* ---------- Tiny utils ---------- */
 const te = new TextEncoder();
@@ -91,9 +91,16 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 function pctChange(a, b) { return b > 0 ? (a - b) / b : 0; }
 const bpsToFrac = (bps) => Number(bps || 0) / 10000;
 
-/* Env helpers (used later to respect exec.post_only and mgmt overlays) */
-function envFlag(env, key, def = "0") { return String(env?.[key] ?? def) === "1"; }
-function envNum(env, key, def) { const v = Number(env?.[key]); return Number.isFinite(v) ? v : def; }
+/* FIXED: Env helpers with validation */
+function envFlag(env, key, def = "0") { 
+  if (!env || typeof env !== 'object') return def === "1";
+  return String(env[key] ?? def) === "1"; 
+}
+function envNum(env, key, def) { 
+  if (!env || typeof env !== 'object') return def;
+  const v = Number(env[key]); 
+  return Number.isFinite(v) ? v : def; 
+}
 
 /* UI helpers */
 function formatMoney(amount) { return `$${Number(amount || 0).toFixed(8)}`; }
@@ -106,31 +113,39 @@ function formatDurationShort(ms) {
   return h > 0 ? `${h}h ${m}m` : `${m}m`;
 }
 
-/* ---------- LRU+TTL cache (flat CPU; bounded size) ---------- */
+/* ---------- FIXED: LRU+TTL cache (properly bounded) ---------- */
 class TTLLRU {
   constructor(capacity = 512, ttlMs = 60000) {
     this.cap = Math.max(1, capacity);
     this.ttl = Math.max(1, ttlMs);
-    this.map = new Map(); // key -> { v, e }
+    this.map = new Map();
   }
+  
   get(key) {
     const ent = this.map.get(key);
     if (!ent) return undefined;
-    if (ent.e <= Date.now()) { this.map.delete(key); return undefined; }
-    // refresh recency
+    if (ent.e <= Date.now()) { 
+      this.map.delete(key); 
+      return undefined; 
+    }
+    // Refresh recency
     this.map.delete(key);
     this.map.set(key, ent);
     return ent.v;
   }
+  
   set(key, value, ttlMs = this.ttl) {
     const e = Date.now() + Math.max(1, ttlMs);
     if (this.map.has(key)) this.map.delete(key);
     this.map.set(key, { v: value, e });
-    if (this.map.size > this.cap) {
+    
+    // FIXED: Evict oldest entries until size <= cap
+    while (this.map.size > this.cap) {
       const oldest = this.map.keys().next().value;
       this.map.delete(oldest);
     }
   }
+  
   delete(key) { this.map.delete(key); }
   clear() { this.map.clear(); }
   size() { return this.map.size; }
@@ -138,11 +153,16 @@ class TTLLRU {
 
 /* ---------- Resource guards ---------- */
 const DEFAULT_FETCH_TIMEOUT_MS = 3000;
+
+// FIXED: Proper AbortError
 async function safeFetch(url, options = {}, timeoutMs = DEFAULT_FETCH_TIMEOUT_MS) {
   const ctrl = new AbortController();
-  const to = setTimeout(() => ctrl.abort("timeout"), timeoutMs);
-  try { return await fetch(url, { ...options, signal: ctrl.signal }); }
-  finally { clearTimeout(to); }
+  const to = setTimeout(() => ctrl.abort(new Error('Fetch timeout')), timeoutMs);
+  try { 
+    return await fetch(url, { ...options, signal: ctrl.signal }); 
+  } finally { 
+    clearTimeout(to); 
+  }
 }
 
 const DEFAULT_CPU_BUDGET_MS = 12000;
@@ -152,62 +172,254 @@ function createCpuBudget(ms = DEFAULT_CPU_BUDGET_MS) {
     deadline,
     isExpired() { return Date.now() > deadline; },
     timeLeft() { return Math.max(0, deadline - Date.now()); },
-    ensure(label) { if (this.isExpired()) throw new Error(`CPU budget exceeded at ${label}`); }
+    ensure(label) { 
+      if (this.isExpired()) throw new Error(`CPU budget exceeded at ${label}`); 
+    }
   };
 }
 
-/* ---------- Telegram helpers (safe edit fallback) ---------- */
-async function answerCallbackQuery(env, id) {
-  const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/answerCallbackQuery`;
-  const r = await safeFetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ callback_query_id: id }) }).catch(() => null);
-  if (r) await r.text().catch(() => {});
+/* ======================================================================
+   LOGGING FRAMEWORK — Structured, timestamped, filterable
+   ====================================================================== */
+
+const LOG_LEVELS = {
+  DEBUG: 0,
+  INFO: 1,
+  WARN: 2,
+  ERROR: 3,
+  CRITICAL: 4
+};
+
+class Logger {
+  constructor(env, context = {}) {
+    this.env = env;
+    this.context = context;
+    this.level = LOG_LEVELS[env?.LOG_LEVEL || 'INFO'] || LOG_LEVELS.INFO;
+    // FIXED: Timestamp-based session ID (no collision risk)
+    this.sessionId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+    this.webhookFailures = 0;
+    this.dbFailures = 0;
+  }
+
+  _log(level, message, data = {}) {
+    if (LOG_LEVELS[level] < this.level) return;
+    
+    const entry = {
+      ts: new Date().toISOString(),
+      level,
+      session: this.sessionId,
+      msg: message,
+      ...this.context,
+      ...data
+    };
+
+    // Console output (readable format)
+    const prefix = `[${entry.ts}][${level}][${this.sessionId}]`;
+    const suffix = Object.keys(data).length 
+      ? ` | ${JSON.stringify(data)}` 
+      : '';
+    console.log(`${prefix} ${message}${suffix}`);
+
+    // FIXED: Circuit breaker for webhook
+    if (this.env?.LOG_WEBHOOK_URL && 
+        LOG_LEVELS[level] >= LOG_LEVELS.WARN && 
+        this.webhookFailures < 3) {
+      this._sendToWebhook(entry).catch(() => {
+        this.webhookFailures++;
+      });
+    }
+
+    // FIXED: Circuit breaker for DB + existence check
+    if (this.env?.DB && 
+        LOG_LEVELS[level] >= LOG_LEVELS.ERROR && 
+        this.dbFailures < 3) {
+      this._storeToDB(entry).catch(() => {
+        this.dbFailures++;
+      });
+    }
+  }
+
+  async _sendToWebhook(entry) {
+    try {
+      await safeFetch(this.env.LOG_WEBHOOK_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(entry)
+      }, 3000);
+    } catch (e) {
+      console.error('[Logger] Webhook failed:', e.message);
+      throw e;
+    }
+  }
+
+  async _storeToDB(entry) {
+    try {
+      await this.env.DB.prepare(
+        "INSERT INTO error_log (ts, level, session_id, message, data) VALUES (?, ?, ?, ?, ?)"
+      ).bind(
+        entry.ts,
+        entry.level,
+        entry.session,
+        entry.msg,
+        JSON.stringify(entry)
+      ).run();
+    } catch (e) {
+      console.error('[Logger] DB storage failed:', e.message);
+      throw e;
+    }
+  }
+
+  debug(msg, data) { this._log('DEBUG', msg, data); }
+  info(msg, data) { this._log('INFO', msg, data); }
+  warn(msg, data) { this._log('WARN', msg, data); }
+  error(msg, data) { this._log('ERROR', msg, data); }
+  critical(msg, data) { this._log('CRITICAL', msg, data); }
+
+  // Scoped logger for sub-operations
+  scope(additionalContext) {
+    const scoped = new Logger(this.env, { ...this.context, ...additionalContext });
+    scoped.sessionId = this.sessionId; // Share session ID
+    scoped.webhookFailures = this.webhookFailures;
+    scoped.dbFailures = this.dbFailures;
+    return scoped;
+  }
+
+  // FIXED: Performance timing with proper cleanup
+  time(label) {
+    const start = performance?.now ? performance.now() : Date.now();
+    let ended = false;
+    return {
+      end: (data = {}) => {
+        if (ended) return 0; // Prevent double-end
+        ended = true;
+        const duration = (performance?.now ? performance.now() : Date.now()) - start;
+        this.info(`⏱️ ${label}`, { duration_ms: duration.toFixed(2), ...data });
+        return duration;
+      }
+    };
+  }
 }
+
+/* Migration SQL (run once in D1):
+CREATE TABLE IF NOT EXISTS error_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,
+  level TEXT NOT NULL,
+  session_id TEXT,
+  message TEXT,
+  data TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_error_log_ts ON error_log(ts);
+CREATE INDEX IF NOT EXISTS idx_error_log_level ON error_log(level);
+CREATE INDEX IF NOT EXISTS idx_error_log_session ON error_log(session_id);
+*/
+
+/* ---------- FIXED: Telegram helpers (with error propagation) ---------- */
+async function answerCallbackQuery(env, id) {
+  const log = new Logger(env, { fn: 'answerCallbackQuery' });
+  const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/answerCallbackQuery`;
+  try {
+    const r = await safeFetch(url, { 
+      method: "POST", 
+      headers: { "Content-Type": "application/json" }, 
+      body: JSON.stringify({ callback_query_id: id }) 
+    });
+    if (r) await r.text().catch(() => {});
+    if (!r || !r.ok) {
+      log.warn('Callback query answer failed', { status: r?.status });
+    }
+  } catch (e) {
+    log.error('answerCallbackQuery error', { error: e.message });
+  }
+}
+
 async function sendMessage(chatId, text, buttons, env) {
+  const log = new Logger(env, { fn: 'sendMessage', chatId });
   const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
   const body = { chat_id: chatId, text };
   if (buttons && buttons.length) body.reply_markup = { inline_keyboard: buttons };
-  const r = await safeFetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }, 6000).catch(() => null);
-  if (!r) {
-    console.error("sendMessage fetch error");
-    return;
-  }
-  if (!r.ok) {
-    console.error("sendMessage error:", await r.text().catch(() => "failed to read error body"));
-  } else {
-    await r.text().catch(() => {}); // Safely drain success body
+  
+  try {
+    const r = await safeFetch(url, { 
+      method: "POST", 
+      headers: { "Content-Type": "application/json" }, 
+      body: JSON.stringify(body) 
+    }, 6000);
+    
+    if (!r) {
+      log.error('sendMessage: No response');
+      return false;
+    }
+    
+    const responseText = await r.text().catch(() => '');
+    
+    if (!r.ok) {
+      log.error('sendMessage failed', { 
+        status: r.status, 
+        response: responseText.slice(0, 200) 
+      });
+      return false;
+    }
+    
+    log.debug('Message sent successfully');
+    return true;
+  } catch (e) {
+    log.error('sendMessage exception', { error: e.message });
+    return false;
   }
 }
+
 async function editMessage(chatId, messageId, newText, buttons, env) {
+  const log = new Logger(env, { fn: 'editMessage', chatId, messageId });
   const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/editMessageText`;
   const body = { chat_id: chatId, message_id: messageId, text: newText };
   if (buttons && buttons.length) body.reply_markup = { inline_keyboard: buttons };
   else body.reply_markup = { inline_keyboard: [] };
-  const r = await safeFetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }, 6000).catch(() => null);
-  if (!r) {
-    console.error("editMessage fetch error");
-    return;
-  }
-
-  const responseText = await r.text().catch(() => "Failed to read body");
-
-  if (r.ok) {
-    return;
-  }
-
-  let desc = responseText;
+  
   try {
-    const j = JSON.parse(responseText);
-    desc = j?.description || responseText;
-  } catch { /* use responseText as desc */ }
+    const r = await safeFetch(url, { 
+      method: "POST", 
+      headers: { "Content-Type": "application/json" }, 
+      body: JSON.stringify(body) 
+    }, 6000);
+    
+    if (!r) {
+      log.error('editMessage: No response');
+      return false;
+    }
 
-  if (r.status === 400 && /message is not modified/i.test(desc)) {
-    return;
+    const responseText = await r.text().catch(() => '');
+
+    if (r.ok) {
+      log.debug('Message edited successfully');
+      return true;
+    }
+
+    let desc = responseText;
+    try {
+      const j = JSON.parse(responseText);
+      desc = j?.description || responseText;
+    } catch {}
+
+    // Ignore "message not modified"
+    if (r.status === 400 && /message is not modified/i.test(desc)) {
+      log.debug('Message not modified (no change)');
+      return true;
+    }
+    
+    // Fallback to sendMessage if can't edit
+    if (r.status === 400 && /(can't be edited|message to edit not found)/i.test(desc)) {
+      log.warn('Message not editable, falling back to sendMessage');
+      return await sendMessage(chatId, newText, buttons, env);
+    }
+    
+    log.error('editMessage failed', { status: r.status, description: desc });
+    return false;
+  } catch (e) {
+    log.error('editMessage exception', { error: e.message });
+    return false;
   }
-  if (r.status === 400 && /(can't be edited|message to edit not found)/i.test(desc)) {
-    await sendMessage(chatId, newText, buttons, env);
-    return;
-  }
-  console.error("editMessage error:", r.status, desc);
 }
 
 /* ---------- Crypto (AES-GCM for DB) ---------- */
@@ -217,12 +429,14 @@ async function getCryptoKey(env) {
   const hash = await crypto.subtle.digest("SHA-256", te.encode(key));
   return crypto.subtle.importKey("raw", hash, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
 }
+
 async function encrypt(plain, env) {
   const k = await getCryptoKey(env);
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const enc = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, k, te.encode(plain));
   return `${b64url.encode(iv)}.${b64url.encode(enc)}`;
 }
+
 async function decrypt(cipher, env) {
   const [ivB64, dataB64] = (cipher || "").split(".");
   if (!ivB64 || !dataB64) throw new Error("Bad cipher format");
@@ -231,51 +445,116 @@ async function decrypt(cipher, env) {
   return td.decode(dec);
 }
 
-/* ---------- DB helpers ---------- */
-async function getSession(env, userId) { return env.DB.prepare("SELECT * FROM user_sessions WHERE user_id = ?").bind(userId).first(); }
-async function createSession(env, userId) {
-  await env.DB.prepare("INSERT INTO user_sessions (user_id, current_step, last_interaction_ts, status) VALUES (?, 'start', ?, 'initializing')").bind(userId, nowISO()).run();
-  return getSession(env, userId);
+/* ---------- FIXED: DB helpers (with error handling) ---------- */
+async function getSession(env, userId) { 
+  try {
+    return await env.DB.prepare("SELECT * FROM user_sessions WHERE user_id = ?").bind(userId).first(); 
+  } catch (e) {
+    console.error('[DB] getSession error:', e.message);
+    return null;
+  }
 }
+
+async function createSession(env, userId) {
+  try {
+    await env.DB.prepare(
+      "INSERT INTO user_sessions (user_id, current_step, last_interaction_ts, status) VALUES (?, 'start', ?, 'initializing')"
+    ).bind(userId, nowISO()).run();
+    return getSession(env, userId);
+  } catch (e) {
+    console.error('[DB] createSession error:', e.message);
+    throw e;
+  }
+}
+
 async function saveSession(env, userId, fields) {
   const keys = Object.keys(fields);
   if (!keys.length) return;
-  await env.DB.prepare(`UPDATE user_sessions SET ${keys.map(k => `${k} = ?`).join(", ")}, last_interaction_ts = ? WHERE user_id = ?`)
-    .bind(...keys.map(k => fields[k]), nowISO(), userId).run();
+  try {
+    await env.DB.prepare(
+      `UPDATE user_sessions SET ${keys.map(k => `${k} = ?`).join(", ")}, last_interaction_ts = ? WHERE user_id = ?`
+    ).bind(...keys.map(k => fields[k]), nowISO(), userId).run();
+  } catch (e) {
+    console.error('[DB] saveSession error:', e.message);
+    throw e;
+  }
 }
-async function deleteSession(env, userId) { await env.DB.prepare("DELETE FROM user_sessions WHERE user_id = ?").bind(userId).run(); }
-async function handleDirectStop(env, userId) { await deleteSession(env, userId); await sendMessage(userId, "Session ended. Send /start to begin again.", null, env); }
 
-/* Simple KV via D1 */
-async function kvGet(env, key) { const row = await env.DB.prepare("SELECT value FROM kv_state WHERE key = ?").bind(key).first(); return row ? row.value : null; }
-async function kvSet(env, key, value) { await env.DB.prepare("INSERT OR REPLACE INTO kv_state (key, value) VALUES (?, ?)").bind(key, String(value)).run(); }
+async function deleteSession(env, userId) { 
+  try {
+    await env.DB.prepare("DELETE FROM user_sessions WHERE user_id = ?").bind(userId).run(); 
+  } catch (e) {
+    console.error('[DB] deleteSession error:', e.message);
+  }
+}
+
+async function handleDirectStop(env, userId) { 
+  await deleteSession(env, userId); 
+  await sendMessage(userId, "Session ended. Send /start to begin again.", null, env); 
+}
+
+/* FIXED: Simple KV via D1 with error handling */
+async function kvGet(env, key) { 
+  try {
+    const row = await env.DB.prepare("SELECT value FROM kv_state WHERE key = ?").bind(key).first(); 
+    return row ? row.value : null; 
+  } catch (e) {
+    console.error('[KV] kvGet error:', e.message, 'key:', key);
+    return null;
+  }
+}
+
+async function kvSet(env, key, value) { 
+  try {
+    await env.DB.prepare("INSERT OR REPLACE INTO kv_state (key, value) VALUES (?, ?)").bind(key, String(value)).run(); 
+  } catch (e) {
+    console.error('[KV] kvSet error:', e.message, 'key:', key);
+    throw e;
+  }
+}
 
 /* ---------- Protocol state ---------- */
 async function getProtocolState(env, userId) {
-  return env.DB.prepare("SELECT * FROM protocol_state WHERE user_id = ?").bind(userId).first();
+  try {
+    return await env.DB.prepare("SELECT * FROM protocol_state WHERE user_id = ?").bind(userId).first();
+  } catch (e) {
+    console.error('[DB] getProtocolState error:', e.message);
+    return null;
+  }
 }
+
 async function initProtocolDynamic(env, userId, feeRate, riskPct = 0.01) {
   await env.DB.prepare(
     `INSERT OR REPLACE INTO protocol_state
      (user_id, initial_capital, acp_balance, pr_balance, trigger_threshold, phase, risk_pct, fee_rate, created_at, updated_at)
      VALUES (?, 0, 0, 0, 0, 'normal', ?, ?, ?, ?)`
   ).bind(userId, riskPct, feeRate, nowISO(), nowISO()).run();
-  return { initial_capital: 0, acp_balance: 0, pr_balance: 0, trigger_threshold: 0, phase: 'normal', risk_pct: riskPct, fee_rate: feeRate };
+  return { 
+    initial_capital: 0, 
+    acp_balance: 0, 
+    pr_balance: 0, 
+    trigger_threshold: 0, 
+    phase: 'normal', 
+    risk_pct: riskPct, 
+    fee_rate: feeRate 
+  };
 }
+
 async function updateProtocolState(env, userId, updates) {
   const keys = Object.keys(updates);
   if (!keys.length) return;
-  await env.DB.prepare(`UPDATE protocol_state SET ${keys.map(k => `${k} = ?`).join(", ")}, updated_at = ? WHERE user_id = ?`)
-    .bind(...keys.map(k => updates[k]), nowISO(), userId).run();
+  await env.DB.prepare(
+    `UPDATE protocol_state SET ${keys.map(k => `${k} = ?`).join(", ")}, updated_at = ? WHERE user_id = ?`
+  ).bind(...keys.map(k => updates[k]), nowISO(), userId).run();
 }
+
 async function reconcileProtocol(env, userId, isWin, riskAmount, rrr, fees) {
   await updateProtocolState(env, userId, { updated_at: nowISO() });
 }
 
-/* ---------- Gist adapter (state.json) ---------- */
+/* ---------- FIXED: Gist adapter (consistent return types + security) ---------- */
 const GIST_FILE = "state.json";
 
-/* Robust gistOn: trims and normalizes env vars (handles "1", "true", "yes", extra whitespace) */
 function gistOn(env) {
   const v = String(env?.GIST_ENABLED ?? "").trim().toLowerCase();
   const enabled = v === "1" || v === "true" || v === "yes";
@@ -284,12 +563,11 @@ function gistOn(env) {
   return enabled && !!id && !!tok;
 }
 
-/* Conditional Content-Type (omit for GET), curl-like UA */
 function gistHdr(env, method = 'GET') {
   const base = {
     "Authorization": `Bearer ${String(env.GIST_TOKEN || "").trim()}`,
     "Accept": "application/vnd.github+json",
-    "User-Agent": "curl/7.88.1"
+    "User-Agent": "CloudflareWorker/1.0"
   };
   if (method !== 'GET') {
     base["Content-Type"] = "application/json";
@@ -297,11 +575,24 @@ function gistHdr(env, method = 'GET') {
   return base;
 }
 
-const deepClone = (o) => JSON.parse(JSON.stringify(o || {}));
+// FIXED: Safe deep clone (handles circular refs)
+function deepClone(o) {
+  try {
+    return JSON.parse(JSON.stringify(o || {}));
+  } catch (e) {
+    console.error('[deepClone] Failed (circular reference?):', e.message);
+    return {};
+  }
+}
 
-/* Gist GET with 10s timeout, trimmed ID, and temporary debug logging (remove after verifying success) */
+// FIXED: Consistent return type (always returns { state, etag } or null)
 async function gistGetState(env) {
-  if (!gistOn(env)) return null;
+  const log = new Logger(env, { fn: 'gistGetState' });
+  
+  if (!gistOn(env)) {
+    log.debug('Gist disabled');
+    return null;
+  }
 
   const GID = String(env.GIST_ID || "").trim();
   const headers = {
@@ -310,73 +601,106 @@ async function gistGetState(env) {
   };
   const url = `https://api.github.com/gists/${GID}`;
 
-  // TEMP DEBUG: remove after confirming 200 status in tails
-  console.log(`[Gist Debug] Fetching ${url} with headers:`, Object.keys(headers));
+  // Controlled debug logging (only if LOG_LEVEL=DEBUG)
+  log.debug('Fetching Gist', { gist_id: GID.slice(0, 8) + '...' });
 
-  const r = await safeFetch(url, { headers }, 10000).catch((e) => {
-    console.error("[Gist Debug] safeFetch exception:", e?.message || e, "url:", url);
-    return null;
-  });
-
-  if (!r) {
-    console.error("[Gist Debug] No response (null r)");
+  let r;
+  try {
+    r = await safeFetch(url, { headers }, 10000);
+  } catch (e) {
+    log.error('Gist fetch exception', { error: e.message });
     return null;
   }
 
-  // TEMP DEBUG: remove after confirming
-  console.log(`[Gist Debug] Status: ${r.status} ${r.statusText}, Headers:`, {
-    "content-type": r.headers.get("content-type"),
-    "x-ratelimit-remaining": r.headers.get("x-ratelimit-remaining"),
-    "x-ratelimit-reset": r.headers.get("x-ratelimit-reset")
+  if (!r) {
+    log.error('Gist: No response');
+    return null;
+  }
+
+  log.debug('Gist response', { 
+    status: r.status, 
+    ratelimit_remaining: r.headers.get("x-ratelimit-remaining") 
   });
 
   if (!r.ok) {
-    let errBody = "";
-    try { errBody = await r.text(); } catch {}
-    console.error(`[Gist Debug] !ok: ${r.status} ${r.statusText}, Body:`, errBody.slice(0, 500));
+    const errBody = await r.text().catch(() => '');
+    log.error('Gist request failed', { 
+      status: r.status, 
+      statusText: r.statusText,
+      body_preview: errBody.slice(0, 200) 
+    });
     return null;
   }
 
   const etag = r.headers.get("etag") || "";
+  let bodyText = '';
   let j;
-  let bodyText = "";
+
   try {
     bodyText = await r.text();
-    // TEMP DEBUG: remove after confirming
-    console.log("[Gist Debug] Body preview:", bodyText.slice(0, 200));
     j = JSON.parse(bodyText);
   } catch (e) {
-    console.error("[Gist Debug] JSON parse error:", e?.message || e, "Body length:", bodyText?.length || 0);
-    return { state: { pending: [], closed: [], sym_stats_real: {}, equity: [], lastReconcileTs: 0 }, etag };
+    log.error('Gist JSON parse error', { 
+      error: e.message, 
+      body_length: bodyText?.length || 0 
+    });
+    return { 
+      state: { pending: [], closed: [], sym_stats_real: {}, equity: [], lastReconcileTs: 0 }, 
+      etag 
+    };
   }
 
   const content = j?.files?.[GIST_FILE]?.content;
   if (!content) {
-    return { state: { pending: [], closed: [], sym_stats_real: {}, equity: [], lastReconcileTs: 0 }, etag };
+    log.warn('Gist file content missing');
+    return { 
+      state: { pending: [], closed: [], sym_stats_real: {}, equity: [], lastReconcileTs: 0 }, 
+      etag 
+    };
   }
+
   try {
-    return { state: JSON.parse(content), etag };
+    const state = JSON.parse(content);
+    log.info('Gist state loaded', { 
+      pending: state?.pending?.length || 0,
+      closed: state?.closed?.length || 0 
+    });
+    return { state, etag };
   } catch (e) {
-    console.error("gistGetState content parse error:", e);
-    return { state: { pending: [], closed: [], sym_stats_real: {}, equity: [], lastReconcileTs: 0 }, etag };
+    log.error('Gist content parse error', { error: e.message });
+    return { 
+      state: { pending: [], closed: [], sym_stats_real: {}, equity: [], lastReconcileTs: 0 }, 
+      etag 
+    };
   }
 }
 
-/* Gist PATCH with trimmed ID and conditional headers */
 async function gistPatchState(env, mutator) {
-  if (!gistOn(env)) return false;
+  const log = new Logger(env, { fn: 'gistPatchState' });
+  
+  if (!gistOn(env)) {
+    log.debug('Gist disabled, skipping patch');
+    return false;
+  }
 
   const strict = String(env?.GIST_STRICT_PATCH || "0") === "1";
 
   const doPatch = async (next, etag) => {
     const GID = String(env.GIST_ID || "").trim();
     const url = `https://api.github.com/gists/${GID}`;
-    const body = JSON.stringify({ files: { [GIST_FILE]: { content: JSON.stringify(next, null, 2) } } });
+    const body = JSON.stringify({ 
+      files: { 
+        [GIST_FILE]: { 
+          content: JSON.stringify(next, null, 2) 
+        } 
+      } 
+    });
     const headers = {
       ...gistHdr(env, 'PATCH'),
       "X-GitHub-Api-Version": "2022-11-28",
     };
     if (etag) headers["If-Match"] = etag;
+    
     const r = await safeFetch(url, { method: "PATCH", headers, body }, 8000).catch(()=>null);
     if (r) await r.text().catch(() => {});
     return r;
@@ -386,32 +710,51 @@ async function gistPatchState(env, mutator) {
     const cur = await gistGetState(env);
     const base = deepClone(cur?.state || { pending: [], closed: [], sym_stats_real: {}, equity: [], lastReconcileTs: 0 });
     let next = base;
-    try { next = (await mutator(deepClone(base))) || base; } catch (_) {}
+    try { 
+      next = (await mutator(deepClone(base))) || base; 
+    } catch (e) {
+      log.error('Mutator error (non-strict)', { error: e.message });
+    }
     const r = await doPatch(next, null);
-    return !!(r && r.ok);
+    const success = !!(r && r.ok);
+    log.info('Gist patch (non-strict)', { success, status: r?.status });
+    return success;
   }
 
+  // Strict mode with retry on 412
   try {
     const cur = await gistGetState(env);
-    if (!cur) return false;
+    if (!cur) {
+      log.warn('Gist patch: No current state');
+      return false;
+    }
+    
     const base1 = deepClone(cur.state || {});
     const next1 = (await mutator(deepClone(base1))) || base1;
 
     let r = await doPatch(next1, cur.etag || "");
-    if (r && r.ok) return true;
+    if (r && r.ok) {
+      log.info('Gist patch (strict) succeeded');
+      return true;
+    }
 
     if (r && r.status === 412) {
+      log.warn('Gist 412 conflict, retrying');
       const cur2 = await gistGetState(env);
       if (!cur2) return false;
       const base2 = deepClone(cur2.state || {});
       const next2 = (await mutator(deepClone(base2))) || base2;
 
       const r2 = await doPatch(next2, cur2.etag || "");
-      return !!(r2 && r2.ok);
+      const success = !!(r2 && r2.ok);
+      log.info('Gist patch retry', { success, status: r2?.status });
+      return success;
     }
+    
+    log.error('Gist patch failed', { status: r?.status });
     return false;
   } catch (e) {
-    console.error("gistPatchState strict error:", e);
+    log.error('Gist patch exception', { error: e.message });
     return false;
   }
 }
@@ -421,8 +764,14 @@ function gistFindPendingIdxByCID(state, cid) {
   return arr.findIndex(p => (p?.client_order_id || "") === cid);
 }
 
-/* Exports (optional) */
-export { gistOn, gistGetState, gistPatchState, gistFindPendingIdxByCID };
+/* Exports */
+export { 
+  gistOn, 
+  gistGetState, 
+  gistPatchState, 
+  gistFindPendingIdxByCID,
+  Logger
+};
 /* ======================================================================
    SECTION 2/7 — Market Data, Orderbook, and Ideas selection
    (Prefer latest GitHub snapshot; origin 'gha' or 'github_actions')
@@ -2309,7 +2658,6 @@ export {
   // NEW: ensure isolated 1x
   ensureFuturesIsolated1x
 };
-
 /* ======================================================================
    SECTION 5/7 — Protocol Status, Create/Execute/Close Trades,
                   Auto exits, Win stats (10/10 dynamic RRR aware)
@@ -2713,10 +3061,15 @@ async function createAutoSkipRecord(env, userId, idea, protocol, reason, meta) {
 
 /* ---------- Create pending trade (EV/Kelly + budgets + guards) ---------- */
 async function createPendingTrade(env, userId, idea, protocol) {
+  const log = new Logger(env, { fn: 'createPendingTrade', userId, symbol: idea?.symbol });
+  log.info('🔄 Creating pending trade');
+  const timer = log.time('createPendingTrade');
+
   const session = await getSession(env, userId);
   const symbol = String(idea.symbol || '').toUpperCase();
 
   {
+    log.debug('Step 1: Checking duplicate symbols');
     const allowDup = allowDuplicateSymbols(env);
     const capPerSym = maxPosPerSymbol(env);
 
@@ -2727,19 +3080,26 @@ async function createPendingTrade(env, userId, idea, protocol) {
       const symCount = Number(rowCnt?.c || 0);
 
       if (!allowDup && symCount > 0) {
+        log.warn('🚫 Duplicate symbol rejected', { symCount, capPerSym: 1 });
         return { id: null, meta: { symbol, skipReason: "duplicate_symbol", symCount, capPerSym: 1 } };
       }
       if (allowDup && symCount >= capPerSym) {
+        log.warn('🚫 Duplicate symbol cap reached', { symCount, capPerSym });
         return { id: null, meta: { symbol, skipReason: "duplicate_symbol_cap", symCount, capPerSym } };
       }
     }
+    log.info('✅ Duplicate check passed');
   }
 
+  log.debug('Step 2: Checking symbol cooldown');
   const cdMs = await getSymbolCooldownRemainingMs(env, userId, symbol);
   if (cdMs > 0 && !noRejects(env)) {
+    log.warn('🚫 Symbol on cooldown', { remain_ms: cdMs });
     return { id: null, meta: { symbol, skipReason: "cooldown_active", remain_ms: cdMs } };
   }
+  log.info('✅ Cooldown check passed');
 
+  log.debug('Step 3: Fetching current price');
   let currentPrice = await getCurrentPrice(symbol, idea?.price ?? idea?.entry_mid ?? idea?.entry_limit);
   if (!isFinite(currentPrice) || currentPrice <= 0) {
     try {
@@ -2755,16 +3115,20 @@ async function createPendingTrade(env, userId, idea, protocol) {
   if (!isFinite(currentPrice) || currentPrice <= 0) {
     if (noRejects(env) && session.exchange_name === 'crypto_parrot') currentPrice = 1;
     if (!isFinite(currentPrice) || currentPrice <= 0) {
+      log.error('❌ Could not fetch valid market price');
       return { id: null, meta: { symbol, skipReason: "market_data" } };
     }
   }
+  log.info('✅ Price fetched', { currentPrice });
 
   const dir = String(idea.side || 'long').toLowerCase();
   const isShort = (dir === 'short' || dir === 'sell');
 
+  log.debug('Step 4: Checking budgets and risk');
   const TC = await getTotalCapital(env, userId);
   const ACP = ACP_FRAC * TC;
   if (ACP < 6 && !noRejects(env)) {
+    log.warn('🚫 Bank closed (ACP too low)', { TC, ACP });
     return { id: null, meta: { symbol, skipReason: "bank_closed", TC, ACP } };
   }
 
@@ -2775,6 +3139,7 @@ async function createPendingTrade(env, userId, idea, protocol) {
   const openNotional            = await getOpenNotional(env, userId);
   let dailyNotionalLeft         = Math.max(0, dailyNotionalCap - openNotional);
   if (dailyNotionalLeft <= 0 && !noRejects(env)) {
+    log.warn('🚫 Daily notional exhausted', { dailyNotionalLeft, dailyNotionalCap, openNotional, TC });
     return { id: null, meta: { symbol, skipReason: "daily_notional_exhausted", dailyNotionalLeft, dailyNotionalCap, openNotional, TC } };
   }
 
@@ -2784,10 +3149,13 @@ async function createPendingTrade(env, userId, idea, protocol) {
   let D_left = Math.max(0, D - openRisk);
   const B = Math.min(M, D_left);
   if (B <= 0 && !noRejects(env)) {
+    log.warn('🚫 Daily risk budget exhausted', { D_left, D, openRisk, TC });
     return { id: null, meta: { symbol, skipReason: "daily_risk_budget_exhausted", D_left, D, openRisk, TC } };
   }
   const B_eff = B > 0 ? B : (noRejects(env) ? Math.max(1, 0.0001 * TC) : 0);
+  log.info('✅ Budgets and risk OK');
 
+  log.debug('Step 5: Starting sizing logic (EV, Kelly)');
   const useIdeaP = String(env.USE_IDEA_P || '1') === '1';
   const useIdeaExits = String(env.USE_IDEA_EXITS || '1') === '1';
   const minEvBps = Number(env.EV_BPS_MIN ?? 1);
@@ -2818,18 +3186,27 @@ async function createPendingTrade(env, userId, idea, protocol) {
     cost_R = Math.max(cost_R, costR_fromIdea);
   }
 
-  const RRR_used = hasIdeaExits ? clamp(tpBps / slBps, 0.8, 3.0) : STRICT_RRR;
+  let RRR_used = STRICT_RRR;
+  if (hasIdeaExits) {
+    if (slBps > 0 && isFinite(tpBps / slBps)) {
+      RRR_used = clamp(tpBps / slBps, 0.8, 3.0);
+    } else {
+      log.warn('⚠️ Invalid RRR from idea exits, using default', { tpBps, slBps });
+    }
+  }
 
   const expLCBBps = Number(idea?.exp_lcb_bps ?? NaN);
   let EV_R;
   if (isFinite(expLCBBps) && hasIdeaExits) {
     EV_R = expLCBBps / Math.max(slBps, 1);
     if ((expLCBBps <= Math.max(0, minEvBps - 1e-9)) && !noRejects(env) && !demoEasy) {
+      log.warn('🚫 EV gate failed (from idea)', { exp_lcb_bps: expLCBBps, minEvBps });
       return { id: null, meta: { symbol, skipReason: "ev_gate", exp_lcb_bps: expLCBBps, p, tp_bps: tpBps, sl_bps: slBps, cost_bps: costBpsIdea } };
     }
   } else {
     EV_R = p * RRR_used - (1 - p) - cost_R;
     if (!(EV_R > 0) && !noRejects(env) && !demoEasy) {
+      log.warn('🚫 EV gate failed (calculated)', { EV_R, p, RRR_used, cost_R });
       return { id: null, meta: { symbol, skipReason: "ev_gate", EV_R, p, RRR: RRR_used, cost_R, pH, sL, currentPrice } };
     }
   }
@@ -2837,11 +3214,13 @@ async function createPendingTrade(env, userId, idea, protocol) {
   let sqsMinDynamic = await computeUserSqsGate(env, userId);
   if (demoEasy) sqsMinDynamic = Math.min(sqsMinDynamic, 0.20);
   if ((SQS < sqsMinDynamic) && !noRejects(env) && !demoEasy) {
+    log.warn('🚫 SQS gate failed', { SQS, sqsMinDynamic });
     return { id: null, meta: { symbol, skipReason: "low_sqs", SQS, sL, currentPrice, sqsMin: sqsMinDynamic } };
   }
 
   const hseMinG = getHSEMinG(env);
   if ((pH >= 0.85) && !demoEasy && hseMinG === 0 && !noRejects(env)) {
+    log.warn('🚫 HSE gate failed', { pH });
     return { id: null, meta: { symbol, skipReason: "hse_gate", pH, sL, currentPrice } };
   }
 
@@ -2882,6 +3261,7 @@ async function createPendingTrade(env, userId, idea, protocol) {
     notionalFinal = MIN_QUOTE_FLOOR_USD;
   }
   if (notionalFinal <= 0 && !noRejects(env)) {
+    log.warn('🚫 Final notional is zero after caps', { notionalDesired, capPerTrade, capDailyLeft, sL });
     return { id: null, meta: { symbol, skipReason: "bank_notional_zero", perTradeNotionalCap, dailyNotionalLeft, openNotional, sL, currentPrice } };
   }
 
@@ -2890,12 +3270,15 @@ async function createPendingTrade(env, userId, idea, protocol) {
   const minRiskFrac = Number(env?.MIN_RISK_FRAC_OF_ACP ?? 0.0025);
   const minRisk = minRiskFrac * (ACP_FRAC * TC);
   if (Final_Risk_USD < minRisk && !noRejects(env)) {
+    log.warn('🚫 Final risk too small', { Final_Risk_USD, minRisk });
     return {
       id: null,
       meta: { symbol, skipReason: "too_small", Final_Risk_USD, minRisk, minRiskFrac, ACP: ACP_FRAC * TC, TC, sL, currentPrice, notionalFinal, perTradeNotionalCap, dailyNotionalLeft }
     };
   }
+  log.info('✅ Sizing calculation complete', { notionalFinal, Final_Risk_USD });
 
+  log.debug('Step 6: Checking available funds');
   const requiredFunds = notionalFinal * (1 + 2 * feeRate);
   let fundsOk = requiredFunds <= TC;
   if (!fundsOk && noRejects(env)) {
@@ -2910,8 +3293,10 @@ async function createPendingTrade(env, userId, idea, protocol) {
     }
   }
   if (!fundsOk && !noRejects(env)) {
+    log.error('❌ Insufficient funds', { available: TC, required: requiredFunds, notionalFinal });
     return { id: null, meta: { symbol, skipReason: "insufficient_funds", available: TC, required: requiredFunds, sL, currentPrice, notionalFinal } };
   }
+  log.info('✅ Funds OK');
 
   let stopPrice, tpPrice;
   if (hasIdeaExits) {
@@ -2980,6 +3365,7 @@ async function createPendingTrade(env, userId, idea, protocol) {
     extra_json.ttl = { ttl_ts_ms: ttlTs, hold_sec: Math.round((ttlTs - nowMs) / 1000), source: 'idea' };
   }
 
+  log.debug('Step 7: Inserting pending trade into DB');
   const res = await env.DB.prepare(
     `INSERT INTO trades (user_id, exchange_name, mode, symbol, side, qty, price, status, stop_pct, stop_price, tp_price, risk_usd, strict_rrr, bracket_frozen, extra_json)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -2991,6 +3377,8 @@ async function createPendingTrade(env, userId, idea, protocol) {
 
   const id = res?.id || null;
   if (id) await bumpTradeCounters(env, userId, 1);
+  timer.end({ success: true, tradeId: id });
+  log.info('✅ Pending trade created successfully', { tradeId: id });
   return { id, meta: { symbol, fundsOk, required: requiredFunds, available: TC, sL, currentPrice, notionalFinal, Final_Risk_USD } };
 }
 
@@ -3023,237 +3411,603 @@ async function cancelBracketsIfAny(env, userId, trade, session, ex, extra) {
   }
 }
 
-/* ---------- Execute trade (supports maker_join + post_only; aligns TTL to open; optional brackets) ---------- */
+/* ---------- Execute trade (FIXED + LOGGED) ---------- */
 async function executeTrade(env, userId, tradeId) {
-  const trade = await env.DB.prepare("SELECT * FROM trades WHERE id = ? AND user_id = ?").bind(tradeId, userId).first();
-  if (!trade || trade.status !== 'pending') return false;
+  const log = new Logger(env, { fn: 'executeTrade', userId, tradeId });
+  log.info('🚀 Starting trade execution');
 
-  const cdMs = await getSymbolCooldownRemainingMs(env, userId, trade.symbol);
-  if (cdMs > 0) { await logEvent(env, userId, 'cooldown_block', { tradeId, symbol: trade.symbol, remain_ms: cdMs }); return false; }
-
-  const extra = JSON.parse(trade.extra_json || '{}');
-  const CID = extra?.client_order_id || null;
-  const protocol = await getProtocolState(env, userId);
-  const isShort = trade.side === 'SELL';
-  
-  const session = await getSession(env, userId);
-  const ex = SUPPORTED_EXCHANGES[session.exchange_name];
-  const isFutures = (ex.kind === "binanceFuturesUSDT" || ex.kind === "bybitFuturesV5");
-  const useBrackets = isFutures ? true : (String(env?.USE_BRACKETS || "0") === "1");
-
-  const respectExec = envFlag(env, 'RESPECT_EXEC_POLICY', '1');
-  const takerFallback = envFlag(env, 'POST_ONLY_TAKER_FALLBACK', '1');
-  const wantPostOnly = respectExec && ((extra?.exec?.exec || '').toLowerCase() === 'post_only' || (extra?.entry?.policy || '').toLowerCase() === 'maker_join');
+  const timer = log.time('executeTrade');
 
   try {
+    // Step 1: Load trade
+    log.debug('Step 1: Loading trade from DB');
+    const trade = await env.DB.prepare(
+      "SELECT * FROM trades WHERE id = ? AND user_id = ?"
+    ).bind(tradeId, userId).first();
+
+    if (!trade) {
+      log.warn('❌ Trade not found', { tradeId, userId });
+      return { status: 'not_found', success: false };
+    }
+
+    if (trade.status !== 'pending') {
+      log.warn('❌ Trade not pending', { status: trade.status, tradeId });
+      return { status: 'not_pending', success: false };
+    }
+
+    log.info('✅ Trade loaded', { 
+      symbol: trade.symbol, 
+      side: trade.side, 
+      status: trade.status 
+    });
+
+    // Step 2: Cooldown check
+    log.debug('Step 2: Checking symbol cooldown');
+    const cdMs = await getSymbolCooldownRemainingMs(env, userId, trade.symbol);
+    if (cdMs > 0) {
+      log.warn('❌ Symbol on cooldown', { 
+        symbol: trade.symbol, 
+        remaining_ms: cdMs 
+      });
+      await logEvent(env, userId, 'cooldown_block', { 
+        tradeId, 
+        symbol: trade.symbol, 
+        remain_ms: cdMs 
+      });
+      return { status: 'cooldown', success: false };
+    }
+    log.info('✅ Cooldown check passed');
+
+    // Step 3: Parse trade data
+    log.debug('Step 3: Parsing trade metadata');
+    const extra = JSON.parse(trade.extra_json || '{}');
+    const CID = extra?.client_order_id || null;
+    const protocol = await getProtocolState(env, userId);
+    const isShort = trade.side === 'SELL';
+
+    log.info('✅ Trade metadata parsed', {
+      cid: CID,
+      isShort,
+      quote_size: extra.quote_size,
+      r_target: extra.r_target
+    });
+
+    // Step 4: Exchange setup
+    log.debug('Step 4: Loading exchange configuration');
+    const session = await getSession(env, userId);
+    const ex = SUPPORTED_EXCHANGES[session.exchange_name];
+    const isFutures = (ex.kind === "binanceFuturesUSDT" || ex.kind === "bybitFuturesV5");
+    const useBrackets = isFutures ? true : (String(env?.USE_BRACKETS || "0") === "1");
+
+    log.info('✅ Exchange configured', {
+      exchange: session.exchange_name,
+      kind: ex.kind,
+      isFutures,
+      useBrackets
+    });
+
+    // Step 5: Execution policy
+    log.debug('Step 5: Determining execution policy');
+    const respectExec = envFlag(env, 'RESPECT_EXEC_POLICY', '1');
+    const takerFallback = envFlag(env, 'POST_ONLY_TAKER_FALLBACK', '1');
+    const wantPostOnly = respectExec && (
+      (extra?.exec?.exec || '').toLowerCase() === 'post_only' || 
+      (extra?.entry?.policy || '').toLowerCase() === 'maker_join'
+    );
+
+    log.info('✅ Execution policy determined', {
+      wantPostOnly,
+      respectExec,
+      takerFallback,
+      execPolicy: extra?.exec?.exec,
+      entryPolicy: extra?.entry?.policy
+    });
+
+    // Step 6A: MARKET ORDER PATH
     if (!wantPostOnly) {
+      log.info('📊 Executing MARKET order');
+      const orderTimer = log.time('market_order');
+
       let orderResult;
-      if (!isShort) orderResult = await placeMarketBuy(env, userId, trade.symbol, extra.quote_size, { reduceOnly: false, clientOrderId: CID });
-      else orderResult = await placeMarketSell(env, userId, trade.symbol, extra.quote_size, true, { reduceOnly: false, clientOrderId: CID });
+      try {
+        if (!isShort) {
+          log.debug('Placing market BUY order', { 
+            symbol: trade.symbol, 
+            quoteAmount: extra.quote_size 
+          });
+          orderResult = await placeMarketBuy(env, userId, trade.symbol, extra.quote_size, { 
+            reduceOnly: false, 
+            clientOrderId: CID 
+          });
+        } else {
+          log.debug('Placing market SELL order', { 
+            symbol: trade.symbol, 
+            quoteAmount: extra.quote_size 
+          });
+          orderResult = await placeMarketSell(env, userId, trade.symbol, extra.quote_size, true, { 
+            reduceOnly: false, 
+            clientOrderId: CID 
+          });
+        }
 
+        orderTimer.end({ 
+          orderId: orderResult.orderId, 
+          avgPrice: orderResult.avgPrice, 
+          executedQty: orderResult.executedQty 
+        });
+
+        log.info('✅ Market order filled', {
+          orderId: orderResult.orderId,
+          avgPrice: orderResult.avgPrice,
+          executedQty: orderResult.executedQty,
+          status: orderResult.status
+        });
+
+      } catch (e) {
+        orderTimer.end({ error: e.message });
+        log.error('❌ Market order failed', { 
+          error: e.message, 
+          stack: e.stack 
+        });
+        throw e;
+      }
+
+      // Step 6B: Calculate actual prices
+      log.debug('Step 6B: Calculating actual stop/target prices');
       const rUsed = Number(extra?.r_target || STRICT_RRR);
-      const actualStopPrice = !isShort ? orderResult.avgPrice * (1 - trade.stop_pct) : orderResult.avgPrice * (1 + trade.stop_pct);
-      const actualTpPrice   = !isShort ? orderResult.avgPrice * (1 + trade.stop_pct * rUsed) : orderResult.avgPrice * (1 - trade.stop_pct * rUsed); // fixed + for long
+      const actualStopPrice = !isShort 
+        ? orderResult.avgPrice * (1 - trade.stop_pct) 
+        : orderResult.avgPrice * (1 + trade.stop_pct);
+      const actualTpPrice = !isShort 
+        ? orderResult.avgPrice * (1 + trade.stop_pct * rUsed) 
+        : orderResult.avgPrice * (1 - trade.stop_pct * rUsed);
 
+      log.info('✅ Exit prices calculated', {
+        entry: orderResult.avgPrice,
+        stop: actualStopPrice,
+        tp: actualTpPrice,
+        r_target: rUsed
+      });
+
+      // Step 6C: Metrics snapshot
+      log.debug('Step 6C: Capturing entry metrics');
       const tcAtEntry = await getTotalCapital(env, userId);
       const notionalAtEntry = (orderResult.avgPrice || 0) * (orderResult.executedQty || 0);
       const pctOfTCAtEntry = tcAtEntry > 0 ? notionalAtEntry / tcAtEntry : 0;
 
+      log.info('✅ Entry metrics captured', {
+        tc_at_entry: tcAtEntry,
+        notional_at_entry: notionalAtEntry,
+        pct_of_tc: (pctOfTCAtEntry * 100).toFixed(2) + '%'
+      });
+
+      // Step 6D: TTL alignment
+      log.debug('Step 6D: Aligning TTL to entry time');
       const openedAtMs = Date.now();
       ensureTradeTtl(extra, openedAtMs, env);
-      extra.metrics = { ...(extra.metrics || {}), tc_at_entry: tcAtEntry, notional_at_entry: notionalAtEntry, pct_of_tc_at_entry: pctOfTCAtEntry };
+      extra.metrics = { 
+        ...(extra.metrics || {}), 
+        tc_at_entry: tcAtEntry, 
+        notional_at_entry: notionalAtEntry, 
+        pct_of_tc_at_entry: pctOfTCAtEntry 
+      };
+
+      log.info('✅ TTL aligned', {
+        ttl_ts_ms: extra?.ttl?.ttl_ts_ms,
+        ttl_remaining_min: extra?.ttl?.ttl_ts_ms 
+          ? ((extra.ttl.ttl_ts_ms - Date.now()) / 60000).toFixed(1)
+          : 'N/A'
+      });
+
+      // Step 6E: FIXED — Place brackets BEFORE marking trade open
+      let bracketsPlaced = false;
+      if (useBrackets) {
+        log.info('📌 Placing bracket orders (TP/SL)');
+        const bracketTimer = log.time('bracket_placement');
+
+        try {
+          let br = null;
+          const isLong = !isShort;
+
+          if (ex.kind === "binanceLike") {
+            log.debug('Placing Binance spot brackets');
+            const apiKey = await decrypt(session.api_key_encrypted, env);
+            const apiSecret = await decrypt(session.api_secret_encrypted, env);
+            br = await placeBinanceLikeExitOrders(
+              ex, apiKey, apiSecret, trade.symbol, isLong, 
+              orderResult.executedQty, actualTpPrice, actualStopPrice, CID || undefined
+            );
+          } else if (ex.kind === "binanceFuturesUSDT") {
+            log.debug('Placing Binance Futures brackets');
+            const apiKey = await decrypt(session.api_key_encrypted, env);
+            const apiSecret = await decrypt(session.api_secret_encrypted, env);
+            br = await placeBinanceFuturesBracketOrders(
+              ex, apiKey, apiSecret, trade.symbol, isLong, 
+              orderResult.executedQty, actualTpPrice, actualStopPrice, CID || undefined
+            );
+          } else if (ex.kind === "bybitFuturesV5") {
+            log.debug('Placing Bybit Futures brackets');
+            const apiKey = await decrypt(session.api_key_encrypted, env);
+            const apiSecret = await decrypt(session.api_secret_encrypted, env);
+            br = await placeBybitFuturesBracketOrders(
+              ex, apiKey, apiSecret, trade.symbol, isLong, 
+              orderResult.executedQty, actualTpPrice, actualStopPrice, CID || undefined
+            );
+          }
+
+          bracketTimer.end({
+            tp_orderId: br?.tp?.orderId,
+            sl_orderId: br?.sl?.orderId
+          });
+
+          // FIXED: Fail trade if brackets required but not placed
+          if (!br?.tp && !br?.sl) {
+            log.critical('❌ CRITICAL: Brackets required but placement failed', {
+              symbol: trade.symbol,
+              exchange: ex.kind
+            });
+            throw new Error('Required bracket orders failed to place');
+          }
+
+          extra.open_brackets = { 
+            tp: br.tp ? { orderId: br.tp.orderId, status: br.tp.status } : null, 
+            sl: br.sl ? { orderId: br.sl.orderId, status: br.sl.status } : null 
+          };
+          bracketsPlaced = true;
+
+          log.info('✅ Brackets placed successfully', {
+            tp_orderId: br?.tp?.orderId,
+            sl_orderId: br?.sl?.orderId
+          });
+
+        } catch (e) {
+          bracketTimer.end({ error: e.message });
+          log.error('❌ Bracket placement failed', { 
+            error: e.message, 
+            stack: e.stack 
+          });
+
+          // FIXED: Rollback entry order if brackets fail
+          log.warn('⚠️ Rolling back entry order due to bracket failure');
+          try {
+            if (!isShort) {
+              await placeMarketSell(env, userId, trade.symbol, orderResult.executedQty, false, { reduceOnly: true });
+            } else {
+              const currentPrice = await getCurrentPrice(trade.symbol);
+              await placeMarketBuy(env, userId, trade.symbol, orderResult.executedQty * currentPrice, { reduceOnly: true });
+            }
+            log.info('✅ Entry order reversed');
+          } catch (rollbackErr) {
+            log.critical('❌ ROLLBACK FAILED — MANUAL INTERVENTION REQUIRED', {
+              symbol: trade.symbol,
+              qty: orderResult.executedQty,
+              error: rollbackErr.message
+            });
+          }
+
+          throw new Error(`Bracket placement failed: ${e.message}`);
+        }
+      }
+
+      // Step 6F: FIXED — Only mark as open AFTER brackets succeed
+      log.debug('Step 6F: Marking trade as open in DB');
+      const dbTimer = log.time('db_update_open');
 
       await env.DB.prepare(
         `UPDATE trades SET status = 'open', qty = ?, entry_price = ?, stop_price = ?, tp_price = ?, extra_json = ?, updated_at = ? WHERE id = ?`
-      ).bind(orderResult.executedQty, orderResult.avgPrice, actualStopPrice, actualTpPrice, JSON.stringify(extra), nowISO(), tradeId).run();
+      ).bind(
+        orderResult.executedQty, 
+        orderResult.avgPrice, 
+        actualStopPrice, 
+        actualTpPrice, 
+        JSON.stringify(extra), 
+        nowISO(), 
+        tradeId
+      ).run();
 
+      dbTimer.end();
+      log.info('✅ Trade marked as OPEN in database');
+
+      // Step 6G: Gist update
+      log.debug('Step 6G: Updating Gist state');
+      const gistTimer = log.time('gist_mark_open');
       await gistMarkOpen(env, trade, orderResult.avgPrice, orderResult.executedQty);
+      gistTimer.end();
+      log.info('✅ Gist state updated');
 
-      // Optional bracket placement (default ON for futures)
-      if (useBrackets) {
-        try {
-          let br = null;
-          const isLong = !isShort;
-          if (ex.kind === "binanceLike") {
-            const apiKey = await decrypt(session.api_key_encrypted, env);
-            const apiSecret = await decrypt(session.api_secret_encrypted, env);
-            br = await placeBinanceLikeExitOrders(ex, apiKey, apiSecret, trade.symbol, isLong, orderResult.executedQty, actualTpPrice, actualStopPrice, CID || undefined);
-          } else if (ex.kind === "binanceFuturesUSDT") {
-            const apiKey = await decrypt(session.api_key_encrypted, env);
-            const apiSecret = await decrypt(session.api_secret_encrypted, env);
-            br = await placeBinanceFuturesBracketOrders(ex, apiKey, apiSecret, trade.symbol, isLong, orderResult.executedQty, actualTpPrice, actualStopPrice, CID || undefined);
-          } else if (ex.kind === "bybitFuturesV5") {
-            const apiKey = await decrypt(session.api_key_encrypted, env);
-            const apiSecret = await decrypt(session.api_secret_encrypted, env);
-            br = await placeBybitFuturesBracketOrders(ex, apiKey, apiSecret, trade.symbol, isLong, orderResult.executedQty, actualTpPrice, actualStopPrice, CID || undefined);
-          }
-          if (br) {
-            extra.open_brackets = { tp: br.tp ? { orderId: br.tp.orderId } : null, sl: br.sl ? { orderId: br.sl.orderId } : null };
-            await env.DB.prepare("UPDATE trades SET extra_json = ?, updated_at = ? WHERE id = ?")
-              .bind(JSON.stringify(extra), nowISO(), tradeId).run();
-          }
-        } catch (e) {
-          console.warn("brackets place warn:", e?.message || e);
-        }
-      }
-
+      // Step 6H: Event logging
+      log.debug('Step 6H: Logging trade_open event');
       await logEvent(env, userId, trade.mode === 'manual' ? 'trade_open_manual' : 'trade_open', {
-        symbol: trade.symbol, side: trade.side, qty: orderResult.executedQty, entry: orderResult.avgPrice,
-        stop_pct: trade.stop_pct, stop_price: actualStopPrice, tp_price: actualTpPrice, r: rUsed,
-        phase: protocol?.phase, fee_rate: protocol?.fee_rate, strict_rrr: true, bracket_frozen: true,
-        tc_at_entry: tcAtEntry, notional_at_entry: notionalAtEntry, pct_of_tc_at_entry: pctOfTCAtEntry,
+        symbol: trade.symbol, 
+        side: trade.side, 
+        qty: orderResult.executedQty, 
+        entry: orderResult.avgPrice,
+        stop_pct: trade.stop_pct, 
+        stop_price: actualStopPrice, 
+        tp_price: actualTpPrice, 
+        r: rUsed,
+        phase: protocol?.phase, 
+        fee_rate: protocol?.fee_rate, 
+        strict_rrr: true, 
+        bracket_frozen: true,
+        brackets_placed: bracketsPlaced,
+        tc_at_entry: tcAtEntry, 
+        notional_at_entry: notionalAtEntry, 
+        pct_of_tc_at_entry: pctOfTCAtEntry,
         ttl_ts_ms: extra?.ttl?.ttl_ts_ms
       });
-      return true;
-    }
 
-    // Post-only maker
-    let makerPx = Number(extra?.entry?.limit);
-    if (!isFinite(makerPx) || makerPx <= 0) {
-      try { const ob = await getOrderBookSnapshot(trade.symbol); const { bestBid, bestAsk } = computeBestBidAsk(ob || {}); makerPx = !isShort ? bestBid : bestAsk; } catch {}
-    }
-    if (!isFinite(makerPx) || makerPx <= 0) makerPx = await getCurrentPrice(trade.symbol);
-
-    const quoteAmt = Number(extra.quote_size || 0);
-    let result;
-
-    if (ex.kind === 'demoParrot') {
-      result = await placeDemoOrder(trade.symbol, isShort ? "SELL" : "BUY", quoteAmt, true, CID);
-    } else if (ex.kind === 'binanceLike') {
-      try {
-        result = await placeBinanceLikeLimitMaker(ex, await decrypt(session.api_key_encrypted, env), await decrypt(session.api_secret_encrypted, env),
-          trade.symbol, isShort ? 'SELL' : 'BUY', makerPx, quoteAmt, true, CID);
-      } catch (e) {
-        if (takerFallback) {
-          if (!isShort) result = await placeMarketBuy(env, userId, trade.symbol, quoteAmt, { reduceOnly: false, clientOrderId: CID });
-          else result = await placeMarketSell(env, userId, trade.symbol, quoteAmt, true, { reduceOnly: false, clientOrderId: CID });
-        } else {
-          await env.DB.prepare("UPDATE trades SET status='rejected', updated_at=? WHERE id=?").bind(nowISO(), tradeId).run();
-          await logEvent(env, userId, 'order_rejected', { policy: 'post_only', symbol: trade.symbol, reason: String(e?.message||e) });
-          return false;
-        }
-      }
-    } else if (ex.kind === 'binanceFuturesUSDT') {
-      const baseQty = (quoteAmt / Math.max(1e-12, makerPx));
-      try {
-        const apiKey = await decrypt(session.api_key_encrypted, env);
-        const apiSecret = await decrypt(session.api_secret_encrypted, env);
-        await ensureFuturesIsolated1x(ex, apiKey, apiSecret, trade.symbol);
-        result = await placeBinanceFuturesLimitPostOnly(ex, apiKey, apiSecret,
-          trade.symbol, isShort ? 'SELL' : 'BUY', baseQty, makerPx, false, CID);
-      } catch (e) {
-        if (takerFallback) {
-          result = await placeBinanceFuturesOrder(ex, await decrypt(session.api_key_encrypted, env), await decrypt(session.api_secret_encrypted, env),
-            trade.symbol, isShort ? 'SELL' : 'BUY', baseQty, false, CID);
-        } else {
-          await env.DB.prepare("UPDATE trades SET status='rejected', updated_at=? WHERE id=?").bind(nowISO(), tradeId).run();
-          await logEvent(env, userId, 'order_rejected', { policy: 'post_only', symbol: trade.symbol, reason: String(e?.message||e) });
-          return false;
-        }
-      }
-    } else if (ex.kind === 'bybitFuturesV5') {
-      const baseQty = (quoteAmt / Math.max(1e-12, makerPx));
-      try {
-        const apiKey = await decrypt(session.api_key_encrypted, env);
-        const apiSecret = await decrypt(session.api_secret_encrypted, env);
-        await ensureFuturesIsolated1x(ex, apiKey, apiSecret, trade.symbol);
-        result = await placeBybitFuturesLimitPostOnly(
-          ex, apiKey, apiSecret, trade.symbol,
-          isShort ? 'SELL' : 'BUY', baseQty, makerPx, false, CID
-        );
-      } catch (e) {
-        if (takerFallback) {
-          const apiKey = await decrypt(session.api_key_encrypted, env);
-          const apiSecret = await decrypt(session.api_secret_encrypted, env);
-          result = await placeBybitFuturesOrder(
-            ex, apiKey, apiSecret, trade.symbol,
-            isShort ? 'SELL' : 'BUY', baseQty, false, CID
-          );
-        } else {
-          await env.DB.prepare("UPDATE trades SET status='rejected', updated_at=? WHERE id=?")
-            .bind(nowISO(), tradeId).run();
-          await logEvent(env, userId, 'order_rejected', { policy: 'post_only', symbol: trade.symbol, reason: String(e?.message||e) });
-          return false;
-        }
-      }
-    } else {
-      if (takerFallback) {
-        if (!isShort) result = await placeMarketBuy(env, userId, trade.symbol, quoteAmt, { reduceOnly: false, clientOrderId: CID });
-        else result = await placeMarketSell(env, userId, trade.symbol, quoteAmt, true, { reduceOnly: false, clientOrderId: CID });
-      } else {
-        await env.DB.prepare("UPDATE trades SET status='rejected', updated_at=? WHERE id=?").bind(nowISO(), tradeId).run();
-        await logEvent(env, userId, 'order_rejected', { policy: 'post_only', symbol: trade.symbol, reason: 'unsupported_exchange' });
-        return false;
-      }
-    }
-
-    if (result && Number(result.executedQty || 0) > 0) {
-      const rUsed = Number(extra?.r_target || STRICT_RRR);
-      const entryPx = Number(result.avgPrice || makerPx);
-      const qty = Number(result.executedQty || 0);
-
-      const actualStopPrice = !isShort ? entryPx * (1 - trade.stop_pct) : entryPx * (1 + trade.stop_pct);
-      const actualTpPrice   = !isShort ? entryPx * (1 + trade.stop_pct * rUsed) : entryPx * (1 - trade.stop_pct * rUsed);
-
-      const tcAtEntry = await getTotalCapital(env, userId);
-      const notionalAtEntry = entryPx * qty;
-      const pctOfTCAtEntry = tcAtEntry > 0 ? notionalAtEntry / tcAtEntry : 0;
-
-      const openedAtMs = Date.now();
-      ensureTradeTtl(extra, openedAtMs, env);
-      extra.metrics = { ...(extra.metrics || {}), tc_at_entry: tcAtEntry, notional_at_entry: notionalAtEntry, pct_of_tc_at_entry: pctOfTCAtEntry };
-
-      await env.DB.prepare(
-        `UPDATE trades SET status='open', qty=?, entry_price=?, stop_price=?, tp_price=?, extra_json=?, updated_at=? WHERE id=?`
-      ).bind(qty, entryPx, actualStopPrice, actualTpPrice, JSON.stringify(extra), nowISO(), tradeId).run();
-
-      await gistMarkOpen(env, trade, entryPx, qty);
-
-      // Optional bracket placement (default ON for futures)
-      if (useBrackets) {
-        try {
-          let br = null;
-          const isLong = !isShort;
-          if (ex.kind === "binanceLike") {
-            const apiKey = await decrypt(session.api_key_encrypted, env);
-            const apiSecret = await decrypt(session.api_secret_encrypted, env);
-            br = await placeBinanceLikeExitOrders(ex, apiKey, apiSecret, trade.symbol, isLong, qty, actualTpPrice, actualStopPrice, CID || undefined);
-          } else if (ex.kind === "binanceFuturesUSDT") {
-            const apiKey = await decrypt(session.api_key_encrypted, env);
-            const apiSecret = await decrypt(session.api_secret_encrypted, env);
-            br = await placeBinanceFuturesBracketOrders(ex, apiKey, apiSecret, trade.symbol, isLong, qty, actualTpPrice, actualStopPrice, CID || undefined);
-          } else if (ex.kind === "bybitFuturesV5") {
-            const apiKey = await decrypt(session.api_key_encrypted, env);
-            const apiSecret = await decrypt(session.api_secret_encrypted, env);
-            br = await placeBybitFuturesBracketOrders(ex, apiKey, apiSecret, trade.symbol, isLong, qty, actualTpPrice, actualStopPrice, CID || undefined);
-          }
-          if (br) {
-            extra.open_brackets = { tp: br.tp ? { orderId: br.tp.orderId } : null, sl: br.sl ? { orderId: br.sl.orderId } : null };
-            await env.DB.prepare("UPDATE trades SET extra_json = ?, updated_at = ? WHERE id = ?")
-              .bind(JSON.stringify(extra), nowISO(), tradeId).run();
-          }
-        } catch (e) {
-          console.warn("brackets place warn:", e?.message || e);
-        }
-      }
-
-      await logEvent(env, userId, 'trade_open', {
-        symbol: trade.symbol, side: trade.side, qty, entry: entryPx, r: rUsed,
-        stop_pct: trade.stop_pct, stop_price: actualStopPrice, tp_price: actualTpPrice,
-        ttl_ts_ms: extra?.ttl?.ttl_ts_ms, policy: 'post_only_fill'
+      const totalDuration = timer.end({ 
+        success: true, 
+        status: 'filled',
+        entry_price: orderResult.avgPrice,
+        qty: orderResult.executedQty
       });
-      return true;
-    } else {
-      extra.open_order = { id: result?.orderId || null, px: makerPx, post_only: true, posted_at: nowISO() };
-      await env.DB.prepare("UPDATE trades SET extra_json=?, updated_at=? WHERE id=?")
-        .bind(JSON.stringify(extra), nowISO(), tradeId).run();
-      await logEvent(env, userId, 'order_posted', { symbol: trade.symbol, id: extra.open_order.id, px: makerPx, post_only: true });
-      return true;
+
+      log.info('🎉 Trade execution completed successfully', {
+        total_duration_ms: totalDuration.toFixed(2),
+        entry_price: orderResult.avgPrice,
+        qty: orderResult.executedQty,
+        brackets_placed: bracketsPlaced
+      });
+
+      return { status: 'filled', success: true, orderResult };
     }
+
+    // Step 7: POST-ONLY PATH
+    log.info('📊 Executing POST-ONLY order');
+    const postOnlyTimer = log.time('post_only_execution');
+
+    try {
+        // 7A: Determine maker price
+        log.debug('Step 7A: Determining maker price');
+        let makerPx = Number(extra?.entry?.limit);
+        if (!isFinite(makerPx) || makerPx <= 0) {
+            try {
+                const ob = await getOrderBookSnapshot(trade.symbol);
+                const { bestBid, bestAsk } = computeBestBidAsk(ob || {});
+                makerPx = !isShort ? bestBid : bestAsk;
+                log.debug('Got maker price from order book', { bestBid, bestAsk, makerPx });
+            } catch (e) {
+                log.warn('Could not get price from order book, falling back', { error: e.message });
+            }
+        }
+        if (!isFinite(makerPx) || makerPx <= 0) {
+            makerPx = await getCurrentPrice(trade.symbol);
+            log.debug('Got maker price from current price API', { makerPx });
+        }
+        log.info('✅ Maker price determined', { makerPx });
+
+        const quoteAmt = Number(extra.quote_size || 0);
+        let result;
+
+        // 7B: Place limit order
+        log.debug('Step 7B: Placing exchange-specific limit order', { exchange: ex.kind, quoteAmt });
+
+        if (ex.kind === 'demoParrot') {
+            log.debug('Placing demo post-only order');
+            result = await placeDemoOrder(trade.symbol, isShort ? "SELL" : "BUY", quoteAmt, true, CID);
+            log.info('✅ Demo order placed/filled');
+        } else if (ex.kind === 'binanceLike') {
+            log.debug('Placing Binance Spot post-only limit order');
+            try {
+                result = await placeBinanceLikeLimitMaker(ex, await decrypt(session.api_key_encrypted, env), await decrypt(session.api_secret_encrypted, env),
+                    trade.symbol, isShort ? 'SELL' : 'BUY', makerPx, quoteAmt, true, CID);
+                log.info('✅ Binance Spot post-only order accepted by exchange');
+            } catch (e) {
+                log.warn('❌ Binance Spot post-only order rejected', { error: e.message });
+                if (takerFallback) {
+                    log.warn('⚠️ Falling back to TAKER order');
+                    if (!isShort) result = await placeMarketBuy(env, userId, trade.symbol, quoteAmt, { reduceOnly: false, clientOrderId: CID });
+                    else result = await placeMarketSell(env, userId, trade.symbol, quoteAmt, true, { reduceOnly: false, clientOrderId: CID });
+                    log.info('✅ Taker fallback order filled');
+                } else {
+                    log.error('❌ Post-only failed without fallback');
+                    await env.DB.prepare("UPDATE trades SET status='rejected', updated_at=? WHERE id=?").bind(nowISO(), tradeId).run();
+                    await logEvent(env, userId, 'order_rejected', { policy: 'post_only', symbol: trade.symbol, reason: String(e?.message||e) });
+                    return { status: 'rejected', success: false };
+                }
+            }
+        } else if (ex.kind === 'binanceFuturesUSDT') {
+            log.debug('Placing Binance Futures post-only limit order');
+            const baseQty = (quoteAmt / Math.max(1e-12, makerPx));
+            try {
+                const apiKey = await decrypt(session.api_key_encrypted, env);
+                const apiSecret = await decrypt(session.api_secret_encrypted, env);
+                await ensureFuturesIsolated1x(ex, apiKey, apiSecret, trade.symbol);
+                result = await placeBinanceFuturesLimitPostOnly(ex, apiKey, apiSecret,
+                    trade.symbol, isShort ? 'SELL' : 'BUY', baseQty, makerPx, false, CID);
+                log.info('✅ Binance Futures post-only order accepted');
+            } catch (e) {
+                log.warn('❌ Binance Futures post-only order rejected', { error: e.message });
+                if (takerFallback) {
+                    log.warn('⚠️ Falling back to TAKER order');
+                    result = await placeBinanceFuturesOrder(ex, await decrypt(session.api_key_encrypted, env), await decrypt(session.api_secret_encrypted, env),
+                        trade.symbol, isShort ? 'SELL' : 'BUY', baseQty, false, CID);
+                    log.info('✅ Taker fallback order filled');
+                } else {
+                    log.error('❌ Post-only failed without fallback');
+                    await env.DB.prepare("UPDATE trades SET status='rejected', updated_at=? WHERE id=?").bind(nowISO(), tradeId).run();
+                    await logEvent(env, userId, 'order_rejected', { policy: 'post_only', symbol: trade.symbol, reason: String(e?.message||e) });
+                    return { status: 'rejected', success: false };
+                }
+            }
+        } else if (ex.kind === 'bybitFuturesV5') {
+            log.debug('Placing Bybit Futures post-only limit order');
+            const baseQty = (quoteAmt / Math.max(1e-12, makerPx));
+            try {
+                const apiKey = await decrypt(session.api_key_encrypted, env);
+                const apiSecret = await decrypt(session.api_secret_encrypted, env);
+                await ensureFuturesIsolated1x(ex, apiKey, apiSecret, trade.symbol);
+                result = await placeBybitFuturesLimitPostOnly(
+                    ex, apiKey, apiSecret, trade.symbol,
+                    isShort ? 'SELL' : 'BUY', baseQty, makerPx, false, CID
+                );
+                log.info('✅ Bybit Futures post-only order accepted');
+            } catch (e) {
+                log.warn('❌ Bybit Futures post-only order rejected', { error: e.message });
+                if (takerFallback) {
+                    log.warn('⚠️ Falling back to TAKER order');
+                    const apiKey = await decrypt(session.api_key_encrypted, env);
+                    const apiSecret = await decrypt(session.api_secret_encrypted, env);
+                    result = await placeBybitFuturesOrder(
+                        ex, apiKey, apiSecret, trade.symbol,
+                        isShort ? 'SELL' : 'BUY', baseQty, false, CID
+                    );
+                    log.info('✅ Taker fallback order filled');
+                } else {
+                    log.error('❌ Post-only failed without fallback');
+                    await env.DB.prepare("UPDATE trades SET status='rejected', updated_at=? WHERE id=?").bind(nowISO(), tradeId).run();
+                    await logEvent(env, userId, 'order_rejected', { policy: 'post_only', symbol: trade.symbol, reason: String(e?.message||e) });
+                    return { status: 'rejected', success: false };
+                }
+            }
+        } else {
+            log.error('❌ Post-only not supported for this exchange, trying fallback', { exchange: ex.kind });
+            if (takerFallback) {
+                log.warn('⚠️ Falling back to TAKER order');
+                if (!isShort) result = await placeMarketBuy(env, userId, trade.symbol, quoteAmt, { reduceOnly: false, clientOrderId: CID });
+                else result = await placeMarketSell(env, userId, trade.symbol, quoteAmt, true, { reduceOnly: false, clientOrderId: CID });
+                log.info('✅ Taker fallback order filled');
+            } else {
+                log.error('❌ Post-only failed without fallback (unsupported exchange)');
+                await env.DB.prepare("UPDATE trades SET status='rejected', updated_at=? WHERE id=?").bind(nowISO(), tradeId).run();
+                await logEvent(env, userId, 'order_rejected', { policy: 'post_only', symbol: trade.symbol, reason: 'unsupported_exchange' });
+                return { status: 'rejected', success: false };
+            }
+        }
+
+        // 7C: Handle result
+        log.debug('Step 7C: Handling order placement result');
+
+        // Case 1: Order filled immediately
+        if (result && Number(result.executedQty || 0) > 0) {
+            log.info('✅ Post-only order was filled immediately (or fell back to taker)');
+            const orderResult = result;
+
+            log.debug('Calculating actual stop/target prices post-fill');
+            const rUsed = Number(extra?.r_target || STRICT_RRR);
+            const entryPx = Number(orderResult.avgPrice || makerPx);
+            const qty = Number(orderResult.executedQty || 0);
+            const actualStopPrice = !isShort ? entryPx * (1 - trade.stop_pct) : entryPx * (1 + trade.stop_pct);
+            const actualTpPrice = !isShort ? entryPx * (1 + trade.stop_pct * rUsed) : entryPx * (1 - trade.stop_pct * rUsed);
+            log.info('✅ Exit prices calculated', { entry: entryPx, stop: actualStopPrice, tp: actualTpPrice });
+
+            log.debug('Capturing entry metrics post-fill');
+            const tcAtEntry = await getTotalCapital(env, userId);
+            const notionalAtEntry = entryPx * qty;
+            const pctOfTCAtEntry = tcAtEntry > 0 ? notionalAtEntry / tcAtEntry : 0;
+            log.info('✅ Entry metrics captured', { tc_at_entry: tcAtEntry, notional_at_entry: notionalAtEntry, pct_of_tc: (pctOfTCAtEntry * 100).toFixed(2) + '%' });
+
+            log.debug('Aligning TTL to entry time post-fill');
+            const openedAtMs = Date.now();
+            ensureTradeTtl(extra, openedAtMs, env);
+            extra.metrics = { ...(extra.metrics || {}), tc_at_entry: tcAtEntry, notional_at_entry: notionalAtEntry, pct_of_tc_at_entry: pctOfTCAtEntry };
+            log.info('✅ TTL aligned', { ttl_ts_ms: extra?.ttl?.ttl_ts_ms });
+
+            let bracketsPlaced = false;
+            if (useBrackets) {
+              log.info('📌 Placing bracket orders (TP/SL)');
+              const bracketTimer = log.time('bracket_placement_post_only');
+              try {
+                  let br = null;
+                  const isLong = !isShort;
+                  if (ex.kind === "binanceLike") {
+                      log.debug('Placing Binance spot brackets');
+                      const apiKey = await decrypt(session.api_key_encrypted, env);
+                      const apiSecret = await decrypt(session.api_secret_encrypted, env);
+                      br = await placeBinanceLikeExitOrders(ex, apiKey, apiSecret, trade.symbol, isLong, qty, actualTpPrice, actualStopPrice, CID || undefined);
+                  } else if (ex.kind === "binanceFuturesUSDT") {
+                      log.debug('Placing Binance Futures brackets');
+                      const apiKey = await decrypt(session.api_key_encrypted, env);
+                      const apiSecret = await decrypt(session.api_secret_encrypted, env);
+                      br = await placeBinanceFuturesBracketOrders(ex, apiKey, apiSecret, trade.symbol, isLong, qty, actualTpPrice, actualStopPrice, CID || undefined);
+                  } else if (ex.kind === "bybitFuturesV5") {
+                      log.debug('Placing Bybit Futures brackets');
+                      const apiKey = await decrypt(session.api_key_encrypted, env);
+                      const apiSecret = await decrypt(session.api_secret_encrypted, env);
+                      br = await placeBybitFuturesBracketOrders(ex, apiKey, apiSecret, trade.symbol, isLong, qty, actualTpPrice, actualStopPrice, CID || undefined);
+                  }
+                  bracketTimer.end({ tp_orderId: br?.tp?.orderId, sl_orderId: br?.sl?.orderId });
+
+                  if (!br?.tp && !br?.sl) {
+                      log.critical('❌ CRITICAL: Brackets required but placement failed', { symbol: trade.symbol, exchange: ex.kind });
+                      throw new Error('Required bracket orders failed to place');
+                  }
+                  extra.open_brackets = { tp: br.tp ? { orderId: br.tp.orderId, status: br.tp.status } : null, sl: br.sl ? { orderId: br.sl.orderId, status: br.sl.status } : null };
+                  bracketsPlaced = true;
+                  log.info('✅ Brackets placed successfully', { tp_orderId: br?.tp?.orderId, sl_orderId: br?.sl?.orderId });
+              } catch (e) {
+                  bracketTimer.end({ error: e.message });
+                  log.error('❌ Bracket placement failed', { error: e.message, stack: e.stack });
+                  log.warn('⚠️ Rolling back entry order due to bracket failure');
+                  try {
+                      if (!isShort) {
+                          await placeMarketSell(env, userId, trade.symbol, qty, false, { reduceOnly: true });
+                      } else {
+                          const currentPrice = await getCurrentPrice(trade.symbol);
+                          await placeMarketBuy(env, userId, trade.symbol, qty * currentPrice, { reduceOnly: true });
+                      }
+                      log.info('✅ Entry order reversed');
+                  } catch (rollbackErr) {
+                      log.critical('❌ ROLLBACK FAILED — MANUAL INTERVENTION REQUIRED', { symbol: trade.symbol, qty: qty, error: rollbackErr.message });
+                  }
+                  throw new Error(`Bracket placement failed: ${e.message}`);
+              }
+            }
+
+            log.debug('Marking trade as OPEN in database');
+            await env.DB.prepare(
+                `UPDATE trades SET status='open', qty=?, entry_price=?, stop_price=?, tp_price=?, extra_json=?, updated_at=? WHERE id=?`
+            ).bind(qty, entryPx, actualStopPrice, actualTpPrice, JSON.stringify(extra), nowISO(), tradeId).run();
+            log.info('✅ Trade marked as OPEN');
+
+            log.debug('Updating Gist state');
+            await gistMarkOpen(env, trade, entryPx, qty);
+            log.info('✅ Gist state updated');
+
+            await logEvent(env, userId, 'trade_open', {
+                symbol: trade.symbol, side: trade.side, qty, entry: entryPx, r: rUsed,
+                stop_pct: trade.stop_pct, stop_price: actualStopPrice, tp_price: actualTpPrice,
+                ttl_ts_ms: extra?.ttl?.ttl_ts_ms, policy: 'post_only_fill', brackets_placed
+            });
+            const totalDuration = timer.end({ success: true, status: 'filled', entry_price: entryPx, qty });
+            log.info('🎉 Trade execution completed successfully (post-only fill)', { total_duration_ms: totalDuration.toFixed(2) });
+            return { status: 'filled', success: true, orderResult };
+
+        // Case 2: Order posted, not filled
+        } else {
+            log.info('✅ Order posted to book, waiting for fill', { orderId: result?.orderId, price: makerPx });
+            extra.open_order = { id: result?.orderId || null, px: makerPx, post_only: true, posted_at: nowISO() };
+            await env.DB.prepare("UPDATE trades SET extra_json=?, updated_at=? WHERE id=?")
+                .bind(JSON.stringify(extra), nowISO(), tradeId).run();
+
+            await logEvent(env, userId, 'order_posted', { symbol: trade.symbol, id: extra.open_order.id, px: makerPx, post_only: true });
+
+            const totalDuration = timer.end({ success: true, status: 'posted', orderId: result?.orderId });
+            log.info('🎉 Trade execution completed (order posted)', { total_duration_ms: totalDuration.toFixed(2) });
+            return { status: 'posted', success: true };
+        }
+    } catch (e) {
+        postOnlyTimer.end({ error: e.message });
+        log.error('❌ Post-only path failed', { error: e.message, stack: e.stack });
+        throw e;
+    }
+
   } catch (e) {
-    console.error('executeTrade error:', e);
-    await logEvent(env, userId, 'error', { where: 'executeTrade', message: e.message });
-    return false;
+    timer.end({ error: e.message });
+    log.error('❌ executeTrade failed', { 
+      error: e.message, 
+      stack: e.stack,
+      tradeId,
+      userId
+    });
+    await logEvent(env, userId, 'error', { 
+      where: 'executeTrade', 
+      message: e.message,
+      tradeId 
+    });
+    return { status: 'error', success: false, error: e.message };
   }
 }
 
@@ -3263,145 +4017,163 @@ async function checkWorkingOrders(env, userId) {
   if (!session) return;
   const ex = SUPPORTED_EXCHANGES[session.exchange_name];
 
-  // Select pending with open_order
   const rows = await env.DB.prepare(
     "SELECT id, symbol, side, stop_pct, extra_json FROM trades WHERE user_id = ? AND status = 'pending'"
   ).bind(userId).all();
+  
+  const log = new Logger(env, { fn: 'checkWorkingOrders', userId });
 
   for (const t of (rows.results || [])) {
+    const tradeLog = log.scope({ tradeId: t.id, symbol: t.symbol });
     try {
       const extra = JSON.parse(t.extra_json || '{}');
       const oo = extra?.open_order;
       if (!oo?.id) continue;
+      
+      const apiKey = await decrypt(session.api_key_encrypted, env);
+      const apiSecret = await decrypt(session.api_secret_encrypted, env);
 
-      // TTL cancel for unfilled entry orders
+      // OPTIMIZATION: Reuse status query
+      let cachedStatus = null;
+
+      // TTL cancel for unfilled entry orders (RACE CONDITION FIX)
       const ttlTs = Number(extra?.ttl?.ttl_ts_ms || 0);
       if (ttlTs > 0 && Date.now() >= ttlTs) {
+        tradeLog.warn('⏱️ TTL expired for unfilled entry order', { orderId: oo.id });
         try {
+          let orderStatus;
           if (ex.kind === 'demoParrot') {
-            // nothing to cancel on exchange
+             orderStatus = { status: 'NEW' }; // Assume not filled
           } else if (ex.kind === 'binanceLike') {
-            const apiKey = await decrypt(session.api_key_encrypted, env);
-            const apiSecret = await decrypt(session.api_secret_encrypted, env);
-            await cancelBinanceLikeOrder(ex, apiKey, apiSecret, t.symbol, { orderId: oo.id });
+            orderStatus = await getBinanceLikeOrderStatus(ex, apiKey, apiSecret, t.symbol, oo.id);
           } else if (ex.kind === 'binanceFuturesUSDT') {
-            const apiKey = await decrypt(session.api_key_encrypted, env);
-            const apiSecret = await decrypt(session.api_secret_encrypted, env);
-            await cancelBinanceFuturesOrder(ex, apiKey, apiSecret, t.symbol, { orderId: oo.id });
+            orderStatus = await getBinanceFuturesOrderStatus(ex, apiKey, apiSecret, t.symbol, oo.id);
           } else if (ex.kind === 'bybitFuturesV5') {
-            const apiKey = await decrypt(session.api_key_encrypted, env);
-            const apiSecret = await decrypt(session.api_secret_encrypted, env);
-            await cancelBybitFuturesOrder(ex, apiKey, apiSecret, t.symbol, { orderId: oo.id });
+            orderStatus = await getBybitFuturesOrderStatus(ex, apiKey, apiSecret, t.symbol, { orderId: oo.id });
           }
-        } catch (_) {}
 
-        // Mark as rejected (TTL expired) and remove gist pending if CID present
-        await env.DB.prepare("UPDATE trades SET status='rejected', close_type='TTL_EXPIRED', updated_at=? WHERE id=?")
-          .bind(nowISO(), t.id).run();
-        if (extra?.client_order_id) {
-          try {
-            await gistPatchState(env, (state) => {
-              const idx = gistFindPendingIdxByCID(state, extra.client_order_id);
-              if (idx >= 0) state.pending.splice(idx, 1);
-              return state;
-            });
-          } catch {}
+          if ((orderStatus?.status || '').toUpperCase() === 'FILLED' && Number(orderStatus.executedQty || 0) > 0) {
+            tradeLog.info('✅ Order filled just before TTL cancellation, processing as a fill.');
+            cachedStatus = orderStatus; // Save for reuse
+          } else {
+            tradeLog.info('Order is not filled, proceeding with cancellation.');
+            if (ex.kind !== 'demoParrot') {
+              if (ex.kind === 'binanceLike') await cancelBinanceLikeOrder(ex, apiKey, apiSecret, t.symbol, { orderId: oo.id });
+              else if (ex.kind === 'binanceFuturesUSDT') await cancelBinanceFuturesOrder(ex, apiKey, apiSecret, t.symbol, { orderId: oo.id });
+              else if (ex.kind === 'bybitFuturesV5') await cancelBybitFuturesOrder(ex, apiKey, apiSecret, t.symbol, { orderId: oo.id });
+            }
+            
+            await env.DB.prepare("UPDATE trades SET status='rejected', close_type='TTL_EXPIRED', updated_at=? WHERE id=?")
+              .bind(nowISO(), t.id).run();
+            if (extra?.client_order_id) {
+              await gistPatchState(env, (state) => {
+                const idx = gistFindPendingIdxByCID(state, extra.client_order_id);
+                if (idx >= 0) state.pending.splice(idx, 1);
+                return state;
+              });
+            }
+            await logEvent(env, userId, 'order_ttl_cancel', { symbol: t.symbol, id: t.id, orderId: oo.id });
+            continue;
+          }
+        } catch (e) {
+            tradeLog.error('Error during TTL cancellation check', { error: e.message });
+            continue;
         }
-        await logEvent(env, userId, 'order_ttl_cancel', { symbol: t.symbol, id: t.id, orderId: oo.id });
-        continue;
       }
 
-      // Query order status
-      let st;
-      if (ex.kind === 'demoParrot') {
-        // Emulate immediate fill
-        st = { status: 'FILLED', executedQty: (extra.quote_size || 0) / Math.max(1e-12, oo.px), avgPrice: oo.px };
-      } else if (ex.kind === 'binanceLike') {
-        const apiKey = await decrypt(session.api_key_encrypted, env);
-        const apiSecret = await decrypt(session.api_secret_encrypted, env);
-        st = await getBinanceLikeOrderStatus(ex, apiKey, apiSecret, t.symbol, oo.id);
-      } else if (ex.kind === 'binanceFuturesUSDT') {
-        const apiKey = await decrypt(session.api_key_encrypted, env);
-        const apiSecret = await decrypt(session.api_secret_encrypted, env);
-        st = await getBinanceFuturesOrderStatus(ex, apiKey, apiSecret, t.symbol, oo.id);
-      } else if (ex.kind === 'bybitFuturesV5') {
-        const apiKey = await decrypt(session.api_key_encrypted, env);
-        const apiSecret = await decrypt(session.api_secret_encrypted, env);
-        st = await getBybitFuturesOrderStatus(ex, apiKey, apiSecret, t.symbol, { orderId: oo.id });
-      } else {
-        continue;
+      // Query order status (or use cached)
+      let st = cachedStatus;
+      if (!st) {
+        if (ex.kind === 'demoParrot') {
+          st = { status: 'FILLED', executedQty: (extra.quote_size || 0) / Math.max(1e-12, oo.px), avgPrice: oo.px };
+        } else if (ex.kind === 'binanceLike') {
+          st = await getBinanceLikeOrderStatus(ex, apiKey, apiSecret, t.symbol, oo.id);
+        } else if (ex.kind === 'binanceFuturesUSDT') {
+          st = await getBinanceFuturesOrderStatus(ex, apiKey, apiSecret, t.symbol, oo.id);
+        } else if (ex.kind === 'bybitFuturesV5') {
+          st = await getBybitFuturesOrderStatus(ex, apiKey, apiSecret, t.symbol, { orderId: oo.id });
+        } else {
+          continue;
+        }
       }
-
+      
       // Only act on FILLED
       if ((st.status || '').toUpperCase() !== 'FILLED' || !(Number(st.executedQty) > 0)) {
         continue;
       }
+      tradeLog.info('✅ Maker order has filled', { orderId: oo.id, avgPrice: st.avgPrice, qty: st.executedQty });
 
       const isShort = t.side === 'SELL';
       const rUsed = Number(extra?.r_target || STRICT_RRR);
-
       const entryPx = Number(st.avgPrice || oo.px);
       const qty = Number(st.executedQty || 0);
 
-      const actualStopPrice = !isShort
-        ? entryPx * (1 - t.stop_pct)
-        : entryPx * (1 + t.stop_pct);
-      const actualTpPrice = !isShort
-        ? entryPx * (1 + t.stop_pct * rUsed)
-        : entryPx * (1 - t.stop_pct * rUsed);
+      const actualStopPrice = !isShort ? entryPx * (1 - t.stop_pct) : entryPx * (1 + t.stop_pct);
+      const actualTpPrice = !isShort ? entryPx * (1 + t.stop_pct * rUsed) : entryPx * (1 - t.stop_pct * rUsed);
+
+      const openedAtMs = Date.now();
+      ensureTradeTtl(extra, openedAtMs, env);
+      delete extra.open_order;
+
+      // BRACKET FAILURE ROLLBACK FIX
+      const useBrackets = (ex.kind === "binanceFuturesUSDT" || ex.kind === "bybitFuturesV5") ? true : (String(env?.USE_BRACKETS || "0") === "1");
+      if (useBrackets) {
+        tradeLog.info('📌 Placing bracket orders after maker fill');
+        try {
+          let br = null;
+          const isLong = !isShort;
+          if (ex.kind === "binanceLike") {
+            br = await placeBinanceLikeExitOrders(ex, apiKey, apiSecret, t.symbol, isLong, qty, actualTpPrice, actualStopPrice, extra?.client_order_id || undefined);
+          } else if (ex.kind === "binanceFuturesUSDT") {
+            br = await placeBinanceFuturesBracketOrders(ex, apiKey, apiSecret, t.symbol, isLong, qty, actualTpPrice, actualStopPrice, extra?.client_order_id || undefined);
+          } else if (ex.kind === "bybitFuturesV5") {
+            br = await placeBybitFuturesBracketOrders(ex, apiKey, apiSecret, t.symbol, isLong, qty, actualTpPrice, actualStopPrice, extra?.client_order_id || undefined);
+          }
+          
+          if (!br?.tp && !br?.sl) {
+            tradeLog.critical('❌ CRITICAL: Brackets required but placement failed');
+            throw new Error('Required bracket orders failed to place');
+          }
+          extra.open_brackets = { tp: br.tp ? { orderId: br.tp.orderId } : null, sl: br.sl ? { orderId: br.sl.orderId } : null };
+          tradeLog.info('✅ Brackets placed successfully', { tp: br?.tp?.orderId, sl: br?.sl?.orderId });
+        } catch (e) {
+          tradeLog.error('❌ Bracket placement failed, reversing fill', { error: e.message });
+          try {
+            if (!isShort) {
+              await placeMarketSell(env, userId, t.symbol, qty, false, { reduceOnly: true });
+            } else {
+              const currentPrice = await getCurrentPrice(t.symbol);
+              await placeMarketBuy(env, userId, t.symbol, qty * currentPrice, { reduceOnly: true });
+            }
+            tradeLog.info('✅ Fill reversed successfully');
+          } catch (rollbackErr) {
+            tradeLog.critical('❌ ROLLBACK FAILED — MANUAL INTERVENTION REQUIRED', { symbol: t.symbol, qty: qty, error: rollbackErr.message });
+          }
+          
+          await env.DB.prepare("UPDATE trades SET status='failed', close_type='BRACKET_FAIL', updated_at=? WHERE id=?")
+            .bind(nowISO(), t.id).run();
+          continue;
+        }
+      }
 
       const tcAtEntry = await getTotalCapital(env, userId);
       const notionalAtEntry = entryPx * qty;
       const pctOfTCAtEntry = tcAtEntry > 0 ? notionalAtEntry / tcAtEntry : 0;
-
-      const openedAtMs = Date.now();
-      ensureTradeTtl(extra, openedAtMs, env); // aligns TTL to open
-      delete extra.open_order;
       extra.metrics = { ...(extra.metrics || {}), tc_at_entry: tcAtEntry, notional_at_entry: notionalAtEntry, pct_of_tc_at_entry: pctOfTCAtEntry };
 
       await env.DB.prepare(
         `UPDATE trades SET status='open', qty=?, entry_price=?, stop_price=?, tp_price=?, extra_json=?, updated_at=? WHERE id=?`
       ).bind(qty, entryPx, actualStopPrice, actualTpPrice, JSON.stringify(extra), nowISO(), t.id).run();
+      tradeLog.info('✅ Trade successfully marked as OPEN in DB');
 
       await gistMarkOpen(env, t, entryPx, qty);
-
-      // Optional bracket placement (default ON for futures)
-      const useBrackets = (ex.kind === "binanceFuturesUSDT" || ex.kind === "bybitFuturesV5") ? true : (String(env?.USE_BRACKETS || "0") === "1");
-      if (useBrackets) {
-        try {
-          let br = null;
-          const isLong = !isShort;
-          if (ex.kind === "binanceLike") {
-            const apiKey = await decrypt(session.api_key_encrypted, env);
-            const apiSecret = await decrypt(session.api_secret_encrypted, env);
-            br = await placeBinanceLikeExitOrders(ex, apiKey, apiSecret, t.symbol, isLong, qty, actualTpPrice, actualStopPrice, extra?.client_order_id || undefined);
-          } else if (ex.kind === "binanceFuturesUSDT") {
-            const apiKey = await decrypt(session.api_key_encrypted, env);
-            const apiSecret = await decrypt(session.api_secret_encrypted, env);
-            br = await placeBinanceFuturesBracketOrders(ex, apiKey, apiSecret, t.symbol, isLong, qty, actualTpPrice, actualStopPrice, extra?.client_order_id || undefined);
-          } else if (ex.kind === "bybitFuturesV5") {
-            const apiKey = await decrypt(session.api_key_encrypted, env);
-            const apiSecret = await decrypt(session.api_secret_encrypted, env);
-            br = await placeBybitFuturesBracketOrders(ex, apiKey, apiSecret, t.symbol, isLong, qty, actualTpPrice, actualStopPrice, extra?.client_order_id || undefined);
-          }
-          if (br) {
-            const ex2 = JSON.parse((await env.DB.prepare("SELECT extra_json FROM trades WHERE id=?").bind(t.id).first()).extra_json || '{}');
-            ex2.open_brackets = { tp: br.tp ? { orderId: br.tp.orderId } : null, sl: br.sl ? { orderId: br.sl.orderId } : null };
-            await env.DB.prepare("UPDATE trades SET extra_json = ?, updated_at = ? WHERE id = ?")
-              .bind(JSON.stringify(ex2), nowISO(), t.id).run();
-          }
-        } catch (e) {
-          console.warn("brackets place (maker) warn:", e?.message || e);
-        }
-      }
-
       await logEvent(env, userId, 'trade_open', {
         symbol: t.symbol, side: t.side, qty, entry: entryPx, r: rUsed,
         stop_pct: t.stop_pct, stop_price: actualStopPrice, tp_price: actualTpPrice,
         ttl_ts_ms: extra?.ttl?.ttl_ts_ms, policy: 'post_only_fill'
       });
     } catch (e) {
-      console.error('checkWorkingOrders error:', e);
+      tradeLog.error('Error processing working order', { error: e.message, stack: e.stack });
     }
   }
 }
@@ -3411,19 +4183,35 @@ function unrealizedR(trade, price) {
   const pnl = trade.side==='SELL' ? (trade.entry_price - price)*trade.qty : (price - trade.entry_price)*trade.qty;
   return trade.risk_usd > 0 ? pnl / trade.risk_usd : 0;
 }
+// SECURITY FIX: Replaced eval-based parser with a safe, simple one
 function parseThreshold(expr, costBps) {
   if (expr == null) return null;
   if (typeof expr === 'number') return expr;
+  
   const s = String(expr).trim().toUpperCase();
   if (!s) return null;
+  
   const COST = Number(costBps || 0);
-  const safe = s.replace(/COST/g, String(COST));
-  if (!/^[0-9+\-*/.\s]+$/.test(safe)) return null;
-  try {
-    // eslint-disable-next-line no-new-func
-    const v = Function(`"use strict";return (${safe});`)();
-    return Number(v);
-  } catch { return null; }
+  
+  if (s === 'COST') return COST;
+  
+  const match = s.match(/^COST\s*([+\-*/])\s*([\d.]+)$/);
+  if (match) {
+    const op = match[1];
+    const num = Number(match[2]);
+    if (!Number.isFinite(num)) return null;
+    
+    switch (op) {
+      case '+': return COST + num;
+      case '-': return COST - num;
+      case '*': return COST * num;
+      case '/': return num !== 0 ? COST / num : null;
+      default: return null;
+    }
+  }
+  
+  const num = Number(s);
+  return Number.isFinite(num) ? num : null;
 }
 
 /* ---------- Manual close & automated exits (with mgmt overlay) ---------- */
@@ -3741,37 +4529,50 @@ async function reconcileExchangeFills(env, userId) {
 
 /* ---------- Robust auto-close with mgmt overlay + batched price fetching ---------- */
 async function checkAndExitTrades(env, userId) {
+  const log = new Logger(env, { fn: 'checkAndExitTrades', userId });
+  log.info('🔍 Checking open trades for exits');
+  const timer = log.time('checkAndExitTrades');
+  
   const openTrades = await env.DB.prepare(
     "SELECT id, symbol, side, qty, entry_price, stop_price, tp_price, risk_usd, stop_pct, extra_json, created_at, updated_at FROM trades WHERE user_id = ? AND status = 'open'"
   ).bind(userId).all();
-  if (!openTrades?.results?.length) return;
+  
+  if (!openTrades?.results?.length) {
+    log.info('ℹ️ No open trades to check');
+    timer.end({ trades_checked: 0 });
+    return;
+  }
+  log.info(`✅ Loaded ${openTrades.results.length} open trades to check`);
 
   const protocol = await getProtocolState(env, userId);
 
   // Batch unique symbols for one-shot pricing
   const symbols = [...new Set(openTrades.results.map(t => t.symbol))];
+  log.debug('Fetching prices for all symbols', { count: symbols.length });
   const priceMap = new Map();
   for (const s of symbols) {
     priceMap.set(s, await robustPriceFor(s));
   }
+  log.info(`✅ Prices fetched for ${symbols.length} unique symbols`);
 
   // Fallback global time-stop (only if per-trade TTL not present)
   const AGE_MS_FALLBACK = getMaxTradeAgeMs(env);
   const overlayOn = envFlag(env, 'ENABLE_MGMT_OVERLAY', '1');
 
   for (const trade of (openTrades.results || [])) {
+    const tradeLog = log.scope({ tradeId: trade.id, symbol: trade.symbol });
     try {
       let currentPrice = Number(priceMap.get(trade.symbol) || 0);
       if (!isFinite(currentPrice) || currentPrice <= 0) {
-        await logEvent(env, userId, 'error', { where: 'checkAndExitTrades', message: `bad price for ${trade.symbol}` });
+        tradeLog.error('Bad price for symbol, skipping check', { price: currentPrice });
         continue;
       }
+      tradeLog.debug('Checking trade for exit conditions', { currentPrice, qty: trade.qty });
 
       const isShort = (trade.side === 'SELL');
       let shouldExit = false;
       let exitReason = '';
 
-      // Management overlay (BE, trail, partial, TTL rescue, early cut)
       let extra = {};
       try { extra = JSON.parse(trade.extra_json || '{}'); } catch { extra = {}; }
       const haveBrackets = !!(extra.open_brackets);
@@ -3785,6 +4586,7 @@ async function checkAndExitTrades(env, userId) {
       if (overlayOn) {
         // 1) Break-even shift
         if (isFinite(mgmt.be_at_r) && rNow >= Number(mgmt.be_at_r) && !extra?.mgmt_state?.be_done) {
+          tradeLog.info('📈 Mgmt: Applying break-even stop', { rNow, be_at_r: mgmt.be_at_r });
           newStop = trade.entry_price;
           extra.mgmt_state = { ...(extra.mgmt_state || {}), be_done: true };
           stateChanged = true;
@@ -3792,103 +4594,76 @@ async function checkAndExitTrades(env, userId) {
 
         // 2) Trailing stop
         if (isFinite(mgmt.trail_atr_mult) && Number(mgmt.trail_atr_mult) > 0) {
-          const baseDist = trade.stop_pct * trade.entry_price; // initial risk distance in $
+          const baseDist = trade.stop_pct * trade.entry_price;
           const trailDist = baseDist * Number(mgmt.trail_atr_mult);
-          const trailed = isShort ? Math.min(newStop, currentPrice + trailDist)
-                                  : Math.max(newStop, currentPrice - trailDist);
+          const trailed = isShort ? Math.min(newStop, currentPrice + trailDist) : Math.max(newStop, currentPrice - trailDist);
           const improved = isShort ? trailed < newStop : trailed > newStop;
-          if (improved) { newStop = trailed; stateChanged = true; }
+          if (improved) {
+            tradeLog.info('📈 Mgmt: Applying trailing stop', { oldStop: newStop, newStop: trailed });
+            newStop = trailed;
+            stateChanged = true;
+          }
         }
 
-        // 3) TTL rescue (extend per-trade TTL if profitable enough)
+        // 3) TTL rescue
         if (mgmt.extend_ttl_if_unrealized_bps_ge != null) {
           const thr = parseThreshold(mgmt.extend_ttl_if_unrealized_bps_ge, costBps);
           const bpsUnreal = ((currentPrice / trade.entry_price - 1) * (isShort ? -1 : 1)) * 10000;
           if (thr != null && bpsUnreal >= thr && isFinite(mgmt.extend_ttl_sec) && mgmt.extend_ttl_sec > 0) {
             const ttl = (extra.ttl || {});
             const newTtl = Math.max(Number(ttl.ttl_ts_ms || 0), Date.now()) + Number(mgmt.extend_ttl_sec) * 1000;
+            tradeLog.info('📈 Mgmt: Extending TTL', { bpsUnreal, threshold: thr, oldTtl: ttl.ttl_ts_ms, newTtl });
             extra.ttl = { ...(ttl || {}), ttl_ts_ms: newTtl, source: 'mgmt_extend' };
             stateChanged = true;
           }
         }
 
-        // 4) Early cut (soft SL)
+        // 4) Early cut (soft SL) - OPTIMIZATION: Removed bracket cancel
         if (mgmt.early_cut_if_unrealized_bps_le != null) {
           const thrLe = parseThreshold(mgmt.early_cut_if_unrealized_bps_le, costBps);
           const bpsUnreal = ((currentPrice / trade.entry_price - 1) * (isShort ? -1 : 1)) * 10000;
           if (thrLe != null && bpsUnreal <= thrLe) {
-            // Cancel brackets first (if any)
-            if (haveBrackets) {
-              const session2 = await getSession(env, userId);
-              const ex2 = SUPPORTED_EXCHANGES[session2.exchange_name];
-              await cancelBracketsIfAny(env, userId, trade, session2, ex2, extra);
-            }
-
-            // Immediate close
-            let exitPrice = currentPrice;
-            if (!isShort) {
-              const sellResult = await placeMarketSell(env, userId, trade.symbol, trade.qty, false, { reduceOnly: true });
-              exitPrice = sellResult.avgPrice || currentPrice;
-            } else {
-              const session = await getSession(env, userId);
-              if (session.exchange_name === 'crypto_parrot') {
-                const buyResult = await placeDemoOrder(trade.symbol, "BUY", trade.qty, false);
-                exitPrice = buyResult.avgPrice || currentPrice;
-              } else {
-                const buyResult = await placeMarketBuy(env, userId, trade.symbol, trade.qty * currentPrice, { reduceOnly: true });
-                exitPrice = buyResult.avgPrice || currentPrice;
-              }
-            }
-
-            const grossPnl = !isShort ? (exitPrice - trade.entry_price) * trade.qty
-                                      : (trade.entry_price - exitPrice) * trade.qty;
-            const fees = (trade.entry_price * trade.qty + exitPrice * trade.qty) * (protocol?.fee_rate ?? 0.001);
-            const netPnl = grossPnl - fees;
-            const realizedR = trade.risk_usd > 0 ? netPnl / trade.risk_usd : 0;
-
-            await env.DB.prepare(
-              `UPDATE trades SET status='closed', price=?, realized_pnl=?, realized_r=?, fees=?, close_type='MGMT_EARLY_CUT', updated_at=? WHERE id=?`
-            ).bind(exitPrice, netPnl, realizedR, fees, nowISO(), trade.id).run();
-            await gistReportClosed(env, trade, exitPrice, 'MGMT_EARLY_CUT', protocol?.fee_rate);
-            await setSymbolCooldown(env, userId, trade.symbol);
-            await logEvent(env, userId, 'trade_close', { symbol: trade.symbol, entry: trade.entry_price, exit: exitPrice, realizedR, close_type: 'MGMT_EARLY_CUT', pnl: netPnl, fees });
-            continue; // proceed next trade
+            tradeLog.info('🎯 Mgmt: Early cut triggered', { bpsUnreal, threshold: thrLe });
+            shouldExit = true;
+            exitReason = 'MGMT_EARLY_CUT';
           }
         }
-
-        // 5) Partial take
+        
+        // 5) Partial take - CRITICAL FIX: Update in-memory quantity
         if (isFinite(mgmt.partial_take_at_r) && rNow >= Number(mgmt.partial_take_at_r) && !extra?.mgmt_state?.pt_done) {
           const pct = clamp(Number(mgmt.partial_take_pct || 0.5), 0.05, 0.95);
           const qtyPart = trade.qty * pct;
+          tradeLog.info('📈 Mgmt: Taking partial profit', { rNow, at_r: mgmt.partial_take_at_r, pct, qtyPart });
           try {
             if (trade.side === 'SELL') {
               const buy = await placeMarketBuy(env, userId, trade.symbol, qtyPart * currentPrice, { reduceOnly: true });
-              // adjust remaining qty
               const newQty = Math.max(0, trade.qty - (buy.executedQty || qtyPart));
               await env.DB.prepare("UPDATE trades SET qty = ?, updated_at = ? WHERE id = ?")
                 .bind(newQty, nowISO(), trade.id).run();
+              trade.qty = newQty; // Update in-memory object
             } else {
               const sell = await placeMarketSell(env, userId, trade.symbol, qtyPart, false, { reduceOnly: true });
               const newQty = Math.max(0, trade.qty - (sell.executedQty || qtyPart));
               await env.DB.prepare("UPDATE trades SET qty = ?, updated_at = ? WHERE id = ?")
                 .bind(newQty, nowISO(), trade.id).run();
+              trade.qty = newQty; // Update in-memory object
             }
             extra.mgmt_state = { ...(extra.mgmt_state || {}), pt_done: true };
             stateChanged = true;
+            tradeLog.info('✅ Partial take successful', { newQty: trade.qty });
           } catch (e) {
-            console.error('partial_take error:', e);
+            tradeLog.error('Partial take profit failed', { error: e.message });
           }
         }
-      } // overlayOn
+      }
 
       if (stateChanged) {
         await env.DB.prepare("UPDATE trades SET stop_price = ?, extra_json = ?, updated_at = ? WHERE id = ?")
           .bind(newStop, JSON.stringify(extra), nowISO(), trade.id).run();
       }
 
-      // Priority: TP > SL > TTL
-      const useBracketsSkipPrice = haveBrackets;
-      if (!useBracketsSkipPrice) {
+      // ALWAYS check price-based exits as a backup (CRITICAL FIX)
+      if (!shouldExit) {
         if (!isShort) {
           if (currentPrice <= newStop) { shouldExit = true; exitReason = 'SL'; }
           else if (currentPrice >= trade.tp_price) { shouldExit = true; exitReason = 'TP'; }
@@ -3896,33 +4671,32 @@ async function checkAndExitTrades(env, userId) {
           if (currentPrice >= newStop) { shouldExit = true; exitReason = 'SL'; }
           else if (currentPrice <= trade.tp_price) { shouldExit = true; exitReason = 'TP'; }
         }
+        if (exitReason) tradeLog.debug('Price-based exit met', { exitReason, currentPrice, newStop, tp_price: trade.tp_price });
       }
 
       // TTL enforcement (per-trade)
-      if (!shouldExit) {
-        let ttlTs = null;
-        try { ttlTs = Number(JSON.parse(trade.extra_json || '{}')?.ttl?.ttl_ts_ms ?? null); } catch {}
-        if (isFinite(ttlTs) && ttlTs > 0 && Date.now() >= ttlTs) {
-          shouldExit = true;
-          exitReason = 'TTL';
-        }
+      let ttlTs = null;
+      try { ttlTs = Number(JSON.parse(trade.extra_json || '{}')?.ttl?.ttl_ts_ms ?? null); } catch {}
+      if (!shouldExit && isFinite(ttlTs) && ttlTs > 0 && Date.now() >= ttlTs) {
+        shouldExit = true;
+        exitReason = 'TTL';
+        tradeLog.debug('Per-trade TTL met');
       }
 
-      // Fallback global TIME stop (only if no per-trade TTL stored)
-      if (!shouldExit) {
-        let ttlTs = null; try { ttlTs = Number(JSON.parse(trade.extra_json || '{}')?.ttl?.ttl_ts_ms ?? null); } catch {}
-        if (!(isFinite(ttlTs) && ttlTs > 0)) {
-          const openedAtMs = Date.parse(trade.updated_at || trade.created_at || "");
-          if (isFinite(openedAtMs) && (Date.now() - openedAtMs >= AGE_MS_FALLBACK)) {
-            shouldExit = true;
-            exitReason = 'TIME';
-          }
+      // Fallback global TIME stop (only if no per-trade TTL)
+      if (!shouldExit && !(isFinite(ttlTs) && ttlTs > 0)) {
+        const openedAtMs = Date.parse(trade.updated_at || trade.created_at || "");
+        if (isFinite(openedAtMs) && (Date.now() - openedAtMs >= AGE_MS_FALLBACK)) {
+          shouldExit = true;
+          exitReason = 'TIME';
+          tradeLog.debug('Global time stop met');
         }
       }
 
       if (!shouldExit) continue;
 
-      // Cancel brackets first (if any) to avoid double-exec
+      tradeLog.info('🎯 Exit triggered', { reason: exitReason });
+
       if (haveBrackets) {
         const session2 = await getSession(env, userId);
         const ex2 = SUPPORTED_EXCHANGES[session2.exchange_name];
@@ -3933,23 +4707,26 @@ async function checkAndExitTrades(env, userId) {
       const exitCid = (exitReason === 'TTL' || exitReason === 'TIME') && cidBase ? `${cidBase}:ttl` : cidBase;
 
       let exitPrice = currentPrice;
-      if (!isShort) {
-        const sellResult = await placeMarketSell(env, userId, trade.symbol, trade.qty, false, { reduceOnly: true, clientOrderId: exitCid });
-        exitPrice = sellResult.avgPrice || currentPrice;
-      } else {
-        const session = await getSession(env, userId);
-        if (session.exchange_name === 'crypto_parrot') {
-          const buyResult = await placeDemoOrder(trade.symbol, "BUY", trade.qty, false, exitCid);
-          exitPrice = buyResult.avgPrice || currentPrice;
+      if (trade.qty > 0) { // Ensure there is remaining quantity to close
+        if (!isShort) {
+            const sellResult = await placeMarketSell(env, userId, trade.symbol, trade.qty, false, { reduceOnly: true, clientOrderId: exitCid });
+            exitPrice = sellResult.avgPrice || currentPrice;
         } else {
-          const requiredQuote = trade.qty * currentPrice;
-          const buyResult = await placeMarketBuy(env, userId, trade.symbol, requiredQuote, { reduceOnly: true, clientOrderId: exitCid });
-          exitPrice = buyResult.avgPrice || currentPrice;
+            const session = await getSession(env, userId);
+            if (session.exchange_name === 'crypto_parrot') {
+            const buyResult = await placeDemoOrder(trade.symbol, "BUY", trade.qty, false, exitCid);
+            exitPrice = buyResult.avgPrice || currentPrice;
+            } else {
+            const requiredQuote = trade.qty * currentPrice;
+            const buyResult = await placeMarketBuy(env, userId, trade.symbol, requiredQuote, { reduceOnly: true, clientOrderId: exitCid });
+            exitPrice = buyResult.avgPrice || currentPrice;
+            }
         }
+      } else {
+        tradeLog.warn('Trade has zero quantity, marking as closed without exchange order');
       }
 
-      const grossPnl = !isShort ? (exitPrice - trade.entry_price) * trade.qty
-                                : (trade.entry_price - exitPrice) * trade.qty;
+      const grossPnl = !isShort ? (exitPrice - trade.entry_price) * trade.qty : (trade.entry_price - exitPrice) * trade.qty;
       const fees = (trade.entry_price * trade.qty + exitPrice * trade.qty) * (protocol?.fee_rate ?? 0.001);
       const netPnl = grossPnl - fees;
       const realizedR = trade.risk_usd > 0 ? netPnl / trade.risk_usd : 0;
@@ -3959,7 +4736,6 @@ async function checkAndExitTrades(env, userId) {
       ).bind(exitPrice, netPnl, realizedR, fees, exitReason, nowISO(), trade.id).run();
 
       await gistReportClosed(env, trade, exitPrice, exitReason, protocol?.fee_rate);
-
       await setSymbolCooldown(env, userId, trade.symbol);
 
       const r_target = (() => { try { return Number(JSON.parse(trade.extra_json||"{}")?.r_target || STRICT_RRR); } catch { return STRICT_RRR; } })();
@@ -3968,13 +4744,14 @@ async function checkAndExitTrades(env, userId) {
         symbol: trade.symbol, entry: trade.entry_price, exit: exitPrice, realizedR,
         hit: exitReason, exit_source: (exitReason === 'TTL' ? 'ttl_scan' : (exitReason === 'TIME' ? 'time_stop' : 'sl_tp_scan')),
         pnl: netPnl, fees, strict_rrr: true, r_target,
-        ttl_ts_ms: (() => { try { return JSON.parse(trade.extra_json||"{}")?.ttl?.ttl_ts_ms ?? null; } catch { return null; } })()
+        ttl_ts_ms: ttlTs
       });
     } catch (e) {
-      console.error('checkAndExitTrades error:', e);
-      await logEvent(env, userId, 'error', { where: 'checkAndExitTrades', message: e.message });
+      tradeLog.error('Error processing trade for exit', { error: e.message, stack: e.stack });
+      await logEvent(env, userId, 'error', { where: 'checkAndExitTrades', message: e.message, tradeId: trade.id });
     }
   }
+  timer.end({ trades_checked: openTrades.results.length });
 }
 
 /* Win-rate for Protocol Status */
@@ -4577,6 +5354,10 @@ export {
   handleStopRequest, restartWizardAtExchange, showWelcomeStep,
   getMaxConcurrent, getMaxNewPerCycle
 };
+
+
+
+
 /* ======================================================================
    SECTION 7/7 — processUser, Telegram handler, HTTP endpoints,
                   Cron with fan-out fallback, Worker export
@@ -4657,249 +5438,547 @@ async function buildIdeasFromGistPending(env) {
 
 /* ---------- Per-user processing (flat-CPU: early exits, time guards) ---------- */
 async function processUser(env, userId, budget = null) {
-  try {
-    if (budget?.isExpired()) return;
-    const session = await getSession(env, userId);
-    if (!session) return;
-    
-    const ex = SUPPORTED_EXCHANGES[session.exchange_name];
-    if (!ex) return;
+  const log = new Logger(env, { fn: 'processUser', userId });
+  log.info('🔄 Starting user processing cycle');
 
-    // Enforce futures-only for non-demo; optionally log and skip ideas
-    if (session.exchange_name !== 'crypto_parrot' && ["binanceLike","lbankV2","coinexV2"].includes(ex.kind)) {
-      // Option 1: log once and return
-      await logEvent(env, userId, 'futures_only_block', { exchange: session.exchange_name });
-      // Option 2 (verbose): mark each idea as skipped (requires loading ideas)
-    //  const ideasTmp = await (await buildIdeasFromGistPending(env)) || await getLatestIdeas(env);
-    //  if (ideasTmp?.ideas?.length) {
-    //    const protocol = await getProtocolState(env, userId);
-    //    for (const idea of ideasTmp.ideas) {
-    //      await createAutoSkipRecord(env, userId, idea, protocol, 'exchange_requires_futures', { exchange: session.exchange_name });
-    //    }
-    //  }
+  const cycleTimer = log.time('processUser_cycle');
+
+  try {
+    // Step 1: Budget check
+    if (budget?.isExpired()) {
+      log.warn('⏱️ CPU budget expired before start', {
+        remaining_ms: budget.timeLeft()
+      });
       return;
     }
 
-    // Helper: force all ideas through (env.NO_REJECTS = '1')
-    const forceAll = () => String(env?.NO_REJECTS || '0') === '1';
-    // Cycle-only duplicate guard flag
-    const cycleOnly = String(env?.CYCLE_ONLY_DUP_GUARD || '0') === '1';
+    // Step 2: Session validation
+    log.debug('Step 1: Loading user session');
+    const session = await getSession(env, userId);
+    if (!session) {
+      log.info('ℹ️ No session found for user');
+      return;
+    }
 
-    // Reconcile exchange fills first (optional; internally no-ops if disabled)
+    const ex = SUPPORTED_EXCHANGES[session.exchange_name];
+    if (!ex) {
+      log.warn('⚠️ Invalid exchange configuration', { 
+        exchange: session.exchange_name 
+      });
+      return;
+    }
+
+    log.info('✅ Session loaded', {
+      exchange: session.exchange_name,
+      mode: session.bot_mode,
+      status: session.status
+    });
+
+    // Step 3: Futures-only enforcement
+    log.debug('Step 2: Checking exchange compatibility');
+    if (session.exchange_name !== 'crypto_parrot' && 
+        ["binanceLike","lbankV2","coinexV2"].includes(ex.kind)) {
+      log.warn('🚫 Futures-only mode: Spot exchange blocked', {
+        exchange: session.exchange_name,
+        kind: ex.kind
+      });
+      await logEvent(env, userId, 'futures_only_block', { 
+        exchange: session.exchange_name 
+      });
+      return;
+    }
+
+    // Step 4: Reconciliation
+    log.debug('Step 3: Running exchange reconciliation');
+    const reconTimer = log.time('reconciliation');
     await reconcileExchangeFills(env, userId);
-    if (budget?.isExpired()) return;
+    reconTimer.end();
+    log.info('✅ Reconciliation completed');
 
-    // Resolve posted-maker orders, then enforce SL/TP
+    if (budget?.isExpired()) {
+      log.warn('⏱️ CPU budget expired after reconciliation');
+      return;
+    }
+
+    // Step 5: Working orders
+    log.debug('Step 4: Checking working orders (post-only)');
+    const workingTimer = log.time('working_orders');
     await checkWorkingOrders(env, userId);
-    if (budget?.isExpired()) return;
+    workingTimer.end();
+    log.info('✅ Working orders processed');
 
+    if (budget?.isExpired()) {
+      log.warn('⏱️ CPU budget expired after working orders');
+      return;
+    }
+
+    // Step 6: Auto exits
+    log.debug('Step 5: Running auto exit checks');
+    const exitTimer = log.time('auto_exits');
     await checkAndExitTrades(env, userId);
-    if (budget?.isExpired()) return;
+    exitTimer.end();
+    log.info('✅ Auto exits processed');
 
+    if (budget?.isExpired()) {
+      log.warn('⏱️ CPU budget expired after exits');
+      return;
+    }
+
+    // Step 7: Concurrency check
+    log.debug('Step 6: Checking concurrency limits');
     const openPauseTh = Number(env.OPEN_PAUSE_THRESHOLD || 2);
     const openCountNow = await getOpenPositionsCount(env, userId);
     const overConcurrency = openCountNow >= openPauseTh;
 
-    const protocol = await getProtocolState(env, userId);
-    if (session.status !== 'active' || !protocol || protocol.phase === 'terminated') return;
+    log.info('✅ Concurrency check', {
+      open_positions: openCountNow,
+      threshold: openPauseTh,
+      over_limit: overConcurrency
+    });
 
+    // Step 8: Protocol validation
+    log.debug('Step 7: Validating protocol state');
+    const protocol = await getProtocolState(env, userId);
+    if (session.status !== 'active' || !protocol || protocol.phase === 'terminated') {
+      log.info('ℹ️ User not active or protocol terminated', {
+        session_status: session.status,
+        protocol_phase: protocol?.phase
+      });
+      return;
+    }
+
+    // Step 9: Load limits
+    log.debug('Step 8: Loading position limits');
     const maxPos = getMaxConcurrent(env);
     const maxNew = getMaxNewPerCycle(env);
 
+    log.info('✅ Limits loaded', {
+      max_concurrent: maxPos,
+      max_new_per_cycle: maxNew
+    });
+
+    // Step 10: Budget snapshot
+    log.debug('Step 9: Calculating budgets');
+    const budgetTimer = log.time('budget_calculation');
+
     const TC = await getTotalCapital(env, userId);
-
-    // Notional budgets (env-driven caps; behavior matches original logic)
     const perTradeNotionalCapFrac = Number(env?.PER_TRADE_NOTIONAL_CAP_FRAC ?? 0.10);
-    const dailyNotionalCapFrac    = Number(env?.DAILY_OPEN_NOTIONAL_CAP_FRAC ?? 0.30);
-    const dailyNotionalCap        = dailyNotionalCapFrac * TC;
-    const openNotional            = await getOpenNotional(env, userId);
-    let dailyNotionalLeft         = Math.max(0, dailyNotionalCap - openNotional);
+    const dailyNotionalCapFrac = Number(env?.DAILY_OPEN_NOTIONAL_CAP_FRAC ?? 0.30);
+    const dailyNotionalCap = dailyNotionalCapFrac * TC;
+    const openNotional = await getOpenNotional(env, userId);
+    let dailyNotionalLeft = Math.max(0, dailyNotionalCap - openNotional);
 
-    // Risk budgets (original constants)
     const D = DAILY_OPEN_RISK_CAP_FRAC * TC;
     const openRisk = await getOpenPortfolioRisk(env, userId);
     let D_left = Math.max(0, D - openRisk);
 
+    budgetTimer.end();
+
+    log.info('✅ Budgets calculated', {
+      TC: TC.toFixed(2),
+      daily_notional_cap: dailyNotionalCap.toFixed(2),
+      daily_notional_left: dailyNotionalLeft.toFixed(2),
+      daily_risk_cap: D.toFixed(2),
+      daily_risk_left: D_left.toFixed(2),
+      open_notional: openNotional.toFixed(2),
+      open_risk: openRisk.toFixed(2)
+    });
+
+    // Step 11: Load ideas
+    log.debug('Step 10: Loading ideas');
+    const ideasTimer = log.time('ideas_load');
+
     let ideas = await buildIdeasFromGistPending(env);
 
-    // Perfect: Strict Gist first; fallback only if all retries fail (rare).
     if (ideas === null) {
-      console.warn(`[${userId}] Gist fetch failed after retries; falling back to DB ideas snapshot.`);
+      log.warn('⚠️ Gist fetch failed; falling back to DB snapshot');
       ideas = await getLatestIdeas(env);
     }
 
-    // Exit if no ideas from either source.
-    if (!ideas || !ideas.ideas || !ideas.ideas.length) return;
+    ideasTimer.end({ 
+      count: ideas?.ideas?.length || 0,
+      origin: ideas?.meta?.origin 
+    });
 
-    // Freshness guard
+    if (!ideas || !ideas.ideas || !ideas.ideas.length) {
+      log.info('ℹ️ No ideas available');
+      return;
+    }
+
+    log.info('✅ Ideas loaded', {
+      count: ideas.ideas.length,
+      origin: ideas.meta?.origin,
+      timestamp: ideas.ts
+    });
+
+    // Step 12: Freshness check
+    log.debug('Step 11: Checking ideas freshness');
     try {
       const ts = new Date(ideas.ts || 0).getTime();
       const maxAgeMs = Number(env.IDEAS_MAX_AGE_MS || 20 * 60 * 1000);
-      if (!ts || (Date.now() - ts) > maxAgeMs) return;
-    } catch (_) {}
+      const age = Date.now() - ts;
+      
+      if (!ts || age > maxAgeMs) {
+        log.warn('⚠️ Ideas too stale', {
+          age_ms: age,
+          max_age_ms: maxAgeMs,
+          age_min: (age / 60000).toFixed(1)
+        });
+        return;
+      }
 
-    // Snapshot dedupe — process each ideas.ts only once per user
+      log.info('✅ Ideas freshness OK', {
+        age_ms: age,
+        age_min: (age / 60000).toFixed(1)
+      });
+    } catch (e) {
+      log.error('❌ Freshness check failed', { error: e.message });
+    }
+
+    // Step 13: Snapshot deduplication
+    log.debug('Step 12: Checking snapshot deduplication');
     const ideasTs = String(ideas.ts || "");
     const lastKey = `last_ideas_ts_user_${userId}`;
     const lastSeenTs = await kvGet(env, lastKey);
 
-    // Early skip when nothing to do: no open positions and snapshot already processed
-    if (openCountNow === 0 && lastSeenTs && lastSeenTs === ideasTs) return;
-
-    // Duplicate symbols control map (per-cycle)
-    const counts = new Map();
-
-    // If NOT cycle-only, pre-populate with existing open/pending exposures (cross-cycle enforcement)
-    let allowDup = false, capPerSym = 1;
-    if (!cycleOnly) {
-      try {
-        const rowsCnt = await env.DB.prepare(
-          "SELECT symbol, COUNT(*) AS c FROM trades WHERE user_id = ? AND status IN ('open','pending') GROUP BY symbol"
-        ).bind(userId).all();
-        for (const r of (rowsCnt.results || [])) {
-          const s = String(r.symbol || '').toUpperCase();
-          const c = Number(r.c || 0);
-          if (s) counts.set(s, c);
-        }
-      } catch (_) {}
-      allowDup = String(env?.ALLOW_DUPLICATE_SYMBOLS || '0') === '1';
-      capPerSym = Math.max(1, Math.floor(Number(env?.MAX_POS_PER_SYMBOL || 1)));
+    if (openCountNow === 0 && lastSeenTs && lastSeenTs === ideasTs) {
+      log.info('ℹ️ Snapshot already processed (no open positions)', {
+        snapshot_ts: ideasTs
+      });
+      return;
     }
 
-    const activeSyms = await getActiveExposureSymbols(env, userId);
-    let placed = 0; // opened/pending count this cycle
-    const stopReason = (!D_left ? 'daily_risk_budget_exhausted' : (!dailyNotionalLeft ? 'daily_notional_exhausted' : null));
+    log.info('✅ Snapshot dedup check passed', {
+      current_snapshot: ideasTs,
+      last_processed: lastSeenTs,
+      is_new: lastSeenTs !== ideasTs
+    });
+
+    // Step 14: Duplicate symbol tracking
+    log.debug('Step 13: Initializing duplicate symbol tracking');
+    const counts = new Map();
+    const cycleOnly = String(env?.CYCLE_ONLY_DUP_GUARD || '0') === '1';
+
+    if (!cycleOnly) {
+      const rowsCnt = await env.DB.prepare(
+        "SELECT symbol, COUNT(*) AS c FROM trades WHERE user_id = ? AND status IN ('open','pending') GROUP BY symbol"
+      ).bind(userId).all();
+
+      for (const r of (rowsCnt.results || [])) {
+        const s = String(r.symbol || '').toUpperCase();
+        const c = Number(r.c || 0);
+        if (s) counts.set(s, c);
+      }
+
+      log.info('✅ Symbol exposure loaded', {
+        unique_symbols: counts.size,
+        exposures: Array.from(counts.entries()).map(([sym, cnt]) => `${sym}:${cnt}`)
+      });
+    }
+
+    const allowDup = String(env?.ALLOW_DUPLICATE_SYMBOLS || '0') === '1';
+    const capPerSym = Math.max(1, Math.floor(Number(env?.MAX_POS_PER_SYMBOL || 1)));
+
+    log.info('✅ Duplicate policy configured', {
+      cycle_only: cycleOnly,
+      allow_duplicates: allowDup,
+      cap_per_symbol: capPerSym
+    });
+
+    // Step 15: Ideas processing loop
+    log.info('🔄 Starting ideas processing loop', {
+      total_ideas: ideas.ideas.length
+    });
+
+    let placed = 0;
+    const stopReason = (!D_left ? 'daily_risk_budget_exhausted' 
+      : (!dailyNotionalLeft ? 'daily_notional_exhausted' : null));
+
+    if (stopReason) {
+      log.warn('⚠️ Budget exhausted before processing ideas', {
+        reason: stopReason,
+        D_left,
+        dailyNotionalLeft
+      });
+    }
 
     const ideasTsMs = new Date(ideas.ts || 0).getTime();
 
     for (let idx = 0; idx < ideas.ideas.length; idx++) {
-      if (budget?.isExpired()) break;
-      budget?.ensure("ideas_loop");
+      if (budget?.isExpired()) {
+        log.warn('⏱️ CPU budget expired during ideas loop', {
+          processed: idx,
+          remaining: ideas.ideas.length - idx
+        });
+        break;
+      }
 
       const idea = ideas.ideas[idx];
+      const ideaLog = log.scope({ idea_idx: idx, symbol: idea.symbol });
 
-      // TTL gating (skip only if NO_REJECTS is off)
+      ideaLog.debug(`Processing idea ${idx + 1}/${ideas.ideas.length}`);
+
+      // TTL check
       try {
         const ttlMs = Number(idea.ttl_sec || 0) * 1000;
         if (ttlMs > 0 && ideasTsMs > 0 && Date.now() - ideasTsMs > ttlMs) {
-          if (!forceAll()) {
-            await createAutoSkipRecord(env, userId, idea, protocol, 'stale_idea_ttl', { ttl_sec: idea.ttl_sec });
+          ideaLog.info('⏱️ Idea expired (TTL)', {
+            ttl_sec: idea.ttl_sec,
+            age_ms: Date.now() - ideasTsMs
+          });
+          if (String(env?.NO_REJECTS || '0') !== '1') {
+            await createAutoSkipRecord(env, userId, idea, protocol, 'stale_idea_ttl', { 
+              ttl_sec: idea.ttl_sec 
+            });
           }
           continue;
         }
-      } catch {}
+      } catch (e) {
+        ideaLog.warn('TTL check error', { error: e.message });
+      }
 
       const symU = String(idea.symbol || '').toUpperCase();
-
-      // Duplicate symbol enforcement
       const curCount = counts.get(symU) || 0;
+
+      // Duplicate check
       if (cycleOnly) {
-        // Block only within this cycle
         if (curCount > 0) {
+          ideaLog.info('🚫 Duplicate symbol in cycle', { curCount });
           await createAutoSkipRecord(env, userId, idea, protocol, 'duplicate_symbol_cycle', { curCount });
           continue;
         }
       } else {
-        // Env-driven cross-cycle policy
         if ((!allowDup && curCount > 0) || (allowDup && curCount >= capPerSym)) {
-          await createAutoSkipRecord(env, userId, idea, protocol, 'duplicate_symbol', { curCount, capPerSym });
+          ideaLog.info('🚫 Duplicate symbol cap reached', { 
+            curCount, 
+            capPerSym 
+          });
+          await createAutoSkipRecord(env, userId, idea, protocol, 'duplicate_symbol', { 
+            curCount, 
+            capPerSym 
+          });
           continue;
         }
       }
 
-      // Concurrency limit (UNCONDITIONAL)
+      // Concurrency limit
       if (overConcurrency || (openCountNow + placed) >= maxPos) {
-        if (!forceAll()) {
-          await createAutoSkipRecord(env, userId, idea, protocol, 'concurrency_limit', { openCountNow, placed, maxPos, th: openPauseTh });
+        ideaLog.info('🚫 Concurrency limit reached', {
+          openCountNow,
+          placed,
+          maxPos
+        });
+        if (String(env?.NO_REJECTS || '0') !== '1') {
+          await createAutoSkipRecord(env, userId, idea, protocol, 'concurrency_limit', { 
+            openCountNow, 
+            placed, 
+            maxPos 
+          });
         }
         continue;
       }
 
-      // Budget stop reason (skip only if NO_REJECTS is off)
-      if (stopReason && !forceAll()) {
-        await createAutoSkipRecord(env, userId, idea, protocol, stopReason, { D_left, dailyNotionalLeft });
+      // Budget exhaustion
+      if (stopReason && String(env?.NO_REJECTS || '0') !== '1') {
+        ideaLog.info('🚫 Budget stop', { reason: stopReason });
+        await createAutoSkipRecord(env, userId, idea, protocol, stopReason, { 
+          D_left, 
+          dailyNotionalLeft 
+        });
         continue;
       }
 
-      // Try to create a pending trade
+      // FIXED: Track budget before creating pending trade
       const beforeOpenRisk = await getOpenPortfolioRisk(env, userId);
+      const beforeOpenNotional = await getOpenNotional(env, userId);
+
+      ideaLog.debug('Creating pending trade');
+      const createTimer = ideaLog.time('createPendingTrade');
+
       const { id, meta } = await createPendingTrade(env, userId, idea, protocol);
+
+      createTimer.end({ 
+        success: !!id, 
+        skipReason: meta?.skipReason 
+      });
+
       if (!id) {
-        // If createPendingTrade still rejects (e.g., hard market_data), log as before
+        ideaLog.info('🚫 Trade creation rejected', { 
+          reason: meta?.skipReason 
+        });
         await createAutoSkipRecord(env, userId, idea, protocol, meta?.skipReason || 'unknown', meta);
         continue;
       }
 
+      ideaLog.info('✅ Pending trade created', { tradeId: id });
+
       // Execute (Auto) or show card (Manual)
       if (session.bot_mode === 'auto' && session.auto_paused !== 'true') {
-        const executed = await executeTrade(env, userId, id);
-        if (!executed) {
-          await env.DB.prepare("UPDATE trades SET status = 'failed', updated_at = ? WHERE id = ?").bind(nowISO(), id).run();
-          continue;
+        ideaLog.debug('Executing trade (auto mode)');
+        const execTimer = ideaLog.time('executeTrade');
+
+        const result = await executeTrade(env, userId, id);
+
+        execTimer.end({ 
+          status: result.status,
+          success: result.success 
+        });
+
+        // FIXED: Only treat as success if filled
+        if (result.status !== 'filled') {
+          ideaLog.warn('⚠️ Trade not filled', { 
+            status: result.status 
+          });
+          
+          if (result.status === 'posted') {
+            ideaLog.info('📌 Order posted, waiting for fill');
+            // Don't increment counts or decrement budgets yet
+            continue;
+          } else {
+            // Failed execution
+            await env.DB.prepare(
+              "UPDATE trades SET status = 'failed', updated_at = ? WHERE id = ?"
+            ).bind(nowISO(), id).run();
+            
+            ideaLog.error('❌ Trade execution failed', { 
+              tradeId: id,
+              error: result.error 
+            });
+            continue;
+          }
         }
 
-        // Update per-cycle duplicate count
+        // FIXED: Increment duplicate counter ONLY after successful fill
         counts.set(symU, (counts.get(symU) || 0) + 1);
-
-        activeSyms.add(symU);
         placed++;
 
-        // Cycle cap enforcement (UNCONDITIONAL)
+        ideaLog.info('🎉 Trade executed successfully', { 
+          tradeId: id,
+          placed_this_cycle: placed 
+        });
+
+        // Cycle cap enforcement
         if (placed >= maxNew) {
-          if (!forceAll()) {
+          ideaLog.info('🛑 Cycle cap reached', { 
+            placed, 
+            maxNew 
+          });
+          
+          if (String(env?.NO_REJECTS || '0') !== '1') {
             for (const rest of ideas.ideas.slice(idx + 1)) {
-              await createAutoSkipRecord(env, userId, rest, protocol, 'cycle_cap_reached', { placed, maxNew });
+              await createAutoSkipRecord(env, userId, rest, protocol, 'cycle_cap_reached', { 
+                placed, 
+                maxNew 
+              });
             }
           }
           break;
         }
 
-        // Update budgets after open
+        // FIXED: Update budgets ONLY after confirmed fill
         const afterOpenRisk = await getOpenPortfolioRisk(env, userId);
-        D_left -= Math.max(0, afterOpenRisk - beforeOpenRisk);
+        const riskConsumed = Math.max(0, afterOpenRisk - beforeOpenRisk);
+        D_left -= riskConsumed;
+
         const afterOpenNotional = await getOpenNotional(env, userId);
+        const notionalConsumed = Math.max(0, afterOpenNotional - beforeOpenNotional);
         dailyNotionalLeft = Math.max(0, dailyNotionalCap - afterOpenNotional);
+
+        ideaLog.info('📊 Budgets updated', {
+          risk_consumed: riskConsumed.toFixed(2),
+          D_left_remaining: D_left.toFixed(2),
+          notional_consumed: notionalConsumed.toFixed(2),
+          notional_left_remaining: dailyNotionalLeft.toFixed(2)
+        });
+
       } else if (session.bot_mode === 'manual') {
-        // Fetch and show the pending card
-        const trow = await env.DB.prepare("SELECT * FROM trades WHERE id = ? AND user_id = ?").bind(id, userId).first();
+        ideaLog.debug('Sending manual approval card');
+        
+        const trow = await env.DB.prepare(
+          "SELECT * FROM trades WHERE id = ? AND user_id = ?"
+        ).bind(id, userId).first();
         const extra = JSON.parse(trow.extra_json || '{}');
+        
         await sendMessage(userId, pendingTradeCard(trow, extra), kbPendingTrade(id, extra.funds_ok), env);
 
-        // Update per-cycle duplicate count
+        // FIXED: Don't decrement budgets in manual mode until approved
         counts.set(symU, (counts.get(symU) || 0) + 1);
-
-        activeSyms.add(symU);
         placed++;
 
-        // Cycle cap enforcement (UNCONDITIONAL)
+        ideaLog.info('📧 Manual approval card sent', { 
+          tradeId: id 
+        });
+
         if (placed >= maxNew) {
-          if (!forceAll()) {
+          ideaLog.info('🛑 Cycle cap reached (manual)', { 
+            placed, 
+            maxNew 
+          });
+          
+          if (String(env?.NO_REJECTS || '0') !== '1') {
             for (const rest of ideas.ideas.slice(idx + 1)) {
-              await createAutoSkipRecord(env, userId, rest, protocol, 'cycle_cap_reached', { placed, maxNew });
+              await createAutoSkipRecord(env, userId, rest, protocol, 'cycle_cap_reached', { 
+                placed, 
+                maxNew 
+              });
             }
           }
           break;
         }
-        dailyNotionalLeft -= Number(extra.quote_size || 0);
       }
 
-      // If budgets became exhausted mid-loop, log the rest as exhausted (only if NO_REJECTS is off)
-      if ((D_left <= 0 || dailyNotionalLeft <= 0) && !forceAll()) {
+      // Budget exhaustion mid-loop
+      if ((D_left <= 0 || dailyNotionalLeft <= 0) && String(env?.NO_REJECTS || '0') !== '1') {
         const reason = D_left <= 0 ? 'daily_risk_budget_exhausted' : 'daily_notional_exhausted';
+        ideaLog.warn('⚠️ Budget exhausted mid-loop', { reason });
+        
         for (const rest of ideas.ideas.slice(idx + 1)) {
-          await createAutoSkipRecord(env, userId, rest, protocol, reason, { D_left, dailyNotionalLeft });
+          await createAutoSkipRecord(env, userId, rest, protocol, reason, { 
+            D_left, 
+            dailyNotionalLeft 
+          });
         }
         break;
       }
     }
 
-    // Mark this snapshot as processed for this user (prevents reprocessing every minute)
-    if (ideasTs) await kvSet(env, lastKey, ideasTs);
+    // Mark snapshot as processed
+    if (ideasTs) {
+      await kvSet(env, lastKey, ideasTs);
+      log.info('✅ Snapshot marked as processed', { 
+        snapshot_ts: ideasTs 
+      });
+    }
+
+    const totalDuration = cycleTimer.end({ 
+      success: true,
+      ideas_processed: ideas.ideas.length,
+      trades_placed: placed
+    });
+
+    log.info('🎉 User processing cycle completed', {
+      total_duration_ms: totalDuration.toFixed(2),
+      ideas_total: ideas.ideas.length,
+      trades_placed: placed,
+      budgets_remaining: {
+        D_left: D_left.toFixed(2),
+        notional_left: dailyNotionalLeft.toFixed(2)
+      }
+    });
+
   } catch (e) {
-    console.error(`processUser error for ${userId}:`, e);
-    await logEvent(env, userId, 'error', { where: 'processUser', message: e.message });
+    cycleTimer.end({ error: e.message });
+    log.error('❌ processUser failed', { 
+      error: e.message, 
+      stack: e.stack 
+    });
+    await logEvent(env, userId, 'error', { 
+      where: 'processUser', 
+      message: e.message 
+    });
   }
 }
+
 
 /* ---------- Telegram update handler (debounced exits + working orders + reconciliation) ---------- */
 async function handleTelegramUpdate(update, env, ctx) {
@@ -5604,5 +6683,3 @@ export default {
     ctx.waitUntil(runCron(env));  // ensures non-blocking execution
   },
 };
-
-
