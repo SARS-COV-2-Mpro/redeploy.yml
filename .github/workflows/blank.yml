@@ -1,4 +1,4 @@
-&
+p
 name: Deploy to Cloudflare
 
 on:
