@@ -3241,28 +3241,78 @@ async function createPendingTrade(env, userId, idea, protocol) {
 
   const Desired_Risk_USD = B_eff * k_dd * f_raw * c_corr * g;
 
-  const fixedNotional = getFixedTradeNotional(env, TC);
-  const planNotionalRaw = Number(idea?.notional_usd);
-  const planNotional = (useIdeaNotional(env) && isFinite(planNotionalRaw) && planNotionalRaw > 0) ? planNotionalRaw : null;
+  // ========== FORCE OVERRIDE: IGNORE PUSHER/IDEA COMPLETELY ==========
+  const forcePct = Number(env?.FORCE_NOTIONAL_PCT || 0);
+  let notionalDesired, notionalFinal;
 
-  let notionalDesired =
-    (fixedNotional != null)
-    ? fixedNotional // your FIXED_TRADE_NOTIONAL_* wins
-    : (planNotional != null ? planNotional // otherwise honor idea.notional_usd
-    : (Desired_Risk_USD / sL)); // else risk-based
+  if (forcePct > 0) {
+    // FORCE mode: use fixed % of TC, ignore ALL pusher suggestions
+    const forceNotional = TC * clamp(forcePct, 0.001, 1.0);
+    
+    log.info('🔒 FORCE MODE: Ignoring all pusher sizing', { 
+      force_pct: (forcePct * 100).toFixed(1) + '%',
+      TC: TC.toFixed(2),
+      forced_notional: forceNotional.toFixed(2),
+      ignored_idea_notional: idea?.notional_usd || 'N/A'
+    });
 
-  const capPerTrade  = fixedStrict(env) ? Number.POSITIVE_INFINITY : perTradeNotionalCap;
-  const capDailyLeft = fixedStrict(env) ? Number.POSITIVE_INFINITY : dailyNotionalLeft;
+    // Still respect daily notional cap (safety rail)
+    const capDailyLeft = dailyNotionalLeft;
+    notionalFinal = Math.min(forceNotional, capDailyLeft);
+    
+    if (notionalFinal < forceNotional) {
+      log.warn('⚠️ FORCE notional capped by daily limit', {
+        desired: forceNotional.toFixed(2),
+        capped_to: notionalFinal.toFixed(2),
+        daily_left: capDailyLeft.toFixed(2)
+      });
+    }
+    
+    // Skip all EV/Kelly/HSE logic below - jump straight to notionalFinal
+    notionalDesired = forceNotional;
 
-  let notionalFinal = Math.min(notionalDesired, capPerTrade, capDailyLeft);
+  } else {
+    // ========== ORIGINAL LOGIC (when FORCE_NOTIONAL_PCT not set) ==========
+    const fixedNotional = getFixedTradeNotional(env, TC);
+    const planNotionalRaw = Number(idea?.notional_usd);
+    const planNotional = (useIdeaNotional(env) && isFinite(planNotionalRaw) && planNotionalRaw > 0) ? planNotionalRaw : null;
+
+    notionalDesired =
+      (fixedNotional != null)
+      ? fixedNotional
+      : (planNotional != null ? planNotional
+      : (Desired_Risk_USD / sL));
+
+    const capPerTrade  = fixedStrict(env) ? Number.POSITIVE_INFINITY : perTradeNotionalCap;
+    const capDailyLeft = fixedStrict(env) ? Number.POSITIVE_INFINITY : dailyNotionalLeft;
+
+    notionalFinal = Math.min(notionalDesired, capPerTrade, capDailyLeft);
+  }
 
   if (notionalFinal <= 0 && noRejects(env)) {
     const MIN_QUOTE_FLOOR_USD = 5;
     notionalFinal = MIN_QUOTE_FLOOR_USD;
   }
   if (notionalFinal <= 0 && !noRejects(env)) {
-    log.warn('🚫 Final notional is zero after caps', { notionalDesired, capPerTrade, capDailyLeft, sL });
-    return { id: null, meta: { symbol, skipReason: "bank_notional_zero", perTradeNotionalCap, dailyNotionalLeft, openNotional, sL, currentPrice } };
+    // FIXED: Handle both FORCE and normal mode safely
+    const capInfo = forcePct > 0 
+      ? { force_pct: (forcePct * 100).toFixed(1) + '%', daily_left: dailyNotionalLeft }
+      : { per_trade_cap: perTradeNotionalCap, daily_left: dailyNotionalLeft };
+      
+    log.warn('🚫 Final notional is zero after caps', { 
+      notionalDesired, 
+      ...capInfo, 
+      sL 
+    });
+    
+    return { id: null, meta: { 
+      symbol, 
+      skipReason: "bank_notional_zero", 
+      notional_desired: notionalDesired,
+      daily_left: dailyNotionalLeft,
+      sL, 
+      currentPrice 
+    }};
   }
 
   let Final_Risk_USD = notionalFinal * sL;
@@ -3359,10 +3409,38 @@ async function createPendingTrade(env, userId, idea, protocol) {
     predicted_snapshot: idea?.predicted || null
   };
 
+  // ========== FORCE TTL OVERRIDE: IGNORE PUSHER COMPLETELY ==========
   const nowMs = Date.now();
-  const ttlTs = ttlDeadlineMsFromIdea(idea, nowMs, env);
-  if (ttlTs) {
-    extra_json.ttl = { ttl_ts_ms: ttlTs, hold_sec: Math.round((ttlTs - nowMs) / 1000), source: 'idea' };
+  const forceTtlMin = Number(env?.FORCE_TTL_MIN || 0);
+  let ttlTs;
+
+  if (forceTtlMin > 0) {
+    // FORCE mode: use fixed minutes from env, ignore pusher
+    const forceTtlMs = forceTtlMin * 60 * 1000;
+    ttlTs = nowMs + forceTtlMs;
+    
+    extra_json.ttl = { 
+      ttl_ts_ms: ttlTs, 
+      hold_sec: Math.round(forceTtlMs / 1000), 
+      source: 'force_env' 
+    };
+    
+    log.info('🔒 FORCE TTL: Ignoring pusher TTL', { 
+      force_ttl_min: forceTtlMin,
+      ignored_idea_ttl_sec: idea?.ttl_sec || idea?.hold_sec || 'N/A',
+      forced_ttl_sec: Math.round(forceTtlMs / 1000)
+    });
+
+  } else {
+    // Original logic: read from idea
+    ttlTs = ttlDeadlineMsFromIdea(idea, nowMs, env);
+    if (ttlTs) {
+      extra_json.ttl = { 
+        ttl_ts_ms: ttlTs, 
+        hold_sec: Math.round((ttlTs - nowMs) / 1000), 
+        source: 'idea' 
+      };
+    }
   }
 
   log.debug('Step 7: Inserting pending trade into DB');
